@@ -1,0 +1,907 @@
+// src/session_env.pdx -- libpdx-pds-parser.R229.M2 (paideia-os#2720)
+//
+// SessionEnv: per-session persistent binding store that threads BOTH
+// the HM-inferred type scheme and the evaluator's value reference
+// across REPL turns. The one piece R229.M1 (REPL state machine)
+// deferred: a `let x = find . | count` on turn N persists `x` into
+// turn N+1 .. session end or explicit `unset x`.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R229 is the REPL evaluator umbrella (paideia-os#2493; design doc
+// design/shell/repl-loop-scaffold.md). R229.M1 (src/kernel/core/shell/
+// repl_loop.pdx) landed the PROMPT/READING/PARSED/EVAL/WRITING/IDLE
+// state machine but owns NO per-turn state. R229.M2 (THIS module)
+// lands the companion substrate the REPL dispatch (R229.M3+) will
+// consult on every EVAL stage: a 32-slot persistent map per session
+// keyed by name, each slot carrying (scheme_kind, type_ref, value_ref).
+//
+// Position in the substrate graph:
+//
+//   TTY ISR -> _rl_tick (R229.M1) -> state := PARSED
+//        -> _rl_dispatch (R229.M3+) -- parses, infers, evaluates
+//              -> _se_insert_binding / _se_lookup_binding / _se_unset_binding
+//              -> _hm_* (R225.M1 HmCore) for type-scheme reads
+//        -> state := WRITING -> _rl_emit_prompt -> READING
+//
+// SessionEnv is PARSER-TIER by geography (same satellite library as
+// HmCore, LambdaLit, Pipeline, etc.) but is NOT itself a parser --
+// the module stores and retrieves opaque name/type/value tuples. The
+// upstream parsers at R221.M4 / R224.M1 enforce the identifier byte-
+// class; SessionEnv treats name bytes verbatim.
+//
+// Lives user-space because the shell runs user-space; the pool is
+// caller-process-local (singleton .bss, 8192 B); the module touches
+// no kernel KIND and consumes no capability (caps.decl R229 band
+// note).
+//
+// =============================================================================
+// RECORD LAYOUT
+// =============================================================================
+//
+// Binding record (32 B, SE_BINDING_BYTES):
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      1   kind         u8  SE_SLOT_EMPTY (0) / SE_SLOT_ACTIVE (1)
+//     1      1   name_len     u8  1..SE_NAME_MAX (= 16); 0 on tombstone
+//     2      1   scheme_kind  u8  SE_SCHEME_DIRECT (1) iff type_ref is a
+//                                 HmCore pool index; 2 reserved for M3+
+//                                 (full generalised schemes).
+//     3      1   flags        u8  reserved; 0 at M2.
+//     4      4   type_ref     u32 HmCore _hm_pool index (1..127) when
+//                                 scheme_kind == 1; offset into schemes
+//                                 blob when scheme_kind == 2 (M3+).
+//     8     16   name_inline  u8[16]  bytes 0..name_len; zero-padded.
+//    24      8   value_ref    u64  OPAQUE 64-bit handle; the REPL
+//                                 dispatch interprets (u64 inline / str
+//                                 arena offset / pipeline handle / ...).
+//                                 SessionEnv stores and returns verbatim.
+//
+//   total: 32 B
+//
+// Per-session row (SE_SESSION_ROW_BYTES = 1024 B): 32 slots x 32 B.
+//
+// Pool (`_se_env_pool`, 8192 B): 8 sessions x 1024 B. Session row base
+// = `_se_env_pool + sid * 1024`. `sid * 1024` is `shl r, 10` -- one op,
+// never 2-op `imul r, imm` (feedback_pdx_encoder_pitfalls).
+//
+// Head-table (`_se_head_table`, 64 B): 8 x u64 next-free slot indices.
+// Head counter for sid = `_se_head_table + sid * 8` -- `shl r, 3`.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _se_init() -> ()
+//     Boot hook. Defensive scrub of _se_head_table (8 u64 = 64 B).
+//     .bss already zero-inits the pool at real boot; the scrub covers
+//     a chaos-restart re-entry.
+//
+//   _se_init_session(session_id) -> errno
+//     Attaches / resets the per-session row at _se_env_pool +
+//     session_id * 1024. Zeroes 1024 B (128 u64 stores) and writes
+//     _se_head_table[session_id] := 0.
+//     SE_OK on success; SE_ERR_BAD_SESSION on session_id >= 8.
+//
+//   _se_insert_binding(session_id, name_ptr, name_len,
+//                      scheme_kind, type_ref, value_ref) -> errno
+//     Last-wins insert. Linear-scans slots 0..head for a kind-active
+//     slot whose (name_len, name_inline[0..name_len]) matches input.
+//     HIT: overwrite scheme_kind/type_ref/value_ref in place.
+//     MISS: append at head if head < 32; else SE_ERR_TOO_MANY.
+//     SE_OK on success; SE_ERR_BAD_SESSION / SE_ERR_BAD_NAME /
+//     SE_ERR_BAD_SCHEME_KIND / SE_ERR_TOO_MANY on guards.
+//
+//   _se_lookup_binding(session_id, name_ptr, name_len,
+//                      out_type_ref_ptr, out_value_ref_ptr) -> errno
+//     Walks slots 0..head for the first active name-match. On hit,
+//     writes type_ref (zero-extended u64) and value_ref u64 through
+//     the two out pointers; returns SE_OK. On miss, returns
+//     SE_ERR_NOT_FOUND without touching either out pointer. Either
+//     out pointer may be 0 (= skip that write).
+//
+//   _se_unset_binding(session_id, name_ptr, name_len) -> errno
+//     Scans slots 0..head for a match; on a hit, writes
+//     kind := SE_SLOT_EMPTY (0) and name_len := 0 (zero-cost
+//     tombstone; type_ref and value_ref left intact).
+//     SE_OK on hit; SE_ERR_NOT_FOUND on miss.
+//
+// Register maps (SysV):
+//
+//   _se_init()                                            -> ()
+//   _se_init_session(rdi)                                 -> rax
+//   _se_insert_binding(rdi, rsi, rdx, rcx, r8, r9)        -> rax
+//   _se_lookup_binding(rdi, rsi, rdx, rcx, r8)            -> rax
+//   _se_unset_binding(rdi, rsi, rdx)                      -> rax
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE  --  0x3700..0x37FF
+// =============================================================================
+//
+// Session-env packed-status range. Five slots used at R229.M2:
+//
+//   SE_OK                   = 0
+//   SE_ERR_BAD_SESSION      = 0x3700
+//   SE_ERR_BAD_NAME         = 0x3701  (name_len == 0 or > 16)
+//   SE_ERR_TOO_MANY         = 0x3702  (head == 32 on insert)
+//   SE_ERR_NOT_FOUND        = 0x3703  (lookup / unset miss)
+//   SE_ERR_BAD_SCHEME_KIND  = 0x3704  (insert with scheme_kind not in {1,2})
+//
+// Slots 0x3705..0x37FF reserved for R229.M3+ (SE_ERR_HM_POOL_FULL,
+// SE_ERR_TOMBSTONE_EXHAUSTED, SE_ERR_EXPORTED_IMMUTABLE, etc.).
+//
+// Disjoint from every other parser-tier packed-status band:
+//   * utf8_nfc        0x2700..0x27FF   (R221.M1)
+//   * schemas_sig     0x2A00..0x2AFF   (R222.M1)
+//   * pipeline        0x2B00..0x2BFF   (R223.M1)
+//   * lambda_lit      0x2C00..0x2CFF   (R224.M1)
+//   * hm_core         0x2D00..0x2DFF   (R225.M1)
+//   * datalog         0x2E00..0x2EFF   (R226.M1)
+//   * repl_loop       0x3000..0x30FF   (R229.M1, kernel-side RL_*)
+//   * command_sig     0x3300..0x33FF   (R222.M2)
+//   * record_projection 0x3400..0x34FF (R223.M2)
+//   * lambda_lit M2   0x3500..0x35FF   (R224.M2, same Wave 117 batch)
+//   * hm_core M2      0x3600..0x36FF   (R225.M2, same Wave 117 batch)
+//   * session_env     0x3700..0x37FF   (R229.M2, THIS)
+//
+// Grep confirmation at R229.M2 landing time:
+//
+//   grep -rE '0x370[0-4]\b' paideia-os/{src,tools,design,tests}
+//     -> no packed-status hits outside this file + caps.decl +
+//        design/shell/session-env.md.
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R229.M1 (repl_loop.pdx, kernel) -- drives per-cycle state; does
+//     NOT touch SessionEnv at M1 or M2. R229.M3+ wires the EVAL
+//     stage to this module through the REPL dispatch surface.
+//
+//   R225.M1 (hm_core.pdx) -- SessionEnv stores a HmCore _hm_pool
+//     index as type_ref when scheme_kind == SE_SCHEME_DIRECT. The
+//     two modules are sibling .bss owners; no cross-module call.
+//     The REPL dispatch at R229.M3+ allocates/reads HmCore pool
+//     slots and hands the resulting pool_idx into this module.
+//
+//   R127.M1 (shell_session.pdx) -- session_id is validated by the
+//     caller against ss_row_in_use before reaching here; SessionEnv
+//     only range-checks against SE_MAX_SESSIONS (8).
+//
+//   R127.M6 (session teardown) -- R229.M4+ adds a cascade step 7
+//     that calls _se_init_session on destroy; M2 relies on sid-
+//     reuse's next _se_init_session to scrub any stale row.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32.
+//   - No 2-op `imul r, imm` -- session base uses `shl rN, 10`
+//     (* 1024), slot stride uses `shl rN, 5` (* 32), head-table
+//     uses `shl rN, 3` (* 8).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `SessionEnv` matches `session_env.pdx`.
+//   - Labels prefixed `se_` (grep-disjoint from `ss_` / `sh_` /
+//     `sj_` / `hf_` / `cr_` / `rl_` kernel namespaces and the
+//     parser-tier `u8n_` / `pl_` / `rp_` / `ll_` / `hm_` / `dl_` /
+//     `sch_sig_` / `cmd_sig_` namespaces). No bare `loop`, `if`,
+//     `let`, `fn`, `ret`, or `done` reserved-keyword labels.
+//   - All `cmp reg, imm` immediates (bands 0x3700..0x3704, caps
+//     16/32/128, ASCII) fit imm32 with bit 31 clear so direct
+//     `cmp reg, imm32` is sign-extension-safe. No MOVABS staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + idx*1]`.
+//   - Byte stores via `mov_b [dst + disp], reg`.
+//   - u32 stores via `mov_d [dst + disp], reg`.
+//   - u64 stores via `mov [dst + disp], reg`.
+//   - `.bss` writes via `lea r11, [rip + sym]; mov [r11 + disp], reg`.
+//   - Scanners (_se_insert, _se_lookup, _se_unset) use 6 callee-
+//     save pushes (rbx, rbp, r12, r13, r14, r15); pure leaves with
+//     NO nested CALL so no `sub rsp` alignment pad is required.
+//   - `_se_init` and `_se_init_session` use zero pushes (pure
+//     leaves; caller-save regs only).
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R229.M3  REPL dispatch -- parses `let` / `unset`; wires HM
+//            typecheck + evaluator; adds scheme_kind == 2 full-
+//            scheme storage.
+//   R229.M4  Session teardown cascade step; cross-session exported
+//            bindings (`flags` bit 0); secondary hash index.
+//   R229.M5+ Lexical nested scopes; persistent per-user env.
+//
+// =============================================================================
+// Upstream: paideia-os#2493 (R229 REPL evaluator umbrella),
+// paideia-os#2720 (THIS ticket, R229.M2 Session-scoped bindings),
+// paideia-os#2719 (R229.M1 REPL loop substrate), paideia-os#2682
+// (R225.M1 HmCore, type-pool substrate). Design doc:
+// design/shell/session-env.md.
+
+module SessionEnv = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax)
+  // ==========================================================================
+  //
+  // Small-value range 0x3700..0x37FF, reserved for the R229 session-
+  // env band. Disjoint from every other parser-tier packed-status
+  // range in the paideia-os tree.
+  //
+  // Grep confirmation at R229.M2 landing time:
+  //   grep -rE '0x370[0-4]\b' paideia-os/{src,tools,design,tests}
+  //     -> no packed-status hits outside this file + caps.decl +
+  //        design/shell/session-env.md.
+
+  pub let SE_OK                   : u64 = 0
+  pub let SE_ERR_BAD_SESSION      : u64 = 0x3700
+  pub let SE_ERR_BAD_NAME         : u64 = 0x3701
+  pub let SE_ERR_TOO_MANY         : u64 = 0x3702
+  pub let SE_ERR_NOT_FOUND        : u64 = 0x3703
+  pub let SE_ERR_BAD_SCHEME_KIND  : u64 = 0x3704
+
+  // ==========================================================================
+  // SECTION 2 -- LAYOUT CONSTANTS
+  // ==========================================================================
+
+  pub let SE_MAX_SESSIONS         : u64 = 8      // 1-byte-shift sid * 1024
+  pub let SE_MAX_BINDINGS         : u64 = 32     // per-session slot cap
+  pub let SE_NAME_MAX             : u64 = 16     // inline byte capacity
+  pub let SE_BINDING_BYTES        : u64 = 32     // slot stride (power of two)
+  pub let SE_SESSION_ROW_BYTES    : u64 = 1024   // 32 slots x 32 bytes
+  pub let SE_POOL_BYTES           : u64 = 8192   // 8 sessions x 1024 bytes
+  pub let SE_HEAD_TABLE_BYTES     : u64 = 64     // 8 x u64
+
+  // Slot kind tags (bytes at [slot + 0]).
+  pub let SE_SLOT_EMPTY           : u64 = 0
+  pub let SE_SLOT_ACTIVE          : u64 = 1
+
+  // Scheme-kind tags (bytes at [slot + 2]).
+  pub let SE_SCHEME_EMPTY         : u64 = 0
+  pub let SE_SCHEME_DIRECT        : u64 = 1   // type_ref = HmCore pool_idx
+  pub let SE_SCHEME_BLOB          : u64 = 2   // reserved M3+ (full scheme)
+
+  // Binding field offsets (bytes, from slot base).
+  pub let SE_OFF_KIND             : u64 = 0
+  pub let SE_OFF_NAME_LEN         : u64 = 1
+  pub let SE_OFF_SCHEME_KIND      : u64 = 2
+  pub let SE_OFF_FLAGS            : u64 = 3
+  pub let SE_OFF_TYPE_REF         : u64 = 4
+  pub let SE_OFF_NAME_INLINE      : u64 = 8
+  pub let SE_OFF_VALUE_REF        : u64 = 24
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _se_env_pool    : [u8; 8192] = uninit @align(8)
+  pub let mut _se_head_table  : [u8; 64]   = uninit @align(8)
+
+  // ==========================================================================
+  // _se_init() -> ()
+  //
+  //   Boot hook. Defensive scrub of _se_head_table (8 u64 = 64 B).
+  //   The _se_env_pool is NOT scrubbed -- .bss is already zero at
+  //   real boot, and a session slot is live only after an explicit
+  //   _se_init_session call that rewrites the row.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed se_ini_.
+  // ==========================================================================
+  pub let _se_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M2 (#2720): defensive scrub of _se_head_table (8 x u64 = 64 B). The _se_env_pool is NOT scrubbed because .bss is already zero at real boot and a session row is live only after _se_init_session rewrites it. Pure leaf; zero pushes; no stack frame; no nested CALL. Loop i in 0..8, store 0 u64 at _se_head_table + i*8. All immediates (0, 8) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed se_ini_.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+        lea r11, [rip + _se_head_table];
+
+      se_ini_loop:
+        cmp rcx, 8;
+        jae se_ini_done;
+        mov r10, rcx;
+        shl r10, 3;
+        mov [r11 + r10], rax;
+        add rcx, 1;
+        jmp se_ini_loop;
+
+      se_ini_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _se_init_session(session_id) -> errno
+  //
+  //   rdi = session_id
+  //   rax = SE_OK (0) on success; SE_ERR_BAD_SESSION (0x3700) if
+  //         session_id >= SE_MAX_SESSIONS (8).
+  //
+  //   Zeroes the 1024-byte row at _se_env_pool + session_id * 1024
+  //   (128 u64 stores) and writes _se_head_table[session_id] := 0.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed se_is_.
+  // ==========================================================================
+  pub let _se_init_session : (u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M2 (#2720): zero the per-session row and reset its head counter. Pure leaf; zero pushes; no stack frame; no nested CALL. Validate rdi < 8 else return SE_ERR_BAD_SESSION (0x3700). Compute row_addr = &_se_env_pool + rdi * 1024 via `mov r10, rdi; shl r10, 10; lea r11, [rip + _se_env_pool]; add r10, r11`. Loop 128 iterations writing 0 u64 at [r10 + i*8]. Zero head counter at _se_head_table + rdi * 8 via `shl r9, 3`. All immediates (0, 8, 128, 1024, 0x3700) fit imm32 and are sign-safe. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed se_is_.",
+      block: {
+        // Session-id bounds check.
+        cmp rdi, 8;                            // SE_MAX_SESSIONS
+        jae se_is_bad_sid;
+
+        // Compute row_addr = &_se_env_pool + sid * 1024.
+        mov r10, rdi;
+        shl r10, 10;                           // sid * 1024
+        lea r11, [rip + _se_env_pool];
+        add r10, r11;                          // r10 = row_addr
+
+        // Zero 128 u64 slots (= 1024 bytes).
+        xor rax, rax;                          // zero source
+        xor rcx, rcx;                          // i = 0
+
+      se_is_zero_loop:
+        cmp rcx, 128;
+        jae se_is_zero_done;
+        mov r9, rcx;
+        shl r9, 3;                             // i * 8
+        mov [r10 + r9], rax;
+        add rcx, 1;
+        jmp se_is_zero_loop;
+
+      se_is_zero_done:
+        // Clear head counter: _se_head_table[sid] := 0.
+        lea r11, [rip + _se_head_table];
+        mov r9, rdi;
+        shl r9, 3;                             // sid * 8
+        mov [r11 + r9], rax;                   // rax still = 0
+
+        // Return SE_OK.
+        xor rax, rax;
+        ret;
+
+      se_is_bad_sid:
+        mov rax, 0x3700;                       // SE_ERR_BAD_SESSION
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _se_insert_binding(session_id, name_ptr, name_len,
+  //                    scheme_kind, type_ref, value_ref) -> errno
+  //
+  //   rdi = session_id
+  //   rsi = name_ptr
+  //   rdx = name_len   (1..16)
+  //   rcx = scheme_kind (1 or 2)
+  //   r8  = type_ref   (u32 payload; stored at [slot + 4])
+  //   r9  = value_ref  (u64 payload; stored at [slot + 24])
+  //   rax = SE_OK / SE_ERR_BAD_SESSION / SE_ERR_BAD_NAME /
+  //         SE_ERR_BAD_SCHEME_KIND / SE_ERR_TOO_MANY
+  //
+  //   Linear-scans slots 0..head. On an active-slot name match,
+  //   overwrites scheme_kind / type_ref / value_ref in place. On
+  //   miss, appends at head if head < SE_MAX_BINDINGS (32); else
+  //   SE_ERR_TOO_MANY.
+  //
+  // Register plan (6-push, pure-leaf):
+  //   rbx = row_addr               (= &_se_env_pool + sid * 1024)
+  //   rbp = head                   (loaded from _se_head_table[sid])
+  //   r12 = slot_cursor (0..head)
+  //   r13 = name_ptr               (preserved across the scan)
+  //   r14 = name_len               (preserved across the scan)
+  //   r15 = scratch                (slot_addr during the inner compare)
+  //
+  //   rcx / r8 / r9 are caller-save; the scan does NOT clobber them
+  //   because the inner compare uses rax / r10 / r11 only.
+  //
+  // Labels prefixed se_ib_.
+  // ==========================================================================
+  pub let _se_insert_binding : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) (name_ptr: u64) (name_len: u64)
+       (scheme_kind: u64) (type_ref: u64) (value_ref: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M2 (#2720): last-wins insert into the per-session binding table. 6 callee-save pushes (rbx=row_addr, rbp=head, r12=slot_cursor, r13=name_ptr, r14=name_len, r15=slot_addr scratch); pure leaf with no nested CALL so no sub-rsp pad is needed. Validate: rdi < 8 (SE_ERR_BAD_SESSION), rdx in [1..16] (SE_ERR_BAD_NAME), rcx in {1,2} (SE_ERR_BAD_SCHEME_KIND). Load row_addr via shl r,10; load head from _se_head_table[sid] via shl r,3. Scan loop: for i in 0..head, compute slot_addr = row_addr + i*32 (`shl r,5`), read kind byte; if kind != SE_SLOT_ACTIVE skip; read slot name_len; if != input name_len skip; byte-compare name_inline[0..name_len] vs input bytes; on match goto overwrite. On full scan without match: if head >= 32 return SE_ERR_TOO_MANY; else write new slot at head. Overwrite path writes scheme_kind u8, type_ref u32 via mov_d, value_ref u64. Append path writes kind=1, name_len, scheme_kind, flags=0, type_ref u32, 16 name bytes (first name_len from input, rest zero-padded), value_ref u64, bumps head. All immediates (0,1,2,8,16,24,32,0x3700..0x3702,0x3704) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed se_ib_.",
+      block: {
+        // ---- Prologue (6 callee-save pushes; no stack pad: pure leaf).
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Guard: session_id < SE_MAX_SESSIONS (8).
+        cmp rdi, 8;
+        jae se_ib_bad_sid;
+
+        // ---- Guard: name_len in [1..16].
+        cmp rdx, 0;
+        je  se_ib_bad_name;
+        cmp rdx, 16;
+        ja  se_ib_bad_name;
+
+        // ---- Guard: scheme_kind in {1, 2}.
+        cmp rcx, 1;
+        je  se_ib_sk_ok;
+        cmp rcx, 2;
+        je  se_ib_sk_ok;
+        jmp se_ib_bad_scheme;
+
+      se_ib_sk_ok:
+        // Compute row_addr = &_se_env_pool + sid * 1024.
+        mov r10, rdi;
+        shl r10, 10;
+        lea r11, [rip + _se_env_pool];
+        add r10, r11;
+        mov rbx, r10;                          // rbx = row_addr
+
+        // Load head = _se_head_table[sid].
+        lea r11, [rip + _se_head_table];
+        mov r10, rdi;
+        shl r10, 3;
+        mov rbp, [r11 + r10];                  // rbp = head
+
+        // Preserve name_ptr / name_len across the scan.
+        mov r13, rsi;                          // r13 = name_ptr
+        mov r14, rdx;                          // r14 = name_len
+
+        // ---- Scan slots 0..head.
+        xor r12, r12;                          // slot_cursor = 0
+
+      se_ib_scan:
+        cmp r12, rbp;
+        jae se_ib_append;                      // scanned all; fall to append
+
+        // slot_addr = row_addr + slot_cursor * 32.
+        mov r10, r12;
+        shl r10, 5;                            // * 32
+        mov r15, rbx;
+        add r15, r10;                          // r15 = slot_addr
+
+        // Read kind byte; skip if not active.
+        xor rax, rax;
+        mov_b rax, [r15 + 0];                  // SE_OFF_KIND = 0
+        cmp rax, 1;                            // SE_SLOT_ACTIVE
+        jne se_ib_scan_next;
+
+        // Read slot name_len; skip if differs from input.
+        xor rax, rax;
+        mov_b rax, [r15 + 1];                  // SE_OFF_NAME_LEN = 1
+        cmp rax, r14;
+        jne se_ib_scan_next;
+
+        // Byte-compare name_inline[0..name_len] vs [r13 + i].
+        xor r10, r10;                          // j = 0
+
+      se_ib_cmp_byte:
+        cmp r10, r14;
+        jae se_ib_hit;                         // all bytes matched
+        xor rax, rax;
+        mov_b rax, [r15 + r10 + 8];            // SE_OFF_NAME_INLINE = 8
+        xor r11, r11;
+        mov_b r11, [r13 + r10];
+        cmp rax, r11;
+        jne se_ib_scan_next;
+        add r10, 1;
+        jmp se_ib_cmp_byte;
+
+      se_ib_scan_next:
+        add r12, 1;
+        jmp se_ib_scan;
+
+        // -----------------------------------------------------------
+        // HIT: slot_addr in r15; overwrite scheme_kind/type_ref/value.
+        // -----------------------------------------------------------
+      se_ib_hit:
+        // scheme_kind u8 at [+2].
+        mov_b [r15 + 2], rcx;                  // SE_OFF_SCHEME_KIND
+
+        // type_ref u32 at [+4].
+        mov_d [r15 + 4], r8;                   // SE_OFF_TYPE_REF
+
+        // value_ref u64 at [+24].
+        mov [r15 + 24], r9;                    // SE_OFF_VALUE_REF
+
+        jmp se_ib_ok;
+
+        // -----------------------------------------------------------
+        // APPEND: head unchanged; r12 == rbp == head.
+        // -----------------------------------------------------------
+      se_ib_append:
+        cmp rbp, 32;                           // SE_MAX_BINDINGS
+        jae se_ib_too_many;
+
+        // slot_addr = row_addr + head * 32.
+        mov r10, rbp;
+        shl r10, 5;
+        mov r15, rbx;
+        add r15, r10;                          // r15 = slot_addr
+
+        // kind := SE_SLOT_ACTIVE (1).
+        mov rax, 1;
+        mov_b [r15 + 0], rax;
+
+        // name_len := input.
+        mov_b [r15 + 1], r14;
+
+        // scheme_kind := input.
+        mov_b [r15 + 2], rcx;
+
+        // flags := 0.
+        xor rax, rax;
+        mov_b [r15 + 3], rax;
+
+        // type_ref := input (u32).
+        mov_d [r15 + 4], r8;
+
+        // Precompute name_inline base in rsi (sidestep the mov_b
+        // [reg + reg + off], reg encoder gap -- see
+        // shell_history.pdx L440; same precedent used by
+        // record_projection.pdx _rp_parse_impl name_copy).
+        mov rsi, r15;
+        add rsi, 8;                            // SE_OFF_NAME_INLINE
+
+        // Copy name_inline[0..name_len] from [r13..] + zero-pad to 16.
+        xor r10, r10;                          // j = 0
+
+      se_ib_name_copy:
+        cmp r10, r14;
+        jae se_ib_name_pad;
+        xor rax, rax;
+        mov_b rax, [r13 + r10 * 1];
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp se_ib_name_copy;
+
+      se_ib_name_pad:
+        // Zero-pad bytes [name_len .. 16).
+        xor rax, rax;
+
+      se_ib_pad_loop:
+        cmp r10, 16;
+        jae se_ib_name_done;
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp se_ib_pad_loop;
+
+      se_ib_name_done:
+        // value_ref u64 at [+24].
+        mov [r15 + 24], r9;
+
+        // Bump head.
+        add rbp, 1;
+        lea r11, [rip + _se_head_table];
+        mov r10, rdi;
+        shl r10, 3;
+        mov [r11 + r10], rbp;
+
+        jmp se_ib_ok;
+
+        // -----------------------------------------------------------
+        // Return paths.
+        // -----------------------------------------------------------
+      se_ib_ok:
+        xor rax, rax;                          // SE_OK = 0
+        jmp se_ib_epilogue;
+
+      se_ib_bad_sid:
+        mov rax, 0x3700;                       // SE_ERR_BAD_SESSION
+        jmp se_ib_epilogue;
+
+      se_ib_bad_name:
+        mov rax, 0x3701;                       // SE_ERR_BAD_NAME
+        jmp se_ib_epilogue;
+
+      se_ib_too_many:
+        mov rax, 0x3702;                       // SE_ERR_TOO_MANY
+        jmp se_ib_epilogue;
+
+      se_ib_bad_scheme:
+        mov rax, 0x3704;                       // SE_ERR_BAD_SCHEME_KIND
+        jmp se_ib_epilogue;
+
+      se_ib_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _se_lookup_binding(session_id, name_ptr, name_len,
+  //                    out_type_ref_ptr, out_value_ref_ptr) -> errno
+  //
+  //   rdi = session_id
+  //   rsi = name_ptr
+  //   rdx = name_len   (1..16)
+  //   rcx = out_type_ref_ptr   (u64 slot; 0 = skip the write)
+  //   r8  = out_value_ref_ptr  (u64 slot; 0 = skip the write)
+  //   rax = SE_OK / SE_ERR_BAD_SESSION / SE_ERR_BAD_NAME /
+  //         SE_ERR_NOT_FOUND
+  //
+  //   Walks slots 0..head for the first active name-match. On hit,
+  //   writes type_ref (zero-extended u64) and value_ref u64 through
+  //   the two out pointers; returns SE_OK. On miss, returns
+  //   SE_ERR_NOT_FOUND without touching either out pointer. Either
+  //   out pointer may be 0 (= skip that write).
+  //
+  // Register plan (same shape as _se_insert_binding scan):
+  //   rbx = row_addr
+  //   rbp = head
+  //   r12 = slot_cursor
+  //   r13 = name_ptr
+  //   r14 = name_len
+  //   r15 = slot_addr scratch
+  //
+  // Labels prefixed se_lb_.
+  // ==========================================================================
+  pub let _se_lookup_binding : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) (name_ptr: u64) (name_len: u64)
+       (out_type_ref_ptr: u64) (out_value_ref_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M2 (#2720): first-match lookup against the per-session binding table. 6 callee-save pushes (rbx=row_addr, rbp=head, r12=slot_cursor, r13=name_ptr, r14=name_len, r15=slot_addr scratch); pure leaf; no sub-rsp pad. Validate rdi < 8 (SE_ERR_BAD_SESSION) and rdx in [1..16] (SE_ERR_BAD_NAME). Load row_addr via shl r,10 and head from _se_head_table[sid] via shl r,3. Scan slots 0..head: slot_addr = row + i*32 (`shl r,5`); skip if kind != SE_SLOT_ACTIVE or stored name_len != query name_len; byte-compare name_inline[0..n] vs [name_ptr+j]; on all-byte match, write type_ref (u32 zero-extended to u64) to [rcx] if rcx != 0, and value_ref u64 to [r8] if r8 != 0; return SE_OK. End of scan without match returns SE_ERR_NOT_FOUND. Out-pointer null-check guards the two writes individually. All immediates (0,1,8,16,32,0x3700,0x3701,0x3703) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed se_lb_.",
+      block: {
+        // ---- Prologue.
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Guard: session_id < SE_MAX_SESSIONS (8).
+        cmp rdi, 8;
+        jae se_lb_bad_sid;
+
+        // ---- Guard: name_len in [1..16].
+        cmp rdx, 0;
+        je  se_lb_bad_name;
+        cmp rdx, 16;
+        ja  se_lb_bad_name;
+
+        // Compute row_addr.
+        mov r10, rdi;
+        shl r10, 10;
+        lea r11, [rip + _se_env_pool];
+        add r10, r11;
+        mov rbx, r10;
+
+        // Load head.
+        lea r11, [rip + _se_head_table];
+        mov r10, rdi;
+        shl r10, 3;
+        mov rbp, [r11 + r10];
+
+        // Preserve name_ptr / name_len.
+        mov r13, rsi;
+        mov r14, rdx;
+
+        // ---- Scan.
+        xor r12, r12;
+
+      se_lb_scan:
+        cmp r12, rbp;
+        jae se_lb_not_found;
+
+        // slot_addr = row + slot_cursor * 32.
+        mov r10, r12;
+        shl r10, 5;
+        mov r15, rbx;
+        add r15, r10;
+
+        // kind check.
+        xor rax, rax;
+        mov_b rax, [r15 + 0];
+        cmp rax, 1;
+        jne se_lb_scan_next;
+
+        // name_len check.
+        xor rax, rax;
+        mov_b rax, [r15 + 1];
+        cmp rax, r14;
+        jne se_lb_scan_next;
+
+        // byte compare.
+        xor r10, r10;
+
+      se_lb_cmp_byte:
+        cmp r10, r14;
+        jae se_lb_hit;
+        xor rax, rax;
+        mov_b rax, [r15 + r10 + 8];
+        xor r11, r11;
+        mov_b r11, [r13 + r10];
+        cmp rax, r11;
+        jne se_lb_scan_next;
+        add r10, 1;
+        jmp se_lb_cmp_byte;
+
+      se_lb_scan_next:
+        add r12, 1;
+        jmp se_lb_scan;
+
+        // -----------------------------------------------------------
+        // HIT: slot_addr in r15.
+        // -----------------------------------------------------------
+      se_lb_hit:
+        // Write type_ref if rcx != 0. type_ref is u32 at [+4]; we
+        // zero-extend into a full qword before writing to the u64 slot.
+        cmp rcx, 0;
+        je  se_lb_skip_type_write;
+        xor rax, rax;
+        mov_d rax, [r15 + 4];                  // zero-extend u32 -> u64
+        mov [rcx], rax;
+
+      se_lb_skip_type_write:
+        // Write value_ref if r8 != 0.
+        cmp r8, 0;
+        je  se_lb_skip_value_write;
+        mov rax, [r15 + 24];
+        mov [r8], rax;
+
+      se_lb_skip_value_write:
+        xor rax, rax;                          // SE_OK
+        jmp se_lb_epilogue;
+
+      se_lb_not_found:
+        mov rax, 0x3703;                       // SE_ERR_NOT_FOUND
+        jmp se_lb_epilogue;
+
+      se_lb_bad_sid:
+        mov rax, 0x3700;
+        jmp se_lb_epilogue;
+
+      se_lb_bad_name:
+        mov rax, 0x3701;
+        jmp se_lb_epilogue;
+
+      se_lb_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _se_unset_binding(session_id, name_ptr, name_len) -> errno
+  //
+  //   rdi = session_id
+  //   rsi = name_ptr
+  //   rdx = name_len   (1..16)
+  //   rax = SE_OK / SE_ERR_BAD_SESSION / SE_ERR_BAD_NAME /
+  //         SE_ERR_NOT_FOUND
+  //
+  //   Walks slots 0..head; on a kind-active name-match, writes
+  //   kind := SE_SLOT_EMPTY (0) and name_len := 0 (tombstone).
+  //   type_ref and value_ref are LEFT INTACT.
+  //
+  // Register plan: same 6-push shape as the other scanners.
+  //
+  // Labels prefixed se_ub_.
+  // ==========================================================================
+  pub let _se_unset_binding : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M2 (#2720): tombstone unset. 6 callee-save pushes (rbx=row_addr, rbp=head, r12=slot_cursor, r13=name_ptr, r14=name_len, r15=slot_addr scratch); pure leaf; no sub-rsp pad. Validate rdi < 8 (SE_ERR_BAD_SESSION) and rdx in [1..16] (SE_ERR_BAD_NAME). Scan loop identical to _se_lookup_binding. On name match: write kind=0 u8 at [slot+0] and name_len=0 u8 at [slot+1] (zero-cost tombstone -- type_ref/value_ref left intact); return SE_OK. On full scan no-match: return SE_ERR_NOT_FOUND. Head counter is NOT decremented (M2 is append-only; compaction is R229.M3+). All immediates (0,1,8,16,32,0x3700,0x3701,0x3703) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed se_ub_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        cmp rdi, 8;
+        jae se_ub_bad_sid;
+
+        cmp rdx, 0;
+        je  se_ub_bad_name;
+        cmp rdx, 16;
+        ja  se_ub_bad_name;
+
+        // row_addr.
+        mov r10, rdi;
+        shl r10, 10;
+        lea r11, [rip + _se_env_pool];
+        add r10, r11;
+        mov rbx, r10;
+
+        // head.
+        lea r11, [rip + _se_head_table];
+        mov r10, rdi;
+        shl r10, 3;
+        mov rbp, [r11 + r10];
+
+        mov r13, rsi;
+        mov r14, rdx;
+
+        xor r12, r12;
+
+      se_ub_scan:
+        cmp r12, rbp;
+        jae se_ub_not_found;
+
+        mov r10, r12;
+        shl r10, 5;
+        mov r15, rbx;
+        add r15, r10;
+
+        xor rax, rax;
+        mov_b rax, [r15 + 0];
+        cmp rax, 1;
+        jne se_ub_scan_next;
+
+        xor rax, rax;
+        mov_b rax, [r15 + 1];
+        cmp rax, r14;
+        jne se_ub_scan_next;
+
+        xor r10, r10;
+
+      se_ub_cmp_byte:
+        cmp r10, r14;
+        jae se_ub_hit;
+        xor rax, rax;
+        mov_b rax, [r15 + r10 + 8];
+        xor r11, r11;
+        mov_b r11, [r13 + r10];
+        cmp rax, r11;
+        jne se_ub_scan_next;
+        add r10, 1;
+        jmp se_ub_cmp_byte;
+
+      se_ub_scan_next:
+        add r12, 1;
+        jmp se_ub_scan;
+
+      se_ub_hit:
+        // Tombstone: kind := 0, name_len := 0. type_ref / value_ref
+        // left intact (zero-cost tombstone).
+        xor rax, rax;
+        mov_b [r15 + 0], rax;
+        mov_b [r15 + 1], rax;
+
+        xor rax, rax;                          // SE_OK
+        jmp se_ub_epilogue;
+
+      se_ub_not_found:
+        mov rax, 0x3703;
+        jmp se_ub_epilogue;
+
+      se_ub_bad_sid:
+        mov rax, 0x3700;
+        jmp se_ub_epilogue;
+
+      se_ub_bad_name:
+        mov rax, 0x3701;
+        jmp se_ub_epilogue;
+
+      se_ub_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

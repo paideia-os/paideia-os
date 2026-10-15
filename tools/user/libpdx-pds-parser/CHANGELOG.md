@@ -4,6 +4,348 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] -- 2026-10-14
+
+R229.M2 of the semantic-shell REPL evaluator umbrella (paideia-os#2493,
+decomposed into paideia-os#2720 for this M2) -- SESSION-SCOPED
+BINDINGS: a per-session persistent map `name -> (scheme_kind,
+type_ref, value_ref)` that threads the HM-inferred type scheme AND
+the evaluator's value reference across REPL turns. R229.M1
+(src/kernel/core/shell/repl_loop.pdx) landed the per-cycle state
+machine; R229.M2 (THIS landing) lands the piece R229.M1 deferred so a
+`let x = find . | count` on turn N resolves `x` identically on turns
+N+1..N+20..session end or explicit `unset x`.
+
+### Added
+
+- `src/session_env.pdx` module `SessionEnv`: user-space parser-tier
+  primitive that owns the per-session binding store.
+  - `_se_init() -> ()` -- boot hook, defensive 64-byte scrub of
+    `_se_head_table`.
+  - `_se_init_session(session_id) -> errno` -- attaches / resets the
+    1024-byte per-session row and clears its head counter.
+  - `_se_insert_binding(session_id, name_ptr, name_len,
+     scheme_kind, type_ref, value_ref) -> errno` -- last-wins insert
+    with linear-scan name match; appends at head on miss, overwrites
+    scheme_kind/type_ref/value_ref in place on hit.
+  - `_se_lookup_binding(session_id, name_ptr, name_len,
+     out_type_ref_ptr, out_value_ref_ptr) -> errno` -- first-match
+    lookup; each out pointer is independently nullable (`0` = skip).
+  - `_se_unset_binding(session_id, name_ptr, name_len) -> errno` --
+    zero-cost tombstone (kind := 0, name_len := 0); type_ref /
+    value_ref left intact.
+- Record layout (32 B stride, SE_BINDING_BYTES): kind u8, name_len
+  u8, scheme_kind u8, flags u8, type_ref u32, name_inline [u8;16],
+  value_ref u64.
+- Working-memory singleton `.bss` state:
+  `_se_env_pool : [u8; 8192] @align(8)` (8 sessions x 1024 bytes),
+  `_se_head_table : [u8; 64] @align(8)` (8 x u64).
+- Capacity caps: `SE_MAX_SESSIONS = 8`, `SE_MAX_BINDINGS = 32` per
+  session, `SE_NAME_MAX = 16` bytes inline.
+- Error band `0x3700..0x37FF` (R229.M2 SessionEnv):
+  - `SE_OK = 0`
+  - `SE_ERR_BAD_SESSION = 0x3700`
+  - `SE_ERR_BAD_NAME = 0x3701`
+  - `SE_ERR_TOO_MANY = 0x3702`
+  - `SE_ERR_NOT_FOUND = 0x3703`
+  - `SE_ERR_BAD_SCHEME_KIND = 0x3704`
+  Slots 0x3705..0x37FF reserved for M3+ (HM_POOL_FULL proxy,
+  TOMBSTONE_EXHAUSTED on compaction, EXPORTED_IMMUTABLE on M4+
+  cross-session rebind).
+- Pure in-process; no KIND surface; no external linker dependencies.
+- Label prefix `se_` (disjoint from `ss_` / `sh_` / `sj_` / `hf_` /
+  `cr_` / `rl_` kernel namespaces and the parser-tier `u8n_` /
+  `pl_` / `rp_` / `ll_` / `cc_` / `hm_` / `rt_` / `dl_` /
+  `sch_sig_` / `cmd_sig_` namespaces).
+
+### Changed
+
+- `src/lib.pdx` bumps `LPX_PDS_PARSER_VERSION_MINOR` 11 -> 12 and
+  adds the R229 feature-gate block
+  (`LPX_PDS_PARSER_R229_M1_READY = 0` -- kernel-side; no lib surface,
+   `LPX_PDS_PARSER_R229_M2_READY = 1`, M3..M6 reserved).
+- `caps.decl` adds R229 to the Waves roster, adds the R229.M2
+  landing paragraph + the R229.M3+ forward note to the per-milestone
+  catalogue, adds the `0x3700..0x37FF` R229.M2 band entry, promotes
+  the pre-reserved 0x3700..0x37FF note to a landed carve-out,
+  appends the `0x370[0-4]` grep-disjointness confirmation line, and
+  adds the R229.M2 linker-dependency note (pure-leaf; no cross-
+  library dep; no cross-module call -- SessionEnv STORES a HmCore
+  pool index but does not DEREFERENCE it).
+- `STATUS.md` records R229.M2 as landed with the three-item
+  milestone checklist (001 module, 002 design doc, 003 20-turn
+  smoke corpus deferred to R229.M3).
+
+### Design notes
+
+- `design/shell/session-env.md` -- the Why (R229.M1 held cycle
+  state; M2 holds session state); the 32-byte binding record
+  (kind + name_len + scheme_kind + flags + type_ref u32 +
+  name_inline [u8;16] + value_ref u64); the 8-session x 32-slot pool
+  geometry; the 1024-byte per-session row stride (`shl r,10`);
+  state semantics (insert / lookup / unset); the type-environment
+  threading pseudo-code for R229.M3+ REPL dispatch; the return band
+  disjointness proof; the 6-push pure-leaf scanner frame; the
+  fingerprint matrix (5 OK tags, allowlisted until R229.M3 lands
+  with asserting smoke-mode goldens); the forward path through
+  R229.M3..R229.M6+.
+
+### Notes
+
+- `_se_init` is a plain init hook with no state inspection; the boot
+  wiring will go into `src/kernel/boot/kernel_main.pdx` at R229.M3,
+  immediately after `_rl_init` (R229.M1) and before `_hf_init`
+  (R127.M7). This landing does NOT wire the boot order -- the
+  parser-tier satellite does not know its own boot position.
+- The 20-turn test cited in paideia-os#2720 lands as the asserting
+  smoke-mode golden at R229.M3 (`smoke/session-env-m3.golden.txt`);
+  M2 is substrate-only and allowlists its five OK fingerprints with
+  R229.M3 as the retire condition.
+- A caller that only wants the type (M3 typecheck pass) or only
+  wants the value (M3+ fast evaluator path) passes a null pointer
+  for the other out slot of `_se_lookup_binding`. The null-pointer
+  convention mirrors R127.M4 `_shell_history_scan`.
+
+## [1.11.0] -- 2026-10-14
+
+R225.M2 of the semantic-shell typechecker umbrella (paideia-os#2489,
+decomposed into paideia-os#2683 for this M2) -- ROW TYPES: Remy-style
+row polymorphism for records with named fields, layered additively
+over R225.M1's HmCore TypeNode pool. The second R225 wave on the
+parser-tier satellite introduces a new node KIND
+(`HM_KIND_TYROW = 4`) with three subkinds (ROW_EMPTY, ROW_EXT,
+ROW_VAR), the field-extension / restriction / selection /
+concatenation primitive family, and a row-aware general unifier that
+correctly handles nested rows inside TyApp subterms (notably the
+`record(row)` wrapper).
+
+### Added
+
+- `src/row_types.pdx` module `RowTypes`: parser-tier primitive family
+  that recognises row types layered over HmCore's singleton
+  `_hm_pool`. Eleven public entry points land at M2:
+  - `_rt_find(idx) -> idx` -- extends `_hm_find`'s resolved-chain
+    walk to cover ROW_VAR nodes (kind=4, subkind=2). Pure leaf.
+  - `_rt_label_hash(ptr, len) -> u32-hash` -- FNV-1a 32 over caller
+    bytes. Pure leaf. Uses `shl rax, 32; shr rax, 32` to defensively
+    truncate the hash to 32 bits after each `mul rcx` (the FNV
+    algorithm is defined mod 2^32).
+  - `_rt_alloc_node() -> pool_idx` -- reserves one 16-byte slot in
+    the shared `_hm_pool`, zero-fills it, bumps `_hm_pool_next`.
+    Pure leaf. 0 return on pool-full.
+  - `_rt_row_empty() -> pool_idx` -- allocates ROW_EMPTY (closed
+    tail).
+  - `_rt_row_var() -> pool_idx` -- allocates ROW_VAR with a fresh
+    var_id from `_hm_var_next` (shared counter with hm_core).
+  - `_rt_row_extend(label_hash, field_type_idx, rest_row_idx) ->
+    pool_idx` -- allocates a ROW_EXT node whose arg0 is the label
+    hash, arg1 is the field-type pool_idx, arg2 is the rest-row
+    pool_idx.
+  - `_rt_record_type(row_idx) -> pool_idx` -- allocates
+    `TyApp(TyCon(RECORD, arity=1), row_idx)`.
+  - `_rt_row_select(row_idx, label_hash, out_type_idx_ptr) -> errno`
+    -- walks the row chain and writes the matching field's type
+    pool_idx to `*out_type_idx_ptr`. Returns `RT_ERR_LABEL_MISSING`
+    on EMPTY or VAR tail without a prior match.
+  - `_rt_row_restrict(row_idx, label_hash, out_type_idx_ptr,
+    out_rest_idx_ptr) -> errno` -- rebuilds the row with the matched
+    extension spliced out. Reconstruction allocates fresh ROW_EXT
+    nodes for every prefix field; the original row is preserved.
+    Bounded at `RT_MAX_PREFIX_FIELDS = 10` fields of prefix.
+  - `_rt_row_concat(row_a, row_b) -> packed((idx << 32) | status)` --
+    appends row_a's fields onto row_b, rejecting the result when
+    row_a terminates in a ROW_VAR tail (`RT_ERR_CLOSED_ROW`) or when
+    any row_a label collides with a row_b label (`RT_ERR_LABEL_DUP`).
+  - `_rt_row_unify(a_idx, b_idx) -> errno` -- row-aware recursive
+    unifier. Dispatches on (kind_a, kind_b): both TyVar / both TyCon
+    delegate to `_hm_unify`; both TyApp recurse on children (since
+    they may themselves be rows); both TyRow use the Remy pivot on
+    label mismatch. Self-recursive AND cross-recursive with
+    `_hm_unify`.
+  - 16-byte TyRow node layout: `[+0]` kind=4; `[+1]` arity (0 / 2 / 0
+    for EMPTY / EXT / VAR); `[+2]` subkind (0 / 1 / 2 for EMPTY /
+    EXT / VAR); `[+3]` flags (reserved for M4 effect-row annotation);
+    `[+4]` arg0 (label_hash u32 / var_id u32 / 0); `[+8]` arg1
+    (field-type pool_idx u32 / 0 / 0); `[+12]` arg2 (rest-row
+    pool_idx / resolved pool_idx / 0). The +12 slot is shared with
+    hm_core's HM_OFF_RESOLVED so `_rt_find` walks TyVar and ROW_VAR
+    chains with one loop body.
+  - New TyCon: `RT_CON_RECORD = 10`, arity 1 -- wraps a row into a
+    type via `TyApp(TyCon(RECORD, 1), row)`. Con_id 9 is left
+    unassigned as a deliberate gap between hm_core's binary range
+    (1..8) and this unary wrapper, held for R225.M3's Datalog bridge.
+  - Error band `0x3600..0x36FF` (R225.M2 RowTypes):
+    `RT_OK = 0`, `RT_ERR_LABEL_MISSING = 0x3600`,
+    `RT_ERR_LABEL_DUP = 0x3601`, `RT_ERR_POOL_FULL = 0x3602`,
+    `RT_ERR_KIND_MISMATCH = 0x3603`, `RT_ERR_CLOSED_ROW = 0x3604`,
+    `RT_ERR_OCCURS = 0x3605` (reserved; M4+ full row-occurs check),
+    `RT_ERR_MISMATCH = 0x3606`.
+  - Scratch usage: `_hm_subst_table[384..512)` for the restrict /
+    concat prefix-field collection (10 entries of 8 bytes each). The
+    slice is disjoint from hm_core's `_hm_instantiate` use of
+    `[0..512)` and `_hm_generalise`'s split `[0..256)` + `[256..512)`
+    because row-flavoured work and type-scheme work never happen
+    inside the same shell turn.
+  - Pure in-process; no KIND surface; no cross-library linker
+    dependency. INTRA-library dependency on R225.M1 at two symbols:
+    `_hm_unify` (called from `_rt_row_unify`'s TyVar/TyCon arms) and
+    the shared `.bss` symbols `_hm_pool` / `_hm_pool_next` /
+    `_hm_var_next`.
+  - Label prefix `rt_` (unique against sibling parser-tier modules
+    in this library: `u8n_`, `sch_sig_`, `cmd_sig_`, `pl_`, `rp_`,
+    `ll_`, `cc_`, `hm_`, `dl_`, `se_`).
+
+### Changed
+
+- `src/lib.pdx` flips `LPX_PDS_PARSER_R225_M2_READY` from 0 to 1 and
+  co-bumps `LPX_PDS_PARSER_VERSION_MINOR` (parallel R224.M2 + R225.M2
+  + R229.M2 arms of Wave 117 land in a single consolidated version
+  bump; this stanza is the per-primitive scratch per the parallel-
+  wave CHANGELOG discipline and main consolidates at wave close).
+  The module-filename comment is extended with `src/row_types.pdx at
+  R225.M2`; the upstream-issues doc comment picks up
+  `paideia-os#2683 (R225.M2 RowTypes)`.
+- `caps.decl` adds the `0x3600..0x36FF` R225.M2 band entry (seven
+  slots), the R225.M2 landing paragraph to the per-milestone
+  catalogue (describing the row-walker + Remy unifier shape), the
+  row_types entry in the linker-dependencies catalogue (NO cross-
+  library deps; intra-library deps on `_hm_unify` + `_hm_pool` /
+  `_hm_pool_next` / `_hm_var_next`), and the `0x360[0-6]` grep-
+  disjointness confirmation line. The R225.M2+ typechecker-follow-
+  ups paragraph retroactively splits into R225.M2 (now landed) and
+  R225.M3+ (still reserved).
+- `STATUS.md`: adds the R225 typechecker checklist section (listing
+  M1 as previously landed and M2 as landed with this wave, M3..M10
+  deferred); extends the error-band accounting table with the
+  `row_types` + `row_types-M3+` rows.
+
+### Design notes
+
+- `design/shell/row-types-remy.md` (NEW): grammar extension, TyRow
+  node layout, interaction with HmCore's shared pool, Remy pivot
+  algorithm, status-code taxonomy (0x3600..0x36FF), encoder-pitfall
+  discipline, stack-frame accounting (max recursion ~7.1 KiB), 40-
+  test corpus enumeration (deferred to R225.M9), forward path
+  through R225.M3+ (predicate-type bridge, effect rows, cross-
+  context flow, rank-restricted enforcement, error-span attribution),
+  references to Remy 1992 "Projective ML" and Pottier-Remy 2005
+  "The essence of ML type inference".
+
+### Linker dependencies
+
+- `src/row_types.pdx` has NO cross-library linker dependency.
+  INTRA-library dependency on R225.M1 (hm_core.pdx) at the symbols
+  `_hm_unify`, `_hm_pool`, `_hm_pool_next`, and `_hm_var_next` --
+  the shared type-graph pool + the canonical pure-HM unifier that
+  `_rt_row_unify` delegates to on TyVar and TyCon arms. All eleven
+  public entry points of row_types.pdx can be linked alongside
+  hm_core.pdx standalone (no further cross-module dependency closes
+  until R225.M3's SchemasSig bridge lands).
+
+## [1.10.0] -- 2026-10-14
+
+R224.M2 of the semantic-shell lambda-lang umbrella (paideia-os#2488,
+decomposed into paideia-os#2676 for this M2) -- CLOSURE CAPTURE: the
+explicit `[binding, binding, ...]` capture list that signals the
+lambda will cross a process boundary (Q13 hybrid pipeline
+serialization) and enumerates the per-binding capture mode. Lands as
+the second R224 wave on the parser-tier satellite, companion to
+R224.M1 LambdaLit (which parses the `\params -> body` header).
+
+### Added
+
+- `src/closure_capture.pdx` module `ClosureCapture`: parser-tier
+  primitive that recognises a `[binding, binding, ...]` capture list
+  and emits a flat 32-byte ClosureCaptureHeader followed by up to 16
+  x 32-byte Binding descriptors.
+  - `_cc_parse(bytes_ptr, bytes_len, out_ptr, out_cap) -> packed_u64`
+    -- public entry point. Parses `[` + `Binding (',' Binding)*` +
+    `]` where each Binding is `identifier (':' type_name)?`. The
+    optional `:type_name` suffix selects BY_VALUE capture (sender
+    serializes using the declared type); the bare-name form selects
+    BY_REF capture (receiver resolves the name against its own
+    session scope). Returns `(bytes_written << 32) | status`.
+  - `_cc_parse_binding(bytes_ptr, bytes_len, cursor_in, write_ptr) ->
+    packed_u64` -- cross-function helper that parses one Binding
+    and writes a 32-byte Binding descriptor at write_ptr. Returns
+    `(new_cursor << 32) | status`.
+  - `_cc_skip_ws(bytes_ptr, bytes_len, cursor) -> new_cursor` --
+    pure leaf whitespace skipper. Mirrors R224.M1 LambdaLit /
+    R222.M1 SchemasSig / R226.M1 Datalog / R223.M2 RecordProjection
+    skippers byte-for-byte so the whitespace discipline is a shared
+    property of the pds-lang family.
+  - `_cc_classify_type(ident_ptr, ident_len) -> type_code` -- pure
+    leaf length-switched classifier over the eight M2-known type
+    names (u64, i64, str, hex, hash32, tsc, path, pid). Byte-for-
+    byte parallel to R224.M1 `_ll_classify_type` and R222.M1
+    `_sch_sig_classify_type`.
+  - ClosureCaptureHeader (32 B): magic u32 `'CCAP' = 0x50414343`,
+    n_bindings u16, flags u16 (bit 0 = HAS_BY_VALUE, bit 1 =
+    IS_EMPTY), bindings_offset u32 (= 32), bindings_len u32 (=
+    n_bindings * 32), reserved `[u8; 16]`.
+  - Binding descriptor (32 B each): type_code u8 (0 = untyped/BY_REF
+    or 1..9 for CC_TYPE_* mirroring LL_TYPE_* / SS_TYPE_*), name_len
+    u8, name_inline `[u8; 14]`, mode u8 (CC_MODE_BY_REF = 0 /
+    CC_MODE_BY_VALUE = 1), reserved `[u8; 15]`.
+  - Grammar M2 scope: `[binding (',' binding)*]`, empty `[]` legal
+    (sets IS_EMPTY flag), max 16 bindings per list
+    (CC_MAX_BINDINGS), max 14-byte identifier (CC_NAME_MAX).
+  - Error band `0x3500..0x35FF` (R224.M2 ClosureCapture):
+    - `CC_OK = 0`
+    - `CC_ERR_SYNTAX = 0x3500`
+    - `CC_ERR_TOO_MANY_BINDINGS = 0x3501`
+    - `CC_ERR_UNKNOWN_TYPE = 0x3502`
+    - `CC_ERR_OUT_TOO_SMALL = 0x3503`
+    - `CC_ERR_NO_OPEN = 0x3504`
+    - `CC_ERR_NO_CLOSE = 0x3505`
+  - Pure in-process; no KIND surface; no external linker
+    dependencies.
+  - Label prefix `clo_` (grep-confirmed free of collision across
+    `paideia-os/{src,tools,design,tests}` at R224.M2 landing time;
+    `cc_*` was NOT chosen because `cc_scan`/`cc_denied`/`cc_bad_sysno`
+    in `src/kernel/core/syscall/cap_check.pdx` collide at the grep
+    level even though paideia-as labels are function-local). The
+    public API still owns the `_cc_*` symbol namespace.
+
+### Changed
+
+- `src/lib.pdx` bumps `LPX_PDS_PARSER_VERSION_MINOR` 9 -> 10 and
+  flips `LPX_PDS_PARSER_R224_M2_READY` from 0 to 1. Module-filename
+  list + upstream-issues doc comment extended with the new file.
+- `caps.decl` adds the `0x3500..0x35FF` R224.M2 band entry, R224.M2
+  consumed_kinds landing paragraph (reconciled with the superseded
+  R224.M2 expression-parse-only description), grep-disjointness
+  confirmation for `0x350[0-5]`, and the R224.M2 linker-dependency
+  note (pure-leaf; one-way intra-library CALL into _cc_skip_ws /
+  _cc_classify_type / _cc_parse_binding; the R224.M2.5 integration
+  pass will add a one-way intra-library dependency where lambda_lit's
+  _ll_parse calls _cc_parse).
+- `STATUS.md` R224.M2 checklist landed; error-band accounting table
+  extended with the closure_capture row.
+
+### Design notes
+
+- `design/shell/closure-capture.md` -- grammar, record layout,
+  BY_REF vs BY_VALUE semantics (Q13 hybrid serialization), capacity
+  / bound-check matrix, interaction with R224.M1 LambdaLit (R224.M2.5
+  integration pass), R222.M1 SchemasSig (shared type codes), R223.M5
+  wire-format sink (BY_VALUE serializer), R225.M5 cross-context type
+  flow (BY_REF receiver lookup).
+
+### Reconciliation note
+
+The parent brief's R224.M2 title is "Closure over pipeline-scope
+bindings" and the acceptance is "15-test corpus of intra- and cross-
+process closures." This landing provides the PARSER tier -- the
+syntactic surface, the capture-list descriptor emission, and the
+error taxonomy. The runtime half (serializer, deserializer, by-ref
+name-resolution against the receiver's session scope) rides a
+separate landing on the kernel-side closure-arena substrate when
+R220.M7 is uplifted; those tests gate on the end-to-end runtime,
+not on the parser-tier descriptor shape this landing freezes. The
+parser-tier descriptor-emission is the ABI frozen at this M2 so the
+runtime half can layer additively without a re-parse.
+
 ## [1.9.0] -- 2026-10-14
 
 R222.M2 of the semantic-shell cmd-functor umbrella (paideia-os#2486,
