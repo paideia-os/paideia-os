@@ -52,7 +52,15 @@ public entry points `_pt_init` / `_pt_register` / `_pt_lookup`
 / `_pt_check_call` over caller-supplied buffers; magic 'PRTY' =
 0x59545250 LE; error band 0x6400..0x64FF with the E09NN mapping
 E0900 ARITY_MISMATCH / E0901 TYPE_MISMATCH / E0902
-UNKNOWN_PREDICATE) -- landed. R229.M2 (SessionEnv: session-scoped
+UNKNOWN_PREDICATE) -- landed. R226.M3 (DatalogEval: parser-tier
+bottom-up semi-naive evaluator over a 1024-slot IDB + 256-slot
+delta + 64-slot rule pool; five public entry points `_de_init` /
+`_de_add_fact` / `_de_add_rule` / `_de_run_fixpoint` / `_de_query`
+over caller-supplied buffers; 64-byte Fact record magic 'DFCT'
+0x54434644 LE; 32-byte Rule record magic 'DRUL' 0x4C555244 LE;
+error band 0x6700..0x670A; raw-M3 ships the loop shape with a
+stub `_de_fire_rules_round` returning 0 new facts, the real join
+engine lands at R226.M3.1 behind the same symbol) -- landed. R229.M2 (SessionEnv: session-scoped
 bindings) -- landed. R229.M3 (TypeEnv: type-environment threading
 = scheme store + specialisation cache) -- landed. R229.M4
 (JobControl: per-shell-session 32-slot Job table backing
@@ -372,6 +380,54 @@ records with matched stride, matched FNV family, and matched
 `@fingerprint("...")` wrapper; 200-turn smoke acceptance corpus
 enumerated in `design/shell/check-fingerprint.md` §8 and deferred to
 R225.M10.5 golden landing).
+**Wave 134 landings (parallel-arm):** R227.M8 LoadFingerprint
+(parser-tier per-script-load anti-fabrication fingerprint emitter +
+correlator implementing the LOAD-side third of project invariant P9;
+every pds script load emits
+`@fingerprint("pds.load.<script-hash-hex>")` so the debugger can
+anchor each load event to the FNV-1a 64 of the actual script bytes;
+64-byte LoadFingerprint record with magic 'LFPR' = 0x5250464C LE at
+[+0], reserved u32 at [+4], script_hash u64 at [+8] (caller-supplied,
+byte-for-byte identical to the parser-tier FNV family and to the
+R227.M7 ScriptCache source_hash so a single hash computation at
+loader ingress feeds both substrates), timestamp_us u64 at [+16] via
+rdtsc, rendered_tag u8[32] at [+24..+56] NUL-padded with fixed-width
+25-byte live `pds.load.<16-hex>` content, reserved u64 at [+56];
+four public entry points `_lf_init` / `_lf_emit` / `_lf_render_tag`
+/ `_lf_correlate` over caller-supplied buffers; `_lf_init`,
+`_lf_render_tag`, and `_lf_correlate` are PURE LEAVES; `_lf_emit`
+is a 2-callee-save-push frame (rbx=script_hash, rbp=out) with ZERO
+nested CALL (hex rendering unrolled; NO FNV loop because the caller
+supplies the hash) so no sub-rsp alignment pad is required; zero
+`.bss` at raw M8; two .rodata tables `_lf_hex_digits` [u8;16]
+(lowercase 0-9 a-f) and `_lf_prefix` [u8;16] (14-byte
+`@fingerprint("` + 2 pad bytes), both byte-for-byte identical to
+the R229.M10 TurnFingerprint and R225.M10 CheckFingerprint sibling
+copies; error band 0x6800..0x68FF with seven LF_* slots (LF_OK,
+LF_ERR_BAD_OUT 0x6800, LF_ERR_OUT_TOO_SMALL 0x6801,
+LF_ERR_BAD_RECORD 0x6802, LF_ERR_BAD_MAGIC 0x6803, LF_ERR_MISMATCH
+0x6804, LF_ERR_BAD_LEN 0x6805, LF_ERR_BAD_EXPECTED 0x6806); forms
+the three-anchor chain `pds.load.<hash>` -> `check.<id>.<ok|fail-N>`
+-> `turn.<id>.<hash>` together with R225.M10 CheckFingerprint and
+R229.M10 TurnFingerprint; 5-script load smoke acceptance (per the
+issue) deferred along with the broader R221.M9 property-test harness
+landing to R227.M8.5 golden). R225.M5 CtxFlow (parser-tier cross-
+context type-flow bridge over the Datalog <-> pipeline-record seam;
+caller-driven materialization of a 64-byte CtxFlow record describing
+one bridge value -- one `?var` escaping to pipeline context OR one
+pipeline field entering a `datalog { ... }` block -- carrying the
+source type-ref, derived destination type-ref, direction byte, and
+bridge name inline; four public entry points `_cxf_init` /
+`_cxf_derive_datalog_to_pipeline` / `_cxf_derive_pipeline_to_datalog`
+/ `_cxf_check` over caller-supplied buffers; zero `.bss` -- every
+record is caller-owned on all three operational paths; magic 'CTXF'
+= 0x46585443 LE; error band 0x6600..0x66FF with the eleven CXF_*
+slots; intra-library deps on R225.M2 RowTypes (`_rt_label_hash` +
+`_rt_row_select` CALLed from direction=1 derive) and R226.M2
+PredicateTypes (PredicateRecord read in-place from direction=0
+derive); 25-test acceptance corpus enumerated in
+`design/shell/cross-context-type-flow.md` §8 and deferred to
+R225.M5.3 golden landing).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -1300,9 +1356,64 @@ Blocked by: M1 + R222.M1 (SchemasSig descriptor array) + R220.M4
       arm in `_eu_unify` (pivot bindings for two open-tail inputs);
       reserves `EU_ERR_ROWVAR_OCCURS` and `EU_ERR_UNIFY_INCONSISTENT`.
 
-### M5 -- Cross-context type flow (deferred)
+### M5 -- Cross-context type flow (paideia-os#2686, landed)
 
-Blocked by: M2 + M3.
+- [x] **R225.M5-001** -- `src/ctx_flow.pdx` module `CtxFlow`
+      landed: four public entry points (`_cxf_init`,
+      `_cxf_derive_datalog_to_pipeline`,
+      `_cxf_derive_pipeline_to_datalog`, `_cxf_check`) over
+      caller-supplied buffers. 64-byte CtxFlow record (stride
+      power-of-two for a future `shl idx, 6` pool addressing):
+      magic u32 `'CTXF'` = `0x46585443` LE at `[+0]`; direction
+      u8 at `[+4]` (0 DATALOG_TO_PIPELINE / 1 PIPELINE_TO_DATALOG);
+      flags u8 at `[+5]`; reserved u16 at `[+6]`; src_type_ref u64
+      at `[+8]`; dst_type_ref u64 at `[+16]`; bridge_name_inline
+      u8[32] at `[+24]`; reserved u64 at `[+56]`. Zero `.bss` --
+      every record is caller-owned on all three operational paths.
+      `_cxf_init` is a bare `ret` (parallel with the parser-family
+      init-hook convention `_st_init` R223.M7 / `_ha_init` R223.M6
+      / `_ws_init` R223.M5 / `_ds_init` R222.M8 / `_dm_init`
+      R222.M6 / `_cmdreg_init` R222.M5).
+      `_cxf_derive_datalog_to_pipeline` is a PURE LEAF (6 args in
+      SysV x64 reg slots rdi/rsi/rdx/rcx/r8/r9; no CALL; r11 free
+      as scratch); reads a caller-supplied R226.M2 PredicateRecord
+      in-place, validates magic 'PRTY' at [+0], u16 arity at [+4],
+      and loads the u8 type code at `[predicate_record + 32 +
+      arg_idx]` (precomputed address; no three-term addressing).
+      `_cxf_derive_pipeline_to_datalog` is a 6-push callee-save
+      frame + `sub rsp, 16` scratch = 64 B total around two nested
+      CALLs into R225.M2's `_rt_label_hash` and `_rt_row_select`;
+      the u64 scratch at `[rsp + 0]` is zeroed BEFORE the second
+      CALL so a defensive non-zero status still leaves a well-
+      defined slot. `_cxf_check` is a PURE LEAF validator.
+      CXF_* status taxonomy in 0x6600..0x660A (band 0x6600..0x66FF
+      with the eleven slots used; 0x660B..0x66FF reserved for
+      M5.1+).
+- [x] **R225.M5-002** -- design doc landed:
+      `design/shell/cross-context-type-flow.md`. Eleven sections
+      covering position in the parser substrate (ASCII art),
+      record layout (64-byte CtxFlow + per-direction interpretation
+      of src/dst type-refs + stride reconciliation note), pool
+      (none; module owns NO .bss), public API (register maps +
+      flow for all four entries), status taxonomy (band
+      0x6600..0x66FF with the eleven CXF_* slots + grep-
+      confirmation stanza), interactions (R226.M2 PredicateTypes,
+      R225.M2 RowTypes, R222.M1 SchemasSig, R225.M8+ HM
+      elaborator, R226.M3 bottom-up evaluator), forward path (M5.1
+      open-tail relax, M5.2 HM-bridge cross-validation, M5.3
+      25-test corpus, M8/R226.M3 downstream), 25-test corpus
+      acceptance anchor (10 datalog_to_pipeline / 10 pipeline_to_
+      datalog / 5 check cases enumerated), paideia-as encoder
+      discipline, register-liveness, cross-references.
+- [ ] **R225.M5-003** -- 25-test acceptance corpus
+      (`tests/shell/cross-context/`): deferred to R225.M5.3 per
+      the forward-path staging; the design doc §8 enumerates the
+      25 cases across datalog_to_pipeline derive (10), pipeline_
+      to_datalog derive (10), and check (5).
+- [ ] **R225.M5-004** (deferred) -- M5.1 open-tail row-var relax:
+      direction=1 derive currently rejects a ROW_VAR tail; M5.1
+      allocates a fresh TyVar via `_hm_fresh_var` and binds the
+      row-var's resolved slot to it.
 
 ### M6 -- Rank-restricted let-polymorphism (deferred)
 
@@ -1573,6 +1684,49 @@ Blocked by: R220.M9.
       predicate at raw M2; a startup pass pre-registering kernel-
       known predicates with their SchemasSig type codes lands with
       R220.M4.
+
+### M3 -- Bottom-up semi-naive evaluator (paideia-os#2694, landed)
+
+- [x] **R226.M3-001** -- `src/datalog_eval.pdx` module
+      `DatalogEval` landed: `_de_init` pure-leaf idempotent pool
+      zero-fill + counter clear hook; `_de_fnv1a64` pure-leaf FNV-1a
+      64 helper (byte-for-byte mirror of `_cmd_sig_fnv1a64`,
+      `_cmdreg_fnv1a64`, `_fi_fnv1a64`, `_ha_fnv1a64`,
+      `_pt_fnv1a64`); `_de_fact_eq` pure-leaf eight-u64 Fact
+      compare; `_de_find_fact_in_idb` 4-push scanner over the IDB
+      pool; `_de_add_fact` 6-push + sub rsp,72 scratch (64 B staged
+      Fact + 8 B align pad), idempotent on byte-identical dedup,
+      appends to IDB + delta on novelty; `_de_add_rule` 6-push +
+      sub rsp,8 pad, 32 B Rule record emit; `_de_fire_rules_round`
+      pure-leaf stub returning 0 new facts (R226.M3.1 replaces with
+      real join engine); `_de_run_fixpoint` 6-push + sub rsp,8 pad,
+      drives semi-naive loop with DE_MAX_ROUNDS = 1024 termination
+      guard; `_de_query` 6-push + sub rsp,8 pad, linear-scan +
+      byte-copy over matching predicate_idx. 64-byte Fact record
+      (magic 'DFCT' 0x54434644 LE, predicate_idx u16, arity u16,
+      arg_hash u64, arg_values_inline u8[48]); 32-byte Rule record
+      (magic 'DRUL' 0x4C555244 LE, head_predicate_idx u16,
+      n_body_atoms u16, body_ptr u64, body_len u64, head_arity u16,
+      flags u16, _reserved u32); 1024-slot IDB pool (65536 B) +
+      256-slot delta pool (16384 B) + 64-slot rule pool (2048 B);
+      DE_* status taxonomy in 0x6700..0x670A (eleven slots used).
+- [x] **R226.M3-002** -- design doc landed:
+      `design/shell/datalog-semi-naive.md`.
+- [ ] **R226.M3-003** -- real rule-firing join engine: deferred to
+      R226.M3.1 -- raw M3 lands the LOOP SHAPE + stub
+      `_de_fire_rules_round` returning 0 new facts; M3.1 replaces
+      the body with a true join engine that re-parses each rule's
+      body via R226.M1 `_dl_scan_body` and filters derived heads
+      via R226.M2 `_pt_check_call`. The public ABI
+      (`_de_run_fixpoint` signature) is stable across that change.
+- [ ] **R226.M3-004** -- 40-test standard Datalog corpus
+      (ancestor / reachability / same-generation / transitive
+      closure): deferred to R226.M3.2; the design doc §3.1
+      enumerates the forward-path shape.
+- [ ] **R226.M3-005** -- perf baseline (≥1M facts/sec selective):
+      deferred to R226.M3.3; measured against the M3.2 corpus with
+      the M3.1 join engine. The acceptance anchor on the ticket
+      lands with M3.3.
 
 ## R229 REPL evaluator checklist
 
@@ -2407,6 +2561,97 @@ finalised; the line-editor primitive is the standing M6 commitment).
       fixture landing (`tests/proptest_script_cache.pdx`);
       landing with R221.M9 property-test harness.
 
+### R227.M8 -- Per-script-load fingerprint (paideia-os#2710, landed)
+
+- [x] **R227.M8-001** -- `src/load_fingerprint.pdx` module
+      `LoadFingerprint` landed: four public entry points
+      (`_lf_init`, `_lf_emit`, `_lf_render_tag`, `_lf_correlate`)
+      over caller-supplied buffers. Zero `.bss`. 64-byte
+      LoadFingerprint record with magic 'LFPR' = 0x5250464C LE
+      u32 @ [+0]; reserved u32 @ [+4] (zero at M8; reserved for
+      M8.1 load_mode); script_hash u64 @ [+8] (caller-supplied,
+      byte-for-byte identical to the parser-family FNV-1a 64
+      precedents and to the R227.M7 ScriptCache source_hash so
+      a single hash computation at loader ingress feeds both
+      substrates); timestamp_us u64 @ [+16] via rdtsc;
+      rendered_tag u8[32] @ [+24..+56] NUL-padded with the
+      standard raw-M8 live content `pds.load.<16-hex>` (25
+      bytes = 9 B prefix + 16 B hex); reserved u64 @ [+56] = 0.
+      Stride 64 is a power of two (`shl idx, 6` addressing
+      without 2-op imul-r-imm). `_lf_init` is a bare `ret`
+      kept for parallelism with the parser-family init-hook
+      convention. `_lf_emit` is a 2-callee-save-push PURE LEAF
+      with rbx=script_hash, rbp=out; no nested CALL (hex
+      rendering unrolled; NO FNV loop because the caller
+      supplies the hash) so no sub-rsp alignment pad is
+      required; writes 64 bytes to out: magic + reserved u32
+      + script_hash + rdtsc timestamp + rendered_tag + reserved
+      u64. `_lf_render_tag` is a PURE LEAF (zero callee-save
+      pushes); emits `@fingerprint("<inner>")` where <inner>
+      is copied from record[+24..+24+N] up to the first NUL
+      or offset 32; returns (bytes_written << 32) | LF_OK on
+      success (bytes_written = 41 under the standard shape).
+      `_lf_correlate` is a PURE LEAF (zero callee-save pushes);
+      verifies the wrapper prefix/suffix on expected_tag and
+      byte-compares the inner against actual_record[+24..].
+      LF_* status taxonomy in 0x6800..0x6806 (band
+      0x6800..0x68FF with the seven LF_* status codes: LF_OK
+      (0), LF_ERR_BAD_OUT (0x6800), LF_ERR_OUT_TOO_SMALL
+      (0x6801), LF_ERR_BAD_RECORD (0x6802), LF_ERR_BAD_MAGIC
+      (0x6803), LF_ERR_MISMATCH (0x6804), LF_ERR_BAD_LEN
+      (0x6805), LF_ERR_BAD_EXPECTED (0x6806); 0x6807..0x68FF
+      reserved for M8.1+ follow-ups). NO intra-library linker-
+      visible FUNCTION dep at raw M8 (hash is caller-supplied;
+      no cross-module FNV call). NO external cross-library
+      linker dep. Forms the three-anchor chain
+      `pds.load.<hash>` -> `check.<id>.<ok|fail-N>` ->
+      `turn.<id>.<hash>` together with R225.M10
+      CheckFingerprint and R229.M10 TurnFingerprint.
+      Declares a FORWARD-PATH data-sharing dependency on
+      R227.M7 ScriptCache (both consume the same caller-
+      computed script_hash; caller-stitched, no linker dep).
+- [x] **R227.M8-002** -- design doc landed:
+      `design/shell/load-fingerprint.md`.
+- [ ] **R227.M8-003** -- 5-script load acceptance fixture
+      (`tests/proptest_load_fingerprint.pdx`): fixture iterates
+      5 synthetic script_hashes through `_lf_emit`, verifies
+      `_lf_render_tag` returns `(41 << 32) | 0`, then feeds
+      each tag back through `_lf_correlate` and asserts
+      LF_OK; a sixth iteration perturbs one hash byte and
+      asserts LF_ERR_MISMATCH. Deferred along with the
+      broader parser-tier property-test harness (R221.M9
+      landing); the raw M8 surface satisfies the fixture by
+      construction (the four entry points are pure leaves /
+      2-push frames with zero nested CALL).
+- [ ] **R227.M8.1** (deferred) -- load_mode field: an
+      additional u32 at [record+0x04..+0x08] discriminating
+      interactive REPL load (0) from `source <path>` load (1)
+      from `require <mod>` load (2) from `#import <mod>` load
+      (3).
+- [ ] **R227.M8.2** (deferred) -- source_kind +
+      script_bytes_len fields: u32+u32 at [record+0x38..+0x40]
+      carrying the hashed byte count AND the source kind
+      (stdin/file/tty/net) so an auditor can cross-check the
+      FNV input length and provenance.
+- [ ] **R227.M8.3** (deferred) -- strict-mode hash-only
+      correlator: `_lf_correlate_strict(expected_tag,
+      expected_len, script_ptr, script_len)` RECOMPUTES the
+      FNV from the script bytes and compares to the hash
+      parsed out of expected_tag's inner.
+- [ ] **R227.M8.4** (deferred) -- rdtsc-skew sanity bound:
+      `_lf_correlate_sequence(records_ptr, n_records)` rejects
+      a sequence where any record's timestamp precedes the
+      previous load's timestamp.
+- [ ] **R227.M8.5** (deferred) -- 5-script smoke golden
+      corpus `smoke/load-fingerprint-m8.golden.txt` consumed
+      by `tools/verify-load-fingerprint-coverage.sh`.
+- [ ] **R227.M8.6** (deferred) -- per-import load
+      fingerprint: when the loader recurses through R227.M3
+      ImportResolve into a transitive import, emit a child
+      LoadFingerprint anchored to the ImportDirective's own
+      hash so a parent -> child chain forms the dependency-
+      order audit trail.
+
 ## Error-band accounting
 
 | Band             | Range            | Milestone | Status |
@@ -2502,6 +2747,12 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | script_cache-M7.1+ | 0x6511..0x65FF | R227.M7.1+ | reserved |
 | check_fingerprint | 0x6300..0x6308  | R225.M10  | landed |
 | check_fingerprint-M10.1+ | 0x6309..0x63FF | R225.M10.1+ | reserved |
+| datalog_eval     | 0x6700..0x670A   | R226.M3   | landed |
+| datalog_eval-M3.1+ | 0x670B..0x67FF | R226.M3.1+ | reserved |
+| load_fingerprint | 0x6800..0x6806   | R227.M8   | landed |
+| load_fingerprint-M8.1+ | 0x6807..0x68FF | R227.M8.1+ | reserved |
+| ctx_flow         | 0x6600..0x660A   | R225.M5   | landed |
+| ctx_flow-M5.1+   | 0x660B..0x66FF   | R225.M5.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in

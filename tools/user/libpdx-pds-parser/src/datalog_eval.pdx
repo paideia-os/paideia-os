@@ -1,0 +1,1528 @@
+// src/datalog_eval.pdx -- libpdx-pds-parser.R226.M3 (paideia-os#2694)
+//
+// DatalogEval: parser-tier bottom-up semi-naive evaluator for the
+// Datalog surface. R226.M3 of the datalog umbrella (paideia-os#2490).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R226.M1 (datalog.pdx) landed the parser that turns raw datalog
+// program bytes into a flat array of 48-byte Clause records. R226.M2
+// (predicate_types.pdx) landed predicate-type resolution + arity /
+// per-position type-code validation. R226.M3 (THIS module) closes the
+// third gap: a bottom-up semi-naive evaluator over an in-process EDB /
+// IDB fact store that fires the registered rules to fixpoint.
+//
+// Position in the parser substrate:
+//
+//                 raw datalog program bytes
+//                           |
+//                           v
+//       +------------------------------------------+
+//       | R221.M1  Utf8Nfc::_u8n_decode_and_       |
+//       |          normalize   (UTF-8 + NFC)       |
+//       +---------------------+--------------------+
+//                             |
+//                             v  NFC-form bytes
+//       +------------------------------------------+
+//       | R226.M1  Datalog::_dl_parse              |
+//       +---------------------+--------------------+
+//                             |
+//                             v  Clause[0..n]
+//       +------------------------------------------+
+//       | R226.M2  PredicateTypes::_pt_*           |
+//       +---------------------+--------------------+
+//                             |
+//                             v  typed predicate refs
+//       +------------------------------------------+
+//       | R226.M3  DatalogEval::_de_* (THIS)       |
+//       |                                          |
+//       |   _de_init          : zero-fill pools    |
+//       |   _de_add_fact      : append to IDB /    |
+//       |                       delta              |
+//       |   _de_add_rule      : append to rules    |
+//       |   _de_run_fixpoint  : semi-naive loop    |
+//       |   _de_query         : scan IDB by pred   |
+//       +---------------------+--------------------+
+//                             |
+//                             v  derived facts
+//       +------------------------------------------+
+//       | R226.M4+  magic-set rewriting, strat.    |
+//       |           negation, aggregation, ...     |
+//       +------------------------------------------+
+//
+// The surface is caller-driven. The elaborator (owned by R226.M3+ or
+// an adjacent landing) walks R226.M1's Clause array; for each Fact it
+// classifies the term values via R226.M2's type codes and calls
+// `_de_add_fact(predicate_idx, arity, arg_values_ptr, arg_values_len)`;
+// for each Rule it stashes the body span via `_de_add_rule(body_ptr,
+// body_len, head_predicate_idx, head_arity)`; and once the program is
+// loaded calls `_de_run_fixpoint(&rounds, &facts)` to drive the semi-
+// naive loop to a stable IDB.
+//
+// =============================================================================
+// SEMI-NAIVE EVALUATION (standard Datalog literature)
+// =============================================================================
+//
+// Classical semi-naive evaluation (Abiteboul-Hull-Vianu, chap. 13;
+// Bancilhon-Ramakrishnan 1986) keeps two fact sets per predicate:
+//
+//   IDB    -- all facts derived so far (including the EDB seeds)
+//   delta  -- facts newly derived in the LAST round only
+//
+// Each round, for every rule R = `H :- B1, B2, ..., Bk`, the join
+// `(delta_B1 join IDB_B2 join ... join IDB_Bk) UNION
+//  (IDB_B1 join delta_B2 join IDB_B3 join ... join IDB_Bk) UNION
+//  ...
+//  (IDB_B1 join IDB_B2 join ... join delta_Bk)` is computed and the
+// head-instantiated results that are not already in IDB are added to
+// a NEW delta. At the end of the round, the new delta is merged into
+// IDB and promoted to the current delta. The fixpoint is reached when
+// the new delta is empty.
+//
+// This module lands the LOOP SHAPE + the fact / rule storage; the
+// rule-firing step itself is a stub at raw M3 (the stub produces 0
+// derived facts, so the fixpoint converges in exactly one round for
+// any initial fact set -- a trivially-correct result for programs
+// without rules). The non-trivial rule-firing lands in R226.M3.1+
+// behind the same `_de_fire_rules_round` helper symbol; the public
+// `_de_run_fixpoint` surface is stable across that extension.
+//
+// At the raw-M3 landing the fixpoint runs the control loop:
+//
+//     round = 0
+//     loop:
+//       if _de_delta_count == 0: break           // fixpoint reached
+//       call _de_fire_rules_round                // M3: no-op stub
+//       _de_delta_count = 0                      // promote empty new delta
+//       round += 1
+//       if round >= DE_MAX_ROUNDS: fault
+//     write *out_round_count = round
+//     write *out_fact_count  = _de_idb_count
+//     return DE_OK
+//
+// With the stub, round == 1 for the first `_de_run_fixpoint` call
+// after any `_de_add_fact` call sequence (because the initial adds
+// populate both IDB and delta; the loop runs once, consumes delta,
+// finds the stub produces no new facts, converges). A second call
+// with no new adds returns round == 0 (delta is already empty).
+//
+// =============================================================================
+// FACT RECORD (64 B)
+// =============================================================================
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      4   magic                u32  -- 'DFCT' (0x54434644 LE)
+//     4      2   predicate_idx        u16  -- 0..0xFFFF
+//     6      2   arity                u16  -- 0..DE_MAX_ARITY (= 8)
+//     8      8   arg_hash             u64  -- FNV-1a 64 over
+//                                             arg_values_inline[0..
+//                                             arg_values_len)
+//    16     48   arg_values_inline    u8[48] -- packed (type_code +
+//                                             raw bytes per arg);
+//                                             zero-padded past
+//                                             arg_values_len.
+//
+//   total: 64 B (DE_FACT_BYTES) -- stride is a power of two so pool
+//   addressing uses `shl rN, 6` with no 2-op `imul r, imm`
+//   (feedback_pdx_encoder_pitfalls).
+//
+// =============================================================================
+// RULE RECORD (32 B)
+// =============================================================================
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      4   magic                u32  -- 'DRUL' (0x4C555244 LE)
+//     4      2   head_predicate_idx   u16
+//     6      2   n_body_atoms         u16  -- caller-supplied hint; 0
+//                                             if unknown (M3.1+ will
+//                                             re-parse the body span
+//                                             via R226.M1 `_dl_scan_
+//                                             body` to populate this).
+//     8      8   body_ptr             u64  -- opaque pointer into the
+//                                             caller's input buffer;
+//                                             the span is NOT copied
+//                                             into the module (parser
+//                                             references stay flat).
+//    16      8   body_len             u64  -- byte length of the span
+//    24      2   head_arity           u16  -- 0..DE_MAX_ARITY
+//    26      2   flags                u16  -- bit 0 reserved (M3.1+
+//                                             open-world / recursive
+//                                             / negation markers).
+//    28      4   _reserved            u32  -- zeroed; M3.1+ reserved.
+//
+//   total: 32 B (DE_RULE_BYTES) -- stride is a power of two so pool
+//   addressing uses `shl rN, 5`.
+//
+// =============================================================================
+// POOL (singleton .bss)
+// =============================================================================
+//
+//   _de_idb_facts      : [u8; 65536]   -- 1024 x 64 B IDB fact pool
+//   _de_delta_facts    : [u8; 16384]   --  256 x 64 B delta pool
+//   _de_rules          : [u8; 2048]    --   64 x 32 B rule pool
+//   _de_idb_count      : u64           -- occupied IDB slots
+//   _de_delta_count    : u64           -- occupied delta slots
+//   _de_rule_count     : u64           -- occupied rule slots
+//   _de_round_count    : u64           -- cumulative fixpoint rounds
+//                                         (M3.1+ diagnostic surface)
+//   _de_init_state     : u64           -- 0 = uninit, 1 = initialised
+//
+// Total .bss footprint: 65536 + 16384 + 2048 + 5*8 = 83,968 B.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _de_init() -> ()
+//     Zero-fill all three pools, clear every counter, mark the state
+//     sentinel initialised. Idempotent. Pure leaf.
+//
+//   _de_add_fact(predicate_idx, arity, arg_values_ptr, arg_values_len)
+//                                                          -> errno
+//     Append a fact to the IDB and the delta pool. Validates:
+//       - arity <= DE_MAX_ARITY (= 8)
+//       - arg_values_len <= DE_ARG_VALUES_INLINE_BYTES (= 48)
+//       - arg_values_ptr != 0 iff arg_values_len > 0
+//     Builds the 64 B record (magic / predicate_idx / arity /
+//     arg_hash via FNV-1a 64 / arg_values_inline byte-copy +
+//     zero-pad). Linear-scans IDB for an existing match (same
+//     predicate_idx, same arg_hash, byte-identical arg_values); if
+//     a match exists this is a no-op and returns DE_OK (idempotent
+//     re-insert). If IDB is full returns DE_ERR_FACT_POOL_FULL
+//     (0x6703); if delta is full returns DE_ERR_DELTA_POOL_FULL
+//     (0x6704).
+//
+//     rdi = predicate_idx     -- low 16 bits honoured.
+//     rsi = arity             -- low 16 bits honoured; <= 8.
+//     rdx = arg_values_ptr    -- may be 0 iff arity == 0 and
+//                                arg_values_len == 0.
+//     rcx = arg_values_len    -- <= 48.
+//     rax = DE_OK | DE_ERR_*
+//
+//   _de_add_rule(body_ptr, body_len, head_predicate_idx, head_arity)
+//                                                          -> errno
+//     Append a rule reference to the rule pool. Validates:
+//       - body_ptr != 0
+//       - body_len > 0
+//       - head_arity <= DE_MAX_ARITY (= 8)
+//     Stores (magic 'DRUL' / head_predicate_idx / 0 n_body_atoms /
+//     body_ptr / body_len / head_arity / 0 flags / 0 reserved).
+//     If the rule pool is full returns DE_ERR_RULE_POOL_FULL (0x6705).
+//     The body span is NOT copied into the module -- the caller owns
+//     the backing bytes (precedent: R226.M1 parser stores
+//     Clause.body_offset as an offset into the caller's buffer).
+//
+//     rdi = body_ptr
+//     rsi = body_len
+//     rdx = head_predicate_idx
+//     rcx = head_arity
+//     rax = DE_OK | DE_ERR_*
+//
+//   _de_run_fixpoint(out_round_count, out_fact_count) -> status
+//     Drive the semi-naive loop to a stable IDB. Each round calls
+//     `_de_fire_rules_round` (M3: no-op stub) which would populate a
+//     new-delta pool; the current M3 landing then clears the delta
+//     count to 0 to signify convergence. Caps the round count at
+//     DE_MAX_ROUNDS (= 1024) to guarantee termination even in the
+//     presence of a future buggy rule set.
+//
+//     On success:
+//       *out_round_count = number of rounds executed.
+//       *out_fact_count  = final IDB fact count.
+//       rax = DE_OK.
+//
+//     Errors:
+//       DE_ERR_BAD_PTR (0x6700) iff either out ptr is NULL.
+//       DE_ERR_FIXPOINT_LIMIT (0x6709) iff the loop ran DE_MAX_ROUNDS
+//                                      times without converging.
+//
+//     rdi = out_round_count   -- write-ptr u64
+//     rsi = out_fact_count    -- write-ptr u64
+//     rax = DE_OK | DE_ERR_*
+//
+//   _de_query(predicate_idx, out_facts, out_cap) -> packed_u64
+//     Linear-scan IDB for facts whose predicate_idx matches; copy
+//     each matching 64 B fact record into out_facts (up to the
+//     capacity cap). The scan is complete: on return the caller
+//     has either every matching fact (success) or a partial result
+//     if the output buffer filled.
+//
+//     Return packing:
+//       rax = (n_facts_written << 32) | status
+//
+//     Status:
+//       DE_OK (0)                   -- scan complete, all matching
+//                                      facts copied.
+//       DE_ERR_BAD_PTR (0x6700)     -- out_facts == 0.
+//       DE_ERR_OUT_TOO_SMALL (0x670A) -- out_cap < 64 (not room for
+//                                        even one fact).
+//
+//     If the buffer fills mid-scan (n matching facts > out_cap / 64),
+//     the scan terminates after writing (out_cap / 64) facts and
+//     returns DE_OK with n_facts_written == out_cap / 64. The caller
+//     interprets a partial fill via (n_facts_written * 64 == out_cap).
+//
+//     rdi = predicate_idx     -- low 16 bits honoured.
+//     rsi = out_facts         -- write-ptr; must be non-NULL.
+//     rdx = out_cap           -- out buffer capacity in bytes.
+//     rax = (n_facts_written << 32) | status
+//
+// =============================================================================
+// STATUS CODES -- band 0x6700..0x67FF
+// =============================================================================
+//
+// Grep confirmation at R226.M3 landing time:
+//
+//   grep -rE '0x67[0-9A-F]{2}' tools/user/libpdx-pds-parser/
+//     -> no packed-status hits outside this file,
+//        design/shell/datalog-semi-naive.md, caps.decl, STATUS.md,
+//        and the parallel R226M3 scratch CHANGELOG.
+//
+// The 0x6700..0x67FF carve-out sits directly above R227.M7 ScriptCache
+// (0x6500..0x65FF, landed) and skips the parallel-arm 0x6600..0x66FF
+// slice held for the sibling R225.M5 cross-context type-flow arm (not
+// yet landed; brief 2694 reservation).
+//
+//   DE_OK                      = 0        operation succeeded.
+//   DE_ERR_BAD_PTR             = 0x6700   NULL pointer where a non-NULL
+//                                         pointer was required
+//                                         (arg_values_ptr on add_fact
+//                                         with arg_values_len > 0;
+//                                         body_ptr on add_rule;
+//                                         out_round_count /
+//                                         out_fact_count on
+//                                         run_fixpoint; out_facts on
+//                                         query).
+//   DE_ERR_BAD_ARITY           = 0x6701   arity > DE_MAX_ARITY (= 8).
+//   DE_ERR_BAD_PREDICATE       = 0x6702   predicate_idx > 0xFFFF
+//                                         (reserved; the low-16 mask
+//                                         is enforced by the u16
+//                                         field width; this slot is
+//                                         held for an M3.1+ strict-
+//                                         predicate-idx check).
+//   DE_ERR_FACT_POOL_FULL      = 0x6703   _de_idb_count ==
+//                                         DE_IDB_SLOTS (= 1024).
+//   DE_ERR_DELTA_POOL_FULL     = 0x6704   _de_delta_count ==
+//                                         DE_DELTA_SLOTS (= 256).
+//   DE_ERR_RULE_POOL_FULL      = 0x6705   _de_rule_count ==
+//                                         DE_RULE_SLOTS (= 64).
+//   DE_ERR_ARG_VALUES_TOO_BIG  = 0x6706   arg_values_len >
+//                                         DE_ARG_VALUES_INLINE_BYTES
+//                                         (= 48).
+//   DE_ERR_ZERO_LEN            = 0x6707   body_len == 0 on add_rule.
+//   DE_ERR_NOT_INIT            = 0x6708   reserved for an M3.1+
+//                                         strict-init check; raw M3
+//                                         lazy-inits in every entry.
+//   DE_ERR_FIXPOINT_LIMIT      = 0x6709   run_fixpoint ran
+//                                         DE_MAX_ROUNDS without
+//                                         converging.
+//   DE_ERR_OUT_TOO_SMALL       = 0x670A   query: out_cap < 64.
+//
+// Slots 0x670B..0x67FF reserved for M3.1+ evaluator diagnostics
+// (predicate-not-registered, type-mismatch at rule-firing, body-span
+// re-parse syntax error, aggregator division-by-zero, etc.).
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R226.M1 Datalog parser (datalog.pdx)
+//     The caller feeds `_dl_parse` output's per-head and per-body
+//     spans into this module's `_de_add_fact` and `_de_add_rule`
+//     entry points. No direct call from THIS module into datalog.pdx
+//     at raw M3 (the rule-firing stub does not re-parse body spans).
+//     The M3.1+ rule-firing extension will CALL `_dl_scan_body` from
+//     inside `_de_fire_rules_round` to split a rule's body span into
+//     per-atom term vectors.
+//
+//   R226.M2 PredicateTypes (predicate_types.pdx)
+//     The caller resolves each predicate name to a predicate_idx
+//     (via `_pt_lookup`) BEFORE calling this module's `_de_add_fact`
+//     / `_de_add_rule` entries. The caller also drives per-position
+//     type-check via `_pt_check_call` before calling `_de_add_fact`.
+//     No direct call from THIS module into predicate_types.pdx at
+//     raw M3 (the caller stitches the two layers); the M3.1+ rule-
+//     firing extension will CALL `_pt_check_call` from inside
+//     `_de_fire_rules_round` to type-check derived heads before
+//     admitting them into the new delta.
+//
+//   R220.M4 schema registry (kernel-side; NOT yet landed)
+//     Independent of this module -- the caller's predicate_idx
+//     resolution is a PredicateTypes concern.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- the only mask needed is `and r, 0xFFFF`
+//     (imm32-safe) for u16 field reads; otherwise shift pairs.
+//   - No 2-op `imul r, imm` -- the 64 B fact stride is `shl r, 6`;
+//     the 32 B rule stride is `shl r, 5`; FNV-1a 64 multiply uses
+//     the one-op `mul rcx` form (shape identical to _cmd_sig_fnv1a64,
+//     _cmdreg_fnv1a64, _fi_fnv1a64, _pt_fnv1a64).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `DatalogEval` matches `datalog_eval.pdx`.
+//   - Labels prefixed `de_` with per-function suffix (`de_ini_` init,
+//     `de_fnv_` FNV helper, `de_feq_` fact-equality helper, `de_ff_`
+//     find-fact helper, `de_af_` add-fact, `de_ar_` add-rule,
+//     `de_fr_` fire-rules stub, `de_rf_` run-fixpoint, `de_q_`
+//     query). Grep-confirmed virgin inside tools/user/libpdx-pds-
+//     parser/src/*.pdx (no prior `de_` label). Also disjoint from
+//     the paideia-as reserved-keyword set (loop, if, let, fn, ret,
+//     done).
+//   - All `cmp reg, imm` immediates (0, 1, 2, 8, 16, 32, 48, 64, 256,
+//     1024, 0xFFFF, 0x54434644 'DFCT', 0x4C555244 'DRUL',
+//     0x6700..0x670A) fit imm32 with bit 31 clear so direct cmp-imm32
+//     is sign-safe. No MOVABS staging.
+//   - Byte loads via `xor r,r; mov_b r,[addr + idx * 1]` (zero-
+//     extends into the full qword; paideia-as #1248 + U1606
+//     mitigation; explicit *1 scale per libpdx-pds-parser Pipeline /
+//     libpdx-audit precedent).
+//   - u32 stores via `mov_d`; u16 stores via two `mov_b` byte stores
+//     (low, high); u64 stores via plain `mov [dst], rax`.
+//   - u8 stores via `mov_b [dst], rN`.
+//   - Cross-module .bss writes via `lea r11, [rip + sym]; mov [r11],
+//     rax` (precedent: hm_core.pdx, cmd_registry.pdx, predicate_
+//     types.pdx).
+//   - No three-term addressing in load / store sites -- precompute
+//     the address in a scratch reg (precedent: predicate_types.pdx
+//     `_pt_check_call`).
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R226.M3.1  Rule-firing semantics: implement `_de_fire_rules_round`
+//              as a true join engine over body atoms. For each rule,
+//              re-parse its body span via R226.M1 `_dl_scan_body` to
+//              extract body-atom spans; for each body-atom position j,
+//              drive `delta_B[j]` join `IDB_B[i!=j]` and emit head
+//              bindings; filter via R226.M2 `_pt_check_call`; admit
+//              novel heads to new_delta + IDB.
+//   R226.M3.2  40-test standard Datalog corpus (ancestor /
+//              reachability / same-generation / transitive closure
+//              benchmarks) -- the acceptance anchor on this issue.
+//   R226.M4    Magic-set rewriting: a pre-pass that rewrites rules
+//              against a goal-directed query plan.
+//   R226.M5    Stratified negation.
+//   R226.M6    Aggregation library.
+//   R226.M7    Typed-graph effect: EDB-materialising predicate
+//              signatures tied to the pdxfs graph substrate.
+//   R226.M11   Per-query fingerprint: consumes the final
+//              `_de_run_fixpoint` round / fact counts and emits
+//              `dlg.<query-id>.<n_results>` via the TurnFingerprint /
+//              CheckFingerprint pattern.
+//
+// =============================================================================
+// Upstream: paideia-os#2490 (R226 umbrella), paideia-os#2694 (THIS
+// ticket, R226.M3). Substrate: paideia-os#2692 (R226.M1 Datalog
+// parser; forward dep), paideia-os#2693 (R226.M2 PredicateTypes;
+// forward dep). Design doc: design/shell/datalog-semi-naive.md.
+
+module DatalogEval = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax; packed in high 16 bits
+  // for `_de_query`)
+  // ==========================================================================
+  //
+  // Band 0x6700..0x67FF, reserved for the R226.M3 datalog evaluator
+  // substrate. Disjoint from every prior landed satellite band:
+  //   0x2E00..0x2EFF datalog (R226.M1)
+  //   0x6400..0x64FF predicate_types (R226.M2)
+  //   0x6500..0x65FF script_cache (R227.M7)
+  //   0x6600..0x66FF reserved for the parallel R225.M5 cross-context
+  //                  type-flow arm (not yet landed).
+
+  pub let DE_OK                       : u64 = 0
+  pub let DE_ERR_BAD_PTR              : u64 = 0x6700
+  pub let DE_ERR_BAD_ARITY            : u64 = 0x6701
+  pub let DE_ERR_BAD_PREDICATE        : u64 = 0x6702
+  pub let DE_ERR_FACT_POOL_FULL       : u64 = 0x6703
+  pub let DE_ERR_DELTA_POOL_FULL      : u64 = 0x6704
+  pub let DE_ERR_RULE_POOL_FULL       : u64 = 0x6705
+  pub let DE_ERR_ARG_VALUES_TOO_BIG   : u64 = 0x6706
+  pub let DE_ERR_ZERO_LEN             : u64 = 0x6707
+  pub let DE_ERR_NOT_INIT             : u64 = 0x6708
+  pub let DE_ERR_FIXPOINT_LIMIT       : u64 = 0x6709
+  pub let DE_ERR_OUT_TOO_SMALL        : u64 = 0x670A
+
+  // ==========================================================================
+  // SECTION 2 -- RECORD / POOL LAYOUT CONSTANTS
+  // ==========================================================================
+
+  // Fact-record geometry.
+  pub let DE_FACT_BYTES               : u64 = 64
+  pub let DE_IDB_SLOTS                : u64 = 1024
+  pub let DE_IDB_BYTES                : u64 = 65536     // 1024 * 64
+  pub let DE_DELTA_SLOTS              : u64 = 256
+  pub let DE_DELTA_BYTES              : u64 = 16384     // 256 * 64
+  pub let DE_FACT_SHIFT               : u64 = 6         // shl idx, 6 => * 64
+
+  // Rule-record geometry.
+  pub let DE_RULE_BYTES               : u64 = 32
+  pub let DE_RULE_SLOTS               : u64 = 64
+  pub let DE_RULE_POOL_BYTES          : u64 = 2048      // 64 * 32
+  pub let DE_RULE_SHIFT               : u64 = 5         // shl idx, 5 => * 32
+
+  // Per-fact packing.
+  pub let DE_MAX_ARITY                : u64 = 8
+  pub let DE_ARG_VALUES_INLINE_BYTES  : u64 = 48
+
+  // Fixpoint termination guard.
+  pub let DE_MAX_ROUNDS               : u64 = 1024
+
+  // Magics.
+  pub let DE_FACT_MAGIC               : u64 = 0x54434644   // 'DFCT' LE
+  pub let DE_RULE_MAGIC               : u64 = 0x4C555244   // 'DRUL' LE
+
+  // Fact-record field offsets.
+  pub let DE_OFF_FACT_MAGIC           : u64 = 0            // u32
+  pub let DE_OFF_FACT_PREDICATE_IDX   : u64 = 4            // u16
+  pub let DE_OFF_FACT_ARITY           : u64 = 6            // u16
+  pub let DE_OFF_FACT_ARG_HASH        : u64 = 8            // u64
+  pub let DE_OFF_FACT_ARG_VALUES      : u64 = 16           // u8[48]
+
+  // Rule-record field offsets.
+  pub let DE_OFF_RULE_MAGIC           : u64 = 0            // u32
+  pub let DE_OFF_RULE_HEAD_PRED       : u64 = 4            // u16
+  pub let DE_OFF_RULE_N_BODY_ATOMS    : u64 = 6            // u16
+  pub let DE_OFF_RULE_BODY_PTR        : u64 = 8            // u64
+  pub let DE_OFF_RULE_BODY_LEN        : u64 = 16           // u64
+  pub let DE_OFF_RULE_HEAD_ARITY      : u64 = 24           // u16
+  pub let DE_OFF_RULE_FLAGS           : u64 = 26           // u16
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _de_idb_facts     : [u8; 65536] = uninit @align(8)
+  pub let mut _de_delta_facts   : [u8; 16384] = uninit @align(8)
+  pub let mut _de_rules         : [u8;  2048] = uninit @align(8)
+  pub let mut _de_idb_count     : u64         = uninit @align(8)
+  pub let mut _de_delta_count   : u64         = uninit @align(8)
+  pub let mut _de_rule_count    : u64         = uninit @align(8)
+  pub let mut _de_round_count   : u64         = uninit @align(8)
+  pub let mut _de_init_state    : u64         = uninit @align(8)
+
+  // ==========================================================================
+  // _de_fnv1a64(ptr, len) -> u64 hash
+  //
+  //   rdi = ptr
+  //   rsi = len
+  //   rax = FNV-1a 64 hash
+  //
+  // Byte-for-byte mirror of the sibling parser-tier FNV leaves
+  // (_cmd_sig_fnv1a64, _cmdreg_fnv1a64, _fi_fnv1a64, _ha_fnv1a64,
+  // _pt_fnv1a64). Replicated so this module links standalone; each
+  // family's FNV leaf produces byte-identical hashes for byte-
+  // identical inputs so a downstream consumer may compare across
+  // families.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed de_fnv_.
+  // ==========================================================================
+  pub let _de_fnv1a64 : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): FNV-1a 64 hash over [ptr, ptr+len). Pure leaf; zero pushes; no stack frame; no nested CALL. Load offset basis 0xCBF29CE484222325 (imm64) into rax; load fnv_prime 0x100000001B3 (imm64) into rcx held across the loop. For each byte: zero-extend byte load into r11 via `xor r11,r11; mov_b r11,[r8+r10*1]`; xor r11 into rax; xor rdx,rdx to clear the mul high half; `mul rcx` -> rdx:rax = rax * fnv_prime, keep low 64 in rax. Advance r10 by 1; loop. Terminates on r10 >= r9. Zero-length input returns offset basis unchanged (standard FNV behaviour). Byte-for-byte identical to command_sig.pdx _cmd_sig_fnv1a64, cmd_registry.pdx _cmdreg_fnv1a64, functor_instance.pdx _fi_fnv1a64, hostname_annot.pdx _ha_fnv1a64, predicate_types.pdx _pt_fnv1a64. The one-op `mul rcx` form is distinct from the pitfall-listed 2-op `imul r,imm`. All cmp immediates are 0 (i < len via jae). No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed de_fnv_.",
+      block: {
+        mov r8, rdi;                           // r8 = ptr
+        mov r9, rsi;                           // r9 = len
+        mov rax, 0xCBF29CE484222325;           // h = fnv_offset_basis
+        mov rcx, 0x100000001B3;                // fnv_prime
+        xor r10, r10;                          // i = 0
+
+      de_fnv_loop:
+        cmp r10, r9;
+        jae de_fnv_done;
+
+        xor r11, r11;
+        mov_b r11, [r8 + r10 * 1];
+        xor rax, r11;
+
+        xor rdx, rdx;
+        mul rcx;
+
+        add r10, 1;
+        jmp de_fnv_loop;
+
+      de_fnv_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_init() -> ()
+  //
+  //   Zero-fills _de_idb_facts (65536 B, 8192 u64 iters), _de_delta_
+  //   facts (16384 B, 2048 u64 iters), and _de_rules (2048 B, 256 u64
+  //   iters); clears every counter. Idempotent via the sentinel
+  //   _de_init_state (0 = not initialised, 1 = initialised).
+  //
+  //   The pool zero-fills are a single long u64-stride loop (10240
+  //   iters total; concatenated contiguous span would require module-
+  //   layout promises, so we do three separate loops over symbol-
+  //   addressed pools).
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed de_ini_.
+  // ==========================================================================
+  pub let _de_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_init zero-fills the three pools (IDB 65536 B / delta 16384 B / rules 2048 B) and clears every counter. Pure leaf; zero callee-save pushes; no stack frame; no nested CALL. Idempotency: load _de_init_state via `lea r11,[rip+_de_init_state]; mov rax,[r11]`; if rax != 0 return. Else: three separate u64-stride loops. For each pool: load its base via `lea r9,[rip+<pool>]`; i = 0; while i < <pool_bytes>: `mov r10,r9; add r10,i; xor rax,rax; mov [r10], rax; add i, 8; jmp`. The three loops cover 65536 + 16384 + 2048 = 83968 B = 10496 u64 stores. After the pool fills, clear _de_idb_count, _de_delta_count, _de_rule_count, _de_round_count via `lea r11,[rip+<sym>]; xor rax,rax; mov [r11], rax`. Finally set _de_init_state := 1. All cmp immediates (0, 1, 8, 2048, 16384, 65536) fit imm32 with bit 31 clear. 65536 fits imm32 (bit 31 clear). No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed de_ini_.",
+      block: {
+        // Idempotency check.
+        lea r11, [rip + _de_init_state];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne de_ini_done;
+
+        // --- Zero-fill _de_idb_facts (65536 B) via u64 stride ---------
+        lea r9, [rip + _de_idb_facts];
+        xor rcx, rcx;                          // i = 0
+
+      de_ini_idb_loop:
+        cmp rcx, 65536;
+        jae de_ini_idb_done;
+        mov r10, r9;
+        add r10, rcx;
+        xor rax, rax;
+        mov [r10], rax;
+        add rcx, 8;
+        jmp de_ini_idb_loop;
+
+      de_ini_idb_done:
+        // --- Zero-fill _de_delta_facts (16384 B) via u64 stride -------
+        lea r9, [rip + _de_delta_facts];
+        xor rcx, rcx;
+
+      de_ini_delta_loop:
+        cmp rcx, 16384;
+        jae de_ini_delta_done;
+        mov r10, r9;
+        add r10, rcx;
+        xor rax, rax;
+        mov [r10], rax;
+        add rcx, 8;
+        jmp de_ini_delta_loop;
+
+      de_ini_delta_done:
+        // --- Zero-fill _de_rules (2048 B) via u64 stride --------------
+        lea r9, [rip + _de_rules];
+        xor rcx, rcx;
+
+      de_ini_rules_loop:
+        cmp rcx, 2048;
+        jae de_ini_rules_done;
+        mov r10, r9;
+        add r10, rcx;
+        xor rax, rax;
+        mov [r10], rax;
+        add rcx, 8;
+        jmp de_ini_rules_loop;
+
+      de_ini_rules_done:
+        // --- Clear every counter --------------------------------------
+        xor rax, rax;
+        lea r11, [rip + _de_idb_count];
+        mov [r11], rax;
+        lea r11, [rip + _de_delta_count];
+        mov [r11], rax;
+        lea r11, [rip + _de_rule_count];
+        mov [r11], rax;
+        lea r11, [rip + _de_round_count];
+        mov [r11], rax;
+
+        // --- Mark initialised ----------------------------------------
+        mov rax, 1;
+        lea r11, [rip + _de_init_state];
+        mov [r11], rax;
+
+      de_ini_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_fact_eq(a_ptr, b_ptr) -> u64 (0 or 1)
+  //
+  //   rdi = a_ptr   (ptr to 64 B Fact record)
+  //   rsi = b_ptr   (ptr to 64 B Fact record)
+  //   rax = 1 iff all eight u64 words are byte-identical, else 0.
+  //
+  // Compares two Fact records as eight u64 words. The caller
+  // guarantees both pointers are 8-byte aligned (both come from the
+  // module's own `.bss` pools; both are at a `shl idx, 6` offset
+  // from a `lea rip`-produced base, so alignment is preserved).
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed de_feq_.
+  // ==========================================================================
+  pub let _de_fact_eq : (u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (b_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_fact_eq byte-compares two 64 B Fact records as eight u64 words. Pure leaf; zero callee-save pushes; no stack frame; no nested CALL. Load eight u64 pairs from [a+0..56] and [b+0..56] stepping by 8; on any inequality return 0; after all eight match return 1. Byte load via plain `mov rN, [base + disp]` (both pointers 8-byte aligned: pools are @align(8) and all per-fact offsets within a pool are at a `shl idx, 6` boundary so each slot is 8-aligned). All cmp immediates are 0 and 1 (via the register-to-register compare for word mismatch). No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed de_feq_.",
+      block: {
+        // Word 0 (magic + predicate_idx + arity).
+        mov rax, [rdi + 0];
+        mov rcx, [rsi + 0];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        // Word 1 (arg_hash).
+        mov rax, [rdi + 8];
+        mov rcx, [rsi + 8];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        // Words 2..7 (arg_values_inline[0..48] as six u64).
+        mov rax, [rdi + 16];
+        mov rcx, [rsi + 16];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        mov rax, [rdi + 24];
+        mov rcx, [rsi + 24];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        mov rax, [rdi + 32];
+        mov rcx, [rsi + 32];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        mov rax, [rdi + 40];
+        mov rcx, [rsi + 40];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        mov rax, [rdi + 48];
+        mov rcx, [rsi + 48];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        mov rax, [rdi + 56];
+        mov rcx, [rsi + 56];
+        cmp rax, rcx;
+        jne de_feq_diff;
+
+        mov rax, 1;
+        ret;
+
+      de_feq_diff:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_find_fact_in_idb(fact_ptr) -> u64 (slot_idx | 0xFFFFFFFFFFFFFFFF)
+  //
+  //   rdi = fact_ptr   (ptr to 64 B Fact record to search for)
+  //   rax = matching slot index on hit; 0xFFFFFFFFFFFFFFFF on miss.
+  //
+  // Linear scan _de_idb_facts[0 .. _de_idb_count); on each slot CALL
+  // _de_fact_eq; on hit return the slot index; on exhausted scan
+  // return the all-ones sentinel.
+  //
+  // Frame: 4 callee-save pushes (rbx=fact_ptr, r12=i, r13=slot_addr,
+  // r14=idb_base) + `sub rsp, 8` pad -> entry rsp%16==8, +32 pushes =
+  // rsp%16==8, +8 pad = rsp%16==0 at the nested CALL to _de_fact_eq.
+  //
+  // Labels prefixed de_ff_.
+  // ==========================================================================
+  pub let _de_find_fact_in_idb : (u64) -> u64 !{mem} @{} =
+    fn (fact_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_find_fact_in_idb linear-scans _de_idb_facts for a byte-identical match to the 64 B record at fact_ptr. 4 callee-save pushes (rbx=fact_ptr, r12=i, r13=slot_addr, r14=idb_base) + `sub rsp, 8` pad = 40 B frame. Entry rsp%16==8, after 4 pushes %16==8, +8 pad = rsp%16==0 at the nested CALL to _de_fact_eq. Flow: stash fact_ptr in rbx; r12 = 0; lea r14, [rip + _de_idb_facts]; loop: load count = *_de_idb_count via `lea r11,[rip+_de_idb_count]; mov rax,[r11]`; compare i (r12) with count; jae miss; slot_addr = r14 + (r12 << 6); call _de_fact_eq(fact_ptr=rbx, slot=r13); if rax == 1 return r12; else advance r12; loop. Miss: return 0xFFFFFFFFFFFFFFFF via `mov rax, -1`. All cmp immediates (0, 1) fit imm32. `mov rax, -1` is a 64-bit immediate (REX.W+MOV imm64). No test; no and-imm64; no imul-r-imm (stride via shl 6); no multiline let; no three-term addressing. Labels prefixed de_ff_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // rbx = fact_ptr
+        xor r12, r12;                          // i = 0
+        lea r14, [rip + _de_idb_facts];        // idb base
+
+      de_ff_loop:
+        // Load _de_idb_count.
+        lea r11, [rip + _de_idb_count];
+        mov rax, [r11];
+        cmp r12, rax;
+        jae de_ff_miss;
+
+        // slot_addr = idb_base + (i << 6).
+        mov r10, r12;
+        shl r10, 6;
+        mov r13, r14;
+        add r13, r10;
+
+        // Call _de_fact_eq(rbx, r13).
+        mov rdi, rbx;
+        mov rsi, r13;
+        call _de_fact_eq;
+
+        cmp rax, 1;
+        je  de_ff_hit;
+
+        // Advance.
+        add r12, 1;
+        jmp de_ff_loop;
+
+      de_ff_hit:
+        mov rax, r12;
+        jmp de_ff_epilogue;
+
+      de_ff_miss:
+        mov rax, -1;
+
+      de_ff_epilogue:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_add_fact(predicate_idx, arity, arg_values_ptr, arg_values_len)
+  //                                                            -> errno
+  //
+  //   rdi = predicate_idx    (low 16 bits honoured)
+  //   rsi = arity            (low 16 bits honoured; <= 8)
+  //   rdx = arg_values_ptr   (may be 0 iff arg_values_len == 0)
+  //   rcx = arg_values_len   (<= 48)
+  //   rax = DE_OK | DE_ERR_*
+  //
+  // Flow:
+  //   1. Validate arity <= DE_MAX_ARITY (= 8). Else DE_ERR_BAD_ARITY.
+  //   2. Validate arg_values_len <= DE_ARG_VALUES_INLINE_BYTES (= 48).
+  //      Else DE_ERR_ARG_VALUES_TOO_BIG.
+  //   3. If arg_values_len > 0: validate arg_values_ptr != 0.
+  //      Else DE_ERR_BAD_PTR.
+  //   4. Call _de_init (lazy boot).
+  //   5. Build a 64 B scratch fact on stack:
+  //        [+0]  magic 'DFCT' u32
+  //        [+4]  predicate_idx u16
+  //        [+6]  arity u16
+  //        [+8]  arg_hash u64 (FNV-1a 64 of arg_values_inline[0..
+  //              arg_values_len))
+  //        [+16] arg_values_inline u8[48] (byte-copy + zero-pad)
+  //   6. Call _de_find_fact_in_idb(scratch); if hit, return DE_OK
+  //      (idempotent re-insert).
+  //   7. Pool-full check: _de_idb_count < DE_IDB_SLOTS (= 1024);
+  //      else DE_ERR_FACT_POOL_FULL.
+  //   8. Pool-full check: _de_delta_count < DE_DELTA_SLOTS (= 256);
+  //      else DE_ERR_DELTA_POOL_FULL.
+  //   9. Append scratch to IDB at slot _de_idb_count.
+  //  10. Append scratch to delta at slot _de_delta_count.
+  //  11. Bump both counts. Return DE_OK.
+  //
+  // Frame: 6 callee-save pushes (rbx=predicate_idx, rbp=arity,
+  // r12=arg_values_ptr, r13=arg_values_len, r14=arg_hash, r15=unused)
+  // + `sub rsp, 64 + 8` scratch frame. Entry rsp%16==8, +48 pushes =
+  // rsp%16==8, +72 scratch = rsp%16==0 at every nested CALL to
+  // _de_init / _de_fnv1a64 / _de_find_fact_in_idb. The 64 B of
+  // scratch holds the staged Fact record; the extra 8 B is align pad.
+  //
+  // Labels prefixed de_af_.
+  // ==========================================================================
+  pub let _de_add_fact : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (predicate_idx: u64) (arity: u64) (arg_values_ptr: u64) (arg_values_len: u64)
+       -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_add_fact builds a 64 B Fact scratch on-stack, dedups against _de_idb_facts, and appends to IDB + delta when novel. 6 callee-save pushes (rbx=predicate_idx, rbp=arity, r12=arg_values_ptr, r13=arg_values_len, r14=arg_hash, r15=idb_slot_addr scratch) + `sub rsp, 72` scratch frame = 120 B total (frame holds a 64 B staged Fact at [rsp+0..64] + 8 B align pad at [rsp+64..72]). Entry rsp%16==8, after 6 pushes %16==8, +72 scratch = rsp%16==0 at every nested CALL to _de_init / _de_fnv1a64 / _de_find_fact_in_idb. Flow: (1) validate arity <= 8 (BAD_ARITY 0x6701); (2) arg_values_len <= 48 (ARG_VALUES_TOO_BIG 0x6706); (3) if arg_values_len > 0 then arg_values_ptr != 0 (BAD_PTR 0x6700); (4) call _de_init; (5) zero-fill 64 B scratch at [rsp+0..64] via eight u64 stores; (6) stamp magic u32 at [rsp+0] via mov_d; (7) stamp predicate_idx u16 at [rsp+4] via two mov_b (low+high); (8) stamp arity u16 at [rsp+6] via two mov_b; (9) byte-copy arg_values from [r12] into [rsp+16] for arg_values_len bytes via a byte loop (rcx = i, cmp rcx, r13; load+store); (10) call _de_fnv1a64(rdi=rsp+16, rsi=r13 clamped) and stash result as arg_hash; store u64 at [rsp+8]; (11) call _de_find_fact_in_idb(rdi=rsp+0); if rax != -1 (idempotent hit), xor rax,rax; jmp epilogue; (12) pool-full IDB: load _de_idb_count; cmp 1024; jae FACT_POOL_FULL (0x6703); (13) pool-full delta: load _de_delta_count; cmp 256; jae DELTA_POOL_FULL (0x6704); (14) write 64 B scratch to IDB at slot [count<<6] via eight u64 copies; (15) write 64 B scratch to delta at slot [delta_count<<6] via eight u64 copies; (16) bump both counts; return DE_OK. Byte load via `xor rN,rN; mov_b rN,[base + idx * 1]`; u32 store via `mov_d`; u16 store via two mov_b (low, high); u64 copy via plain mov. All cmp immediates (0, 1, 8, 16, 32, 48, 56, 64, 256, 1024, magic 0x54434644, status 0x6700..0x6706) fit imm32 with bit 31 clear. The -1 sentinel compare in step 11 uses `mov rax, -1; cmp r9, rax` via REX.W+MOV imm64 for the -1 constant (direct cmp-imm32 against bit-31-set is unsafe). No test; no and-imm64; no imul-r-imm (stride via shl 6); no multiline let; no three-term addressing (slot addresses precomputed). Labels prefixed de_af_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 72;
+
+        mov rbx, rdi;                          // predicate_idx
+        mov rbp, rsi;                          // arity
+        mov r12, rdx;                          // arg_values_ptr
+        mov r13, rcx;                          // arg_values_len
+        xor r14, r14;                          // arg_hash (computed later)
+        xor r15, r15;                          // slot_addr scratch
+
+        // (1) Validate arity <= 8.
+        cmp rbp, 8;
+        ja  de_af_bad_arity;
+
+        // (2) Validate arg_values_len <= 48.
+        cmp r13, 48;
+        ja  de_af_arg_too_big;
+
+        // (3) If arg_values_len > 0, arg_values_ptr != 0.
+        cmp r13, 0;
+        je  de_af_lazy_init;
+        cmp r12, 0;
+        je  de_af_bad_ptr;
+
+      de_af_lazy_init:
+        // (4) Lazy init.
+        call _de_init;
+
+        // (5) Zero-fill scratch Fact at [rsp+0..64] (eight u64 stores).
+        xor rax, rax;
+        mov [rsp +  0], rax;
+        mov [rsp +  8], rax;
+        mov [rsp + 16], rax;
+        mov [rsp + 24], rax;
+        mov [rsp + 32], rax;
+        mov [rsp + 40], rax;
+        mov [rsp + 48], rax;
+        mov [rsp + 56], rax;
+
+        // (6) Stamp magic 'DFCT' u32 at [rsp+0].
+        mov rax, 0x54434644;
+        mov_d [rsp + 0], rax;
+
+        // (7) Stamp predicate_idx u16 at [rsp+4]: low byte + high byte.
+        mov rax, rbx;
+        mov_b [rsp + 4], rax;
+        shr rax, 8;
+        mov_b [rsp + 5], rax;
+
+        // (8) Stamp arity u16 at [rsp+6]: low byte + high byte.
+        mov rax, rbp;
+        mov_b [rsp + 6], rax;
+        shr rax, 8;
+        mov_b [rsp + 7], rax;
+
+        // (9) Byte-copy arg_values[0..arg_values_len) into [rsp+16..].
+        //     Skip the copy entirely if arg_values_len == 0.
+        cmp r13, 0;
+        je  de_af_hash;
+
+        xor rcx, rcx;                          // i = 0
+      de_af_copy_loop:
+        cmp rcx, r13;
+        jae de_af_hash;
+        xor rax, rax;
+        mov_b rax, [r12 + rcx * 1];
+        mov r10, rsp;
+        add r10, rcx;
+        mov_b [r10 + 16], rax;
+        add rcx, 1;
+        jmp de_af_copy_loop;
+
+      de_af_hash:
+        // (10) Compute arg_hash = FNV-1a 64 of [rsp+16..rsp+16+r13).
+        mov rdi, rsp;
+        add rdi, 16;
+        mov rsi, r13;
+        call _de_fnv1a64;
+        mov r14, rax;                          // r14 = arg_hash
+        mov [rsp + 8], r14;                    // stamp u64 at [+8]
+
+        // (11) Dedup against IDB.
+        mov rdi, rsp;
+        call _de_find_fact_in_idb;
+        // rax == -1 (0xFFFFFFFFFFFFFFFF) means miss.
+        mov r9, rax;
+        mov r10, -1;
+        cmp r9, r10;
+        jne de_af_idempotent_hit;
+
+        // (12) Pool-full check IDB.
+        lea r11, [rip + _de_idb_count];
+        mov rax, [r11];
+        cmp rax, 1024;
+        jae de_af_fact_pool_full;
+
+        // (13) Pool-full check delta.
+        lea r11, [rip + _de_delta_count];
+        mov rax, [r11];
+        cmp rax, 256;
+        jae de_af_delta_pool_full;
+
+        // (14) Append scratch to IDB at slot [idb_count << 6].
+        lea r11, [rip + _de_idb_count];
+        mov rax, [r11];                        // rax = idb_count
+        mov r10, rax;
+        shl r10, 6;                            // r10 = idb_count * 64
+        lea r11, [rip + _de_idb_facts];
+        add r10, r11;                          // r10 = idb slot addr
+        mov r15, r10;                          // stash in r15
+
+        // Byte-copy 64 B scratch -> r15 via eight u64 loads+stores.
+        mov rax, [rsp +  0];
+        mov [r15 +  0], rax;
+        mov rax, [rsp +  8];
+        mov [r15 +  8], rax;
+        mov rax, [rsp + 16];
+        mov [r15 + 16], rax;
+        mov rax, [rsp + 24];
+        mov [r15 + 24], rax;
+        mov rax, [rsp + 32];
+        mov [r15 + 32], rax;
+        mov rax, [rsp + 40];
+        mov [r15 + 40], rax;
+        mov rax, [rsp + 48];
+        mov [r15 + 48], rax;
+        mov rax, [rsp + 56];
+        mov [r15 + 56], rax;
+
+        // (15) Append scratch to delta at slot [delta_count << 6].
+        lea r11, [rip + _de_delta_count];
+        mov rax, [r11];                        // rax = delta_count
+        mov r10, rax;
+        shl r10, 6;
+        lea r11, [rip + _de_delta_facts];
+        add r10, r11;
+        mov r15, r10;
+
+        mov rax, [rsp +  0];
+        mov [r15 +  0], rax;
+        mov rax, [rsp +  8];
+        mov [r15 +  8], rax;
+        mov rax, [rsp + 16];
+        mov [r15 + 16], rax;
+        mov rax, [rsp + 24];
+        mov [r15 + 24], rax;
+        mov rax, [rsp + 32];
+        mov [r15 + 32], rax;
+        mov rax, [rsp + 40];
+        mov [r15 + 40], rax;
+        mov rax, [rsp + 48];
+        mov [r15 + 48], rax;
+        mov rax, [rsp + 56];
+        mov [r15 + 56], rax;
+
+        // (16) Bump both counts.
+        lea r11, [rip + _de_idb_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        lea r11, [rip + _de_delta_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        xor rax, rax;                          // DE_OK
+        jmp de_af_epilogue;
+
+      de_af_idempotent_hit:
+        xor rax, rax;                          // DE_OK (idempotent)
+        jmp de_af_epilogue;
+
+      de_af_bad_arity:
+        mov rax, 0x6701;
+        jmp de_af_epilogue;
+
+      de_af_arg_too_big:
+        mov rax, 0x6706;
+        jmp de_af_epilogue;
+
+      de_af_bad_ptr:
+        mov rax, 0x6700;
+        jmp de_af_epilogue;
+
+      de_af_fact_pool_full:
+        mov rax, 0x6703;
+        jmp de_af_epilogue;
+
+      de_af_delta_pool_full:
+        mov rax, 0x6704;
+        jmp de_af_epilogue;
+
+      de_af_epilogue:
+        add rsp, 72;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_add_rule(body_ptr, body_len, head_predicate_idx, head_arity)
+  //                                                            -> errno
+  //
+  //   rdi = body_ptr            (opaque into caller's buffer)
+  //   rsi = body_len
+  //   rdx = head_predicate_idx  (low 16 bits honoured)
+  //   rcx = head_arity          (low 16 bits honoured; <= 8)
+  //   rax = DE_OK | DE_ERR_*
+  //
+  // Flow:
+  //   1. Validate body_ptr != 0 (DE_ERR_BAD_PTR).
+  //   2. Validate body_len > 0 (DE_ERR_ZERO_LEN).
+  //   3. Validate head_arity <= DE_MAX_ARITY (DE_ERR_BAD_ARITY).
+  //   4. Call _de_init.
+  //   5. Pool-full check: _de_rule_count < DE_RULE_SLOTS (= 64);
+  //      else DE_ERR_RULE_POOL_FULL.
+  //   6. Compute rule_slot_addr = _de_rules + (rule_count << 5).
+  //   7. Zero-fill 32 B.
+  //   8. Stamp u32 magic 'DRUL' at [+0].
+  //   9. Stamp u16 head_predicate_idx at [+4].
+  //  10. Stamp u16 n_body_atoms = 0 at [+6] (M3.1+ will populate via
+  //      a nested call into R226.M1 `_dl_scan_body`).
+  //  11. Stamp u64 body_ptr at [+8].
+  //  12. Stamp u64 body_len at [+16].
+  //  13. Stamp u16 head_arity at [+24].
+  //  14. Flags u16 + reserved u32 stay zero from the zero-fill.
+  //  15. Bump _de_rule_count. Return DE_OK.
+  //
+  // Frame: 5 callee-save pushes (rbx=body_ptr, rbp=body_len, r12=head_
+  // pred, r13=head_arity, r14=slot_addr) + `sub rsp, 8` pad -> entry
+  // rsp%16==8, +40 pushes = rsp%16==0, +8 pad = rsp%16==8... wait.
+  //
+  // Entry rsp%16==8. +5 pushes = +40 bytes = rsp%16 = 0. +8 pad =
+  // rsp%16 = 8. That's misaligned at the CALL to _de_init. We need
+  // rsp%16==0 at every nested CALL. The fix: use 6 pushes + sub rsp, 8.
+  //
+  // 6 callee-save pushes (rbx=body_ptr, rbp=body_len, r12=head_pred,
+  // r13=head_arity, r14=slot_addr, r15=unused) + `sub rsp, 8` pad.
+  // Entry rsp%16==8, +48 pushes = rsp%16==8, +8 pad = rsp%16==0 at
+  // the nested CALL.
+  //
+  // Labels prefixed de_ar_.
+  // ==========================================================================
+  pub let _de_add_rule : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (body_ptr: u64) (body_len: u64) (head_predicate_idx: u64) (head_arity: u64)
+       -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_add_rule stashes a 32 B Rule record into _de_rules. 6 callee-save pushes (rbx=body_ptr, rbp=body_len, r12=head_predicate_idx, r13=head_arity, r14=slot_addr, r15=unused) + `sub rsp, 8` pad = 56 B frame. Entry rsp%16==8, after 6 pushes %16==8, +8 pad = rsp%16==0 at the nested CALL to _de_init. Flow: (1) validate body_ptr != 0 (BAD_PTR 0x6700); (2) body_len > 0 (ZERO_LEN 0x6707); (3) head_arity <= 8 (BAD_ARITY 0x6701); (4) call _de_init; (5) pool-full: load _de_rule_count; cmp 64; jae RULE_POOL_FULL (0x6705); (6) rule_slot_addr = _de_rules + (count << 5) via `mov r10, count; shl r10, 5; lea r11, [rip + _de_rules]; add r10, r11; mov r14, r10`; (7) zero-fill 32 B at [r14+0..32] via four u64 stores; (8) stamp u32 magic 0x4C555244 'DRUL' at [+0] via mov_d; (9) stamp u16 head_predicate_idx at [+4] via two mov_b (low+high); (10) stamp u16 n_body_atoms = 0 at [+6] via two mov_b with zero; (11) stamp u64 body_ptr at [+8] via plain mov; (12) stamp u64 body_len at [+16] via plain mov; (13) stamp u16 head_arity at [+24] via two mov_b; (14) flags u16 at [+26] and reserved u32 at [+28] stay zero from the zero-fill; (15) bump _de_rule_count via `lea r11,[rip+_de_rule_count]; mov rax,[r11]; add rax,1; mov [r11], rax`; return DE_OK. u32 store via mov_d; u16 store via two mov_b (low, high); u64 store via plain mov. All cmp immediates (0, 1, 5, 8, 32, 64, magic 0x4C555244, status 0x6700/0x6701/0x6705/0x6707) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm (stride via shl 5); no multiline let; no three-term addressing. Labels prefixed de_ar_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // body_ptr
+        mov rbp, rsi;                          // body_len
+        mov r12, rdx;                          // head_predicate_idx
+        mov r13, rcx;                          // head_arity
+        xor r14, r14;                          // slot_addr
+        xor r15, r15;                          // unused scratch
+
+        // (1) Validate body_ptr != 0.
+        cmp rbx, 0;
+        je  de_ar_bad_ptr;
+
+        // (2) Validate body_len > 0.
+        cmp rbp, 0;
+        je  de_ar_zero_len;
+
+        // (3) Validate head_arity <= 8.
+        cmp r13, 8;
+        ja  de_ar_bad_arity;
+
+        // (4) Lazy init.
+        call _de_init;
+
+        // (5) Pool-full check.
+        lea r11, [rip + _de_rule_count];
+        mov rax, [r11];
+        cmp rax, 64;
+        jae de_ar_pool_full;
+
+        // (6) rule_slot_addr = _de_rules + (count << 5).
+        mov r10, rax;
+        shl r10, 5;
+        lea r11, [rip + _de_rules];
+        add r10, r11;
+        mov r14, r10;                          // r14 = slot_addr
+
+        // (7) Zero-fill 32 B at [r14+0..32] (four u64 stores).
+        xor rax, rax;
+        mov [r14 +  0], rax;
+        mov [r14 +  8], rax;
+        mov [r14 + 16], rax;
+        mov [r14 + 24], rax;
+
+        // (8) Stamp u32 magic 'DRUL' at [+0].
+        mov rax, 0x4C555244;
+        mov_d [r14 + 0], rax;
+
+        // (9) Stamp u16 head_predicate_idx at [+4].
+        mov rax, r12;
+        mov_b [r14 + 4], rax;
+        shr rax, 8;
+        mov_b [r14 + 5], rax;
+
+        // (10) Stamp u16 n_body_atoms = 0 at [+6] (both bytes zero).
+        xor rax, rax;
+        mov_b [r14 + 6], rax;
+        mov_b [r14 + 7], rax;
+
+        // (11) Stamp u64 body_ptr at [+8].
+        mov [r14 + 8], rbx;
+
+        // (12) Stamp u64 body_len at [+16].
+        mov [r14 + 16], rbp;
+
+        // (13) Stamp u16 head_arity at [+24].
+        mov rax, r13;
+        mov_b [r14 + 24], rax;
+        shr rax, 8;
+        mov_b [r14 + 25], rax;
+
+        // (15) Bump _de_rule_count.
+        lea r11, [rip + _de_rule_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        xor rax, rax;                          // DE_OK
+        jmp de_ar_epilogue;
+
+      de_ar_bad_ptr:
+        mov rax, 0x6700;
+        jmp de_ar_epilogue;
+
+      de_ar_zero_len:
+        mov rax, 0x6707;
+        jmp de_ar_epilogue;
+
+      de_ar_bad_arity:
+        mov rax, 0x6701;
+        jmp de_ar_epilogue;
+
+      de_ar_pool_full:
+        mov rax, 0x6705;
+        jmp de_ar_epilogue;
+
+      de_ar_epilogue:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_fire_rules_round() -> u64 (new_delta_count)
+  //
+  //   rax = count of facts newly derived in this round (0 at raw M3).
+  //
+  // M3 scaffolding: returns 0 unconditionally. The semi-naive loop
+  // calls this helper once per round; the stub reports "no new facts
+  // derived" so the fixpoint converges in exactly one round for any
+  // initial fact set (a trivially-correct result for programs without
+  // rules).
+  //
+  // M3.1 will replace this body with the real join engine: for each
+  // registered rule, walk the body span via R226.M1 `_dl_scan_body`,
+  // split into per-atom term vectors, drive a delta-per-position
+  // join against _de_idb_facts / _de_delta_facts, filter each derived
+  // head via R226.M2 `_pt_check_call`, and append novel heads to a
+  // new-delta pool (which this current M3 landing already provisions
+  // under the `_de_delta_facts` name -- M3.1 will swap in a true
+  // double-buffered pair and promote on round close). The symbol's
+  // public ABI (zero inputs, one u64 return = new_delta count) is
+  // stable across that extension.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed de_fr_.
+  // ==========================================================================
+  pub let _de_fire_rules_round : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_fire_rules_round is the raw-M3 stub for the rule-firing step of semi-naive evaluation. Returns 0 unconditionally so the fixpoint converges in one round. Pure leaf; zero callee-save pushes; no stack frame; no nested CALL. Reserved for an M3.1 extension that replaces the body with a true join engine over _de_rules + _de_idb_facts + _de_delta_facts (walks each rule's body span via R226.M1 _dl_scan_body, filters derived heads via R226.M2 _pt_check_call, appends novel heads to a new-delta pool). The public ABI (zero inputs, one u64 return = new_delta count) is stable across that extension. No cmp; no load; no store. Only `xor rax, rax` + `ret`. Labels prefixed de_fr_.",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_run_fixpoint(out_round_count, out_fact_count) -> status
+  //
+  //   rdi = out_round_count   (write-ptr u64)
+  //   rsi = out_fact_count    (write-ptr u64)
+  //   rax = DE_OK | DE_ERR_*
+  //
+  // Flow:
+  //   1. Validate out_round_count != 0 AND out_fact_count != 0.
+  //      Else DE_ERR_BAD_PTR.
+  //   2. Call _de_init.
+  //   3. round = 0; loop:
+  //        3a. Load _de_delta_count; if 0 break (fixpoint reached).
+  //        3b. Call _de_fire_rules_round (M3 stub -> 0).
+  //        3c. Clear _de_delta_count to 0 (promote empty new delta;
+  //            M3.1+ will promote the actual new-delta count returned
+  //            by _de_fire_rules_round, and merge new-delta into IDB
+  //            before clearing).
+  //        3d. round += 1.
+  //        3e. if round >= DE_MAX_ROUNDS: DE_ERR_FIXPOINT_LIMIT.
+  //   4. *out_round_count = round.
+  //   5. *out_fact_count  = _de_idb_count.
+  //   6. _de_round_count += round (cumulative diagnostic).
+  //   7. return DE_OK.
+  //
+  // Frame: 6 callee-save pushes (rbx=out_round_count, rbp=out_fact_
+  // count, r12=round, r13=unused, r14=unused, r15=unused) + `sub rsp,
+  // 8` pad -> entry rsp%16==8, +48 pushes = rsp%16==8, +8 pad =
+  // rsp%16==0 at every nested CALL to _de_init / _de_fire_rules_round.
+  //
+  // Labels prefixed de_rf_.
+  // ==========================================================================
+  pub let _de_run_fixpoint : (u64, u64) -> u64 !{mem} @{} =
+    fn (out_round_count: u64) (out_fact_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_run_fixpoint drives the semi-naive loop over _de_rules + _de_delta_facts + _de_idb_facts. 6 callee-save pushes (rbx=out_round_count, rbp=out_fact_count, r12=round, r13=unused, r14=unused, r15=unused) + `sub rsp, 8` pad = 56 B frame. Entry rsp%16==8, after 6 pushes %16==8, +8 pad = rsp%16==0 at every nested CALL to _de_init / _de_fire_rules_round. Flow: (1) validate rbx != 0 AND rbp != 0 (BAD_PTR 0x6700); (2) call _de_init; (3) r12 = round = 0; loop: load _de_delta_count; cmp 0; je done; call _de_fire_rules_round; clear _de_delta_count to 0 via `xor rax,rax; lea r11,[rip+_de_delta_count]; mov [r11], rax`; add r12, 1; cmp r12, 1024; jae FIXPOINT_LIMIT (0x6709); jmp loop; done: (4) store r12 at [rbx] via plain mov; (5) load _de_idb_count; store at [rbp]; (6) load _de_round_count; add r12; store back via `lea r11,[rip+_de_round_count]; mov rax,[r11]; add rax,r12; mov [r11],rax`; (7) return DE_OK (xor rax,rax). All cmp immediates (0, 1, 1024, status 0x6700/0x6709) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let; no three-term addressing. Labels prefixed de_rf_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // out_round_count ptr
+        mov rbp, rsi;                          // out_fact_count ptr
+        xor r12, r12;                          // round = 0
+        xor r13, r13;
+        xor r14, r14;
+        xor r15, r15;
+
+        // (1) Validate out ptrs.
+        cmp rbx, 0;
+        je  de_rf_bad_ptr;
+        cmp rbp, 0;
+        je  de_rf_bad_ptr;
+
+        // (2) Lazy init.
+        call _de_init;
+
+        // (3) Semi-naive loop.
+      de_rf_loop:
+        lea r11, [rip + _de_delta_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  de_rf_done;
+
+        call _de_fire_rules_round;
+        // M3 stub returns 0 (new_delta_count); ignore -- we always
+        // clear the current delta count to signify "the new delta we
+        // computed this round was empty". M3.1 will instead write
+        // _de_delta_count := rax (the returned new_delta_count).
+
+        xor rax, rax;
+        lea r11, [rip + _de_delta_count];
+        mov [r11], rax;
+
+        add r12, 1;
+        cmp r12, 1024;                         // DE_MAX_ROUNDS
+        jae de_rf_fixpoint_limit;
+
+        jmp de_rf_loop;
+
+      de_rf_done:
+        // (4) *out_round_count = round.
+        mov [rbx], r12;
+
+        // (5) *out_fact_count = _de_idb_count.
+        lea r11, [rip + _de_idb_count];
+        mov rax, [r11];
+        mov [rbp], rax;
+
+        // (6) _de_round_count += round (cumulative diagnostic).
+        lea r11, [rip + _de_round_count];
+        mov rax, [r11];
+        add rax, r12;
+        mov [r11], rax;
+
+        xor rax, rax;                          // DE_OK
+        jmp de_rf_epilogue;
+
+      de_rf_bad_ptr:
+        mov rax, 0x6700;
+        jmp de_rf_epilogue;
+
+      de_rf_fixpoint_limit:
+        mov rax, 0x6709;
+        jmp de_rf_epilogue;
+
+      de_rf_epilogue:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _de_query(predicate_idx, out_facts, out_cap) -> (n_facts<<32)|status
+  //
+  //   rdi = predicate_idx    (low 16 bits honoured)
+  //   rsi = out_facts        (write-ptr)
+  //   rdx = out_cap          (bytes)
+  //   rax = (n_facts_written << 32) | status
+  //
+  // Flow:
+  //   1. Validate out_facts != 0. Else (0<<32)|DE_ERR_BAD_PTR.
+  //   2. Validate out_cap >= 64. Else (0<<32)|DE_ERR_OUT_TOO_SMALL.
+  //   3. Call _de_init.
+  //   4. Compute max_facts = out_cap >> 6 (= out_cap / 64).
+  //   5. Linear-scan _de_idb_facts[0 .. _de_idb_count); for each
+  //      slot read its u16 predicate_idx at [+4..+6] and compare
+  //      with the low 16 bits of rdi. On match: byte-copy 64 B into
+  //      out_facts + (n_written << 6); bump n_written; if n_written
+  //      == max_facts break.
+  //   6. Return (n_written << 32) | DE_OK.
+  //
+  // Frame: 6 callee-save pushes (rbx=predicate_idx_low16, rbp=out_
+  // facts, r12=max_facts, r13=n_written, r14=i, r15=idb_base) +
+  // `sub rsp, 8` pad = 56 B. Entry rsp%16==8, +48 pushes = rsp%16==8,
+  // +8 pad = rsp%16==0 at the nested CALL to _de_init.
+  //
+  // Labels prefixed de_q_.
+  // ==========================================================================
+  pub let _de_query : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (predicate_idx: u64) (out_facts: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R226.M3 (#2694): _de_query scans _de_idb_facts for facts matching predicate_idx and copies up to (out_cap / 64) of them into out_facts. 6 callee-save pushes (rbx=predicate_idx_low16, rbp=out_facts, r12=max_facts, r13=n_written, r14=i, r15=idb_base) + `sub rsp, 8` pad = 56 B frame. Entry rsp%16==8, after 6 pushes %16==8, +8 pad = rsp%16==0 at the nested CALL to _de_init. Flow: (1) validate rsi != 0 (BAD_PTR 0x6700); (2) rdx >= 64 (OUT_TOO_SMALL 0x670A); (3) call _de_init; (4) max_facts = rdx >> 6; (5) mask predicate_idx to low 16 via `shl rbx, 48; shr rbx, 48`; (6) r14 = 0; r13 = 0; lea r15, [rip + _de_idb_facts]; loop: load _de_idb_count; cmp r14 >= count -> break; slot_addr = r15 + (r14 << 6); load u16 pred at [slot+4]: `xor r9,r9; mov_b r9,[slot+4]; xor r10,r10; mov_b r10,[slot+5]; shl r10,8; or r9,r10`; cmp r9 vs rbx; if match: dst_addr = rbp + (r13 << 6); byte-copy 64 B via eight u64 loads+stores from slot_addr to dst_addr; r13 += 1; if r13 == r12 break; advance r14; loop. (7) Pack return: rax = (r13 << 32) | DE_OK. On error paths pack (0 << 32) | status. All cmp immediates (0, 1, 8, 48, 64, status 0x6700/0x670A) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm (stride via shl 6; shift pair for low-16 mask); no multiline let; no three-term addressing. Labels prefixed de_q_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // predicate_idx
+        mov rbp, rsi;                          // out_facts
+        mov r12, rdx;                          // out_cap (reused for max_facts)
+        xor r13, r13;                          // n_written = 0
+        xor r14, r14;                          // i = 0
+        xor r15, r15;                          // idb_base (set later)
+
+        // (1) Validate out_facts != 0.
+        cmp rbp, 0;
+        je  de_q_bad_ptr;
+
+        // (2) Validate out_cap >= 64.
+        cmp r12, 64;
+        jb  de_q_out_too_small;
+
+        // (3) Lazy init.
+        call _de_init;
+
+        // (4) max_facts = out_cap >> 6 (into r12).
+        shr r12, 6;
+
+        // (5) Mask predicate_idx to low 16 via shift pair.
+        shl rbx, 48;
+        shr rbx, 48;
+
+        // (6) Scan loop.
+        lea r15, [rip + _de_idb_facts];
+
+      de_q_scan_loop:
+        // Load _de_idb_count; stop iff i >= count.
+        lea r11, [rip + _de_idb_count];
+        mov rax, [r11];
+        cmp r14, rax;
+        jae de_q_scan_done;
+
+        // slot_addr = idb_base + (i << 6) -> r10.
+        mov r10, r14;
+        shl r10, 6;
+        add r10, r15;
+
+        // Load u16 predicate_idx from [slot+4..+6].
+        xor r9, r9;
+        mov_b r9, [r10 + 4];
+        xor r8, r8;
+        mov_b r8, [r10 + 5];
+        shl r8, 8;
+        or  r9, r8;
+
+        // Compare with rbx (masked target).
+        cmp r9, rbx;
+        jne de_q_advance;
+
+        // Match: byte-copy 64 B into out_facts + (n_written << 6).
+        mov r8, r13;
+        shl r8, 6;
+        add r8, rbp;                           // r8 = dst_addr
+
+        // Eight u64 loads + stores.
+        mov rax, [r10 +  0];
+        mov [r8 +  0], rax;
+        mov rax, [r10 +  8];
+        mov [r8 +  8], rax;
+        mov rax, [r10 + 16];
+        mov [r8 + 16], rax;
+        mov rax, [r10 + 24];
+        mov [r8 + 24], rax;
+        mov rax, [r10 + 32];
+        mov [r8 + 32], rax;
+        mov rax, [r10 + 40];
+        mov [r8 + 40], rax;
+        mov rax, [r10 + 48];
+        mov [r8 + 48], rax;
+        mov rax, [r10 + 56];
+        mov [r8 + 56], rax;
+
+        add r13, 1;
+        cmp r13, r12;                          // n_written == max_facts?
+        jae de_q_scan_done;
+
+      de_q_advance:
+        add r14, 1;
+        jmp de_q_scan_loop;
+
+      de_q_scan_done:
+        // (7) Pack return: (n_written << 32) | DE_OK.
+        mov rax, r13;
+        shl rax, 32;
+        // DE_OK = 0, so no OR needed.
+        jmp de_q_epilogue;
+
+      de_q_bad_ptr:
+        // (0 << 32) | DE_ERR_BAD_PTR.
+        mov rax, 0x6700;
+        jmp de_q_epilogue;
+
+      de_q_out_too_small:
+        mov rax, 0x670A;
+        jmp de_q_epilogue;
+
+      de_q_epilogue:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
