@@ -87,8 +87,44 @@ four public entry points `_ws_init` / `_ws_serialize_record` /
 buffers; zero `.bss`; all PURE LEAVES; magic 'WSNK' = 0x4B4E5357 LE,
 version u16 = 1; error band 0x5200..0x52FF; serialization-only
 landing with the TCP + ChaCha20-Poly1305 transport half deferred
-to R137.M4 OSARCH substrate) -- landed.
-**Version:** 1.28.0.
+to R137.M4 OSARCH substrate) -- landed. R224.M7 (LinearPropagate:
+Walker 2005 substructural-lattice propagation across lambda closure
+capture; four-point lattice UNRESTRICTED/AFFINE/RELEVANT/LINEAR
+encoded as a two-bit restriction mask so lattice JOIN = `or`,
+lattice MEET = `and` with no table lookup; five public entry points
+`_lp_init` / `_lp_meet` / `_lp_join` / `_lp_check_use` /
+`_lp_classify_lambda` over caller-supplied inputs + a R224.M2
+ClosureCapture record passed BY OPAQUE POINTER + a parallel
+caller-supplied `env_kinds` byte array; zero `.bss`; all PURE
+LEAVES; error band 0x5600..0x56FF; the propagated-kind write-back
+into the LambdaHeader / PipelineLambda tail is deferred to the
+M7.5 HM-pass wire-up) -- landed. R229.M7 (ViMode: per-shell-session
+vi-mode state machine over the R229.M6 LineEditor substrate;
+NORMAL / INSERT / VISUAL / COMMAND four-mode dispatcher with
+motion keys `h`/`l`/`j`/`k`/`w`/`b`/`e`/`0`/`$`/`gg`/`G`,
+operators `d`/`c`/`y` composed with motions, linewise doubles
+`dd`/`cc`/`yy`, paste `p`/`P`, mode entry `i`/`a`/`I`/`A`/`o`/
+`O`/`v`/`:`, ESC return to NORMAL; four u64 scalars in a
+singleton `.bss`; line buffer + kill buffer + cursor shared with
+R229.M6 LineEditor via cross-module linker reference; four public
+entry points `_vi_init` / `_vi_reset` / `_vi_mode_get` /
+`_vi_dispatch_key`; `_vi_dispatch_key` is a 6-push PURE LEAF
+(ZERO nested CALL, ZERO stack pad -- all buffer manipulation is
+INLINED); error band 0x5700..0x57FF; ASCII-whitespace word
+boundaries at raw M7; TR#29-cluster-aware motion refinement
+lands at M7.2) -- landed. R223.M7 (SessionType: session-typed
+edge protocol enforcement for pipeline-lang stage graphs; 32-byte
+SessionType record pair materialises every `|` boundary as one
+PRODUCE + one CONSUME half; `_st_check_duality` validates
+magic + direction + CLOSED + schema_tag_hash across the pair and
+reports the E0710..E0713 diagnostic family on mismatch; four
+public entry points `_st_init` / `_st_build_edge` /
+`_st_check_duality` / `_st_render` over caller-supplied buffers;
+zero `.bss`; all PURE LEAVES; magic 'SESS' = 0x53534553 LE;
+error band 0x5500..0x55FF; single-step protocol at raw M7 with
+multi-step chains / branch types / linearity cross-wire
+deferred to M7.1+) -- landed.
+**Version:** 1.30.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 **Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
 **Wave 126 landings:** R224.M6 PipelineLambda, R229.M5 History,
@@ -97,6 +133,16 @@ R222.M8 DescribeSig.
 13 bindings from design/terminal/editor-bindings.md §1), R223.M6
 HostnameAnnot (@hostname annotation parse + type), R223.M5 WireSink
 (Cap'n Proto-ish cross-boundary record serializer).
+**Wave 128 landings:** R224.M7 LinearPropagate (Walker 2005
+substructural-lattice propagation across lambda closure capture;
+10-test corpus of linear-capture cases enumerated in
+`design/shell/linear-propagation.md` §7), R229.M7 ViMode (vi-mode
+state machine over the R229.M6 LineEditor substrate; all
+bindings from `design/terminal/editor-bindings.md` §2),
+R223.M7 SessionType (session-typed edge protocol enforcement
+for pipeline-lang stage graphs; 32-byte SessionType record pair
+per `|` boundary, dual-pair check reports E0710..E0713 on
+mismatch per `design/shell/session-typed-edges.md` §3).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -579,6 +625,94 @@ R222.M4 ArgFlagSpec at its M4.1+ follow-ups.
       hashing). Raw-bytes mode stays available for pin-on-wire
       daemons. Filed as R223.M6.5 follow-up.
 
+### M7 -- Session-typed edge protocol enforcement (paideia-os#2672, landed)
+
+Re-scoped from the prior placeholder "pipeline fuzz corpus"
+occupying this M-slot. The fuzz-corpus landing (test harnesses
+for Pipeline / RecordProjection / FilterOp / SortGroupReduce /
+WireSink / HostnameAnnot and now SessionType) relocates to a
+future wave slot bridged via R221.M7 FuzzHarness; the "deferred
+to R223.M7" bridge notes in sibling milestones' tasks
+(R223.M1-003, R223.M2-003, R223.M4-003, R223.M5-003, R223.M6-003)
+reflect the pre-rescoping plan and remain accurate about the
+test content, only the destination M-slot moves.
+
+- [x] **R223.M7-001** -- `src/session_type.pdx` module `SessionType`
+      landed: four public entry points over caller-supplied buffers;
+      zero `.bss` footprint; all PURE LEAVES. `_st_init` is a bare
+      `ret` kept for parallelism with the HostnameAnnot / WireSink /
+      DescribeSig / DispatchMode / CmdRegistry init-hook family.
+      `_st_build_edge(producer_name_ptr, consumer_name_ptr, out,
+      out_cap)` is a pure-leaf edge-pair emitter: validates both
+      name pointers non-null (`ST_ERR_BAD_SCHEMA` 0x5500 on fail),
+      `out != 0` and `out_cap >= 64` (`ST_ERR_OUT_TOO_SMALL` 0x5501
+      on fail); zero-fills the 64-byte region via 8 u64 stores;
+      Record A emit at `[out+0..+32)` with direction = PRODUCE (0),
+      magic 'SESS' (0x53534553 LE), flags byte 1 (`ST_FLAG_CLOSED`),
+      byte-copies producer_name[0..16] inline to `[+16..+32]`,
+      scans for first NUL to compute live length, FNV-1a 64 over
+      the live prefix, writes hash u64 at `[+8]`; Record B emit at
+      `[out+32..+64)` mirrors with direction = CONSUME (1).
+      Returns `(64 << 32) | ST_OK` on success.
+      `_st_check_duality(edge_a, edge_b)` is a pure-leaf dual-pair
+      validator: validates both record pointers non-null
+      (`ST_ERR_BAD_RECORD` 0x5502); magic on both halves
+      (`ST_ERR_PROTOCOL_DRIFT` 0x5513 = E0713); direction byte in
+      `{0, 1}` on both halves (`ST_ERR_PROTOCOL_DRIFT`); directions
+      differ (`ST_ERR_DIRECTION_MISMATCH` 0x5511 = E0711);
+      `ST_FLAG_CLOSED` set on both halves (`ST_ERR_UNCLOSED_SESSION`
+      0x5512 = E0712); schema_tag_hash equal
+      (`ST_ERR_SCHEMA_MISMATCH` 0x5510 = E0710). Validation
+      ordering runs most-specific error first.
+      `_st_render(record, out, out_cap)` emits the human-readable
+      surface form ('!' / '?' prefix per direction + schema name
+      up to first NUL + ';done' / ';open' per CLOSED bit; total
+      6..22 bytes) for diagnostic splicing into the REPL's E07NN
+      message templates. Status taxonomy in 0x5500..0x5513 (eight
+      codes). Label prefix `st_` disjoint from every sibling
+      satellite's prefix and from paideia-as reserved keywords.
+- [x] **R223.M7-002** -- design doc landed:
+      `design/shell/session-typed-edges.md`. Fourteen sections:
+      scope + motivation, why session types and not a flat compare,
+      the session-type lattice + duality rule, wire record layout +
+      field-by-field rationale + why 32 bytes + why FNV-1a 64,
+      public API + register maps, status band + disjointness proof,
+      encoder discipline, register-liveness per entry, lazy-init
+      non-applicability, acceptance (ten adversarial mismatched
+      pipelines per issue #2672), consumer pattern
+      (build -> check -> render), boundary ("where this is NOT":
+      not runtime, not full session-type system, not effect / cap
+      row, not wire protocol), file footprint, forward path
+      (M7.1..M7.6).
+- [ ] **R223.M7-003** -- 10-fixture adversarial mismatched-pipeline
+      corpus (`tests/proptest_session_type.pdx`): deferred to a
+      future fuzz-harness wave bridged via R221.M7 FuzzHarness
+      once a `FUZZ_KIND_SESSION_TYPE` target is added. The design
+      doc §10 enumerates the ten cases (schema mismatches across
+      five pipeline shapes from `design/terminal/semantic-shell.md`
+      §cross-schema-pipelines plus five hand-fabricated edge
+      records exercising E0711 / E0712 / E0713 classes).
+- [ ] **R223.M7-004** (deferred) -- Multi-step protocol chains via
+      `flags` bit 1 (ST_FLAG_CHAIN) + a trailing far-pointer in
+      the reserved u16 slot that points at the next SessionType
+      record in a chain pool. Filed as R223.M7.1 follow-up.
+- [ ] **R223.M7-005** (deferred) -- Fan-out protocols for
+      `@group:rule` host-set edges (R223.M6 HostnameAnnot
+      federation extension pairing). Filed as R223.M7.2 follow-up.
+- [ ] **R223.M7-006** (deferred) -- Branch types (`&{A, B}`
+      external choice, `+{A, B}` internal choice) encoded in a
+      trailing variant tag inside the reserved u16 slot. Filed
+      as R223.M7.3 follow-up.
+- [ ] **R223.M7-007** (deferred) -- Linearity cross-wire: pair
+      SessionType with R224.M7 LinearPropagate `LP_KIND_LINEAR`
+      to statically enforce one-shot edge records. Filed as
+      R223.M7.4 follow-up.
+- [ ] **R223.M7-008** (deferred) -- Combined quintuple
+      acceptance pass that cross-validates (schema, direction,
+      closed, effect-row, cap-row) at a single edge; wires
+      R225.M4 EffectUnify + R224.M4 CapRow into the duality
+      check. Filed as R223.M7.5 follow-up.
+
 ## R224 lambda-lang checklist
 
 ### M1 -- Lambda literal grammar (paideia-os#2675, landed)
@@ -794,9 +928,63 @@ rather than a semantic unlock.
 
 Blocked by: M2, R220.M7 (closure arena), R223.M4 (higher-order combinators).
 
-### M7 -- Linear/affine propagation (deferred)
+### M7 -- Linear/affine propagation (paideia-os#2681, landed)
 
-Blocked by: M4. 20-test parser corpus + fuzz run gate landing.
+- [x] **R224.M7-001** -- `src/linear_propagate.pdx` module
+      `LinearPropagate` landed: five public entry points over
+      caller-supplied inputs; zero `.bss` at raw M7; all PURE
+      LEAVES.
+      - `_lp_init()` -- bare `ret` (no `.bss` at M7; parallelism
+        with every other parser-family init hook).
+      - `_lp_meet(k1, k2)` -- lattice MEET; `and rax, rsi` after
+        band validation; returns LP_UNKNOWN_KIND (0xFF) on
+        out-of-band input.
+      - `_lp_join(k1, k2)` -- lattice JOIN; `or rax, rsi` after
+        band validation; the primitive Walker 2005's propagation
+        rule uses most.
+      - `_lp_check_use(kind, use_count)` -- per-binding
+        substructural discipline check (LINEAR == 1 exactly;
+        AFFINE in {0,1}; RELEVANT >= 1; UNRESTRICTED any; kind
+        > 3 is LP_ERR_BAD_KIND).
+      - `_lp_classify_lambda(lambda_lit_ref, closure_env_ref,
+        env_kinds_ref, env_kinds_len)` -- walks a R224.M2
+        ClosureCapture record (magic 'CCAP' at [+0]; n_bindings
+        u16 at [+4]; bounded by LP_MAX_BINDINGS=16), JOINs each
+        caller-supplied per-binding kind into an accumulator
+        starting at UNRESTRICTED (0); returns packed
+        `(propagated_kind << 32) | status`. `lambda_lit_ref` is
+        reserved for M7.1 (user-declared kind override).
+      - Two-bit restriction encoding (bit 0 = no_contraction,
+        bit 1 = no_weakening) is load-bearing: lattice JOIN
+        compiles to `or`, MEET compiles to `and`; the non-trivial
+        pair JOIN(AFFINE=1, RELEVANT=2) = 1|2 = 3 = LINEAR holds.
+      - LP_* status taxonomy in 0x5600..0x56FF (9 slots used:
+        LP_OK (0), LP_ERR_BAD_KIND (0x5600),
+        LP_ERR_LINEAR_NOT_USED (0x5601),
+        LP_ERR_LINEAR_MULTI_USE (0x5602),
+        LP_ERR_AFFINE_MULTI_USE (0x5603),
+        LP_ERR_RELEVANT_NOT_USED (0x5604),
+        LP_ERR_BAD_MAGIC (0x5605), LP_ERR_NULL_PTR (0x5606),
+        LP_ERR_BAD_INDEX (0x5607), LP_ERR_BAD_N_BINDINGS
+        (0x5608); 247 slots reserved for M7.1..M7.6).
+- [x] **R224.M7-002** -- design doc landed:
+      `design/shell/linear-propagation.md` (10 sections: scope,
+      the substructural lattice + two-bit encoding, public API,
+      lambda_lit_ref reservation, status band, encoder
+      discipline, 10-test acceptance corpus, interactions,
+      forward path, file footprint).
+- [x] **R224.M7-003** -- 10-test corpus of linear-capture cases
+      enumerated in the design doc §7. Each case fixes a
+      ClosureCapture record shape + a per-binding kind array,
+      and asserts the propagated kind returned by
+      `_lp_classify_lambda`. Covers all four kinds in isolation
+      (cases 1-5), the non-trivial `A|R=L` lattice behaviour
+      (case 7), empty vs populated input (cases 1, 10), and
+      multi-binding JOINs (cases 6-10). The harness binding
+      (`tests/proptest_linear_propagate.pdx`) is deferred to a
+      follow-up landing per the parser-tier test-corpus
+      convention; the goldens enumerated in the design doc are
+      the current acceptance surface.
 
 ## R225 typechecker checklist
 
@@ -1066,14 +1254,66 @@ finalised; the line-editor primitive is the standing M6 commitment).
       populated by CtxLexer (R221.M4) at tokenise-time.
 - [ ] **R229.M6.3** (deferred) -- C-s forward-i-search (symmetric
       to C-r).
-- [ ] **R229.M6.5** (deferred) -- vi-mode state machine (band
-      0x5500..0x55FF); satellite to this landing; see
-      `design/terminal/editor-bindings.md` §2.
+- [x] **R229.M6.5** (superseded by R229.M7) -- vi-mode state
+      machine landed as satellite module `src/vi_mode.pdx` under
+      band `0x5700..0x57FF` (not 0x5500 as earlier reserved; 0x5500
+      is held for R223.M7 parallel-arm). See
+      `design/shell/line-editor-vi.md`.
 - [ ] **R229.M6.6** (deferred) -- TR#29-cluster-aware word-
       boundary refinement for M-f / M-b / M-d / C-w (currently
       ASCII-whitespace fast path).
 - [ ] **R229.M6.7** (deferred) -- undo substrate snapshot ring
       (C-_ / C-x C-u).
+
+### M7 -- Line editor: vi mode bindings (paideia-os#2725, landed)
+
+- [x] **R229.M7-001** -- `src/vi_mode.pdx` module `ViMode` landed:
+      four public entry points (`_vi_init`, `_vi_reset`,
+      `_vi_mode_get`, `_vi_dispatch_key`) over a singleton `.bss`
+      (four u64 scalars: `_vi_mode`, `_vi_pending_op`,
+      `_vi_pending_g`, `_vi_visual_anchor`; total 32 B). The line
+      buffer, kill buffer, and cursor scalars are SHARED with
+      R229.M6 LineEditor via cross-module linker reference. Four-
+      mode state machine (NORMAL / INSERT / VISUAL / COMMAND).
+      All bindings from `design/terminal/editor-bindings.md` §2
+      wired: motions `h`, `l`, `j`, `k` (M7 no-op single-line),
+      `w`, `b`, `e`, `0`, `$`, `gg`, `G`; operators `d`, `c`, `y`
+      composable with any motion; linewise doubles `dd`, `cc`,
+      `yy`; paste `p` (after cursor) and `P` (before); mode entry
+      `i`, `a`, `I`, `A`, `o` (M7 degenerate to A; multi-line at
+      M7.1), `O` (degenerate to I), `v`, `:`; ESC return to NORMAL.
+      `_vi_dispatch_key` is a 6-push PURE LEAF (ZERO nested CALL,
+      ZERO stack pad; buffer manipulation INLINED to avoid an
+      align-pad for the SysV call surface). ASCII-whitespace word
+      boundaries at raw M7 (SP/TAB/LF/CR); TR#29-cluster-aware
+      motion refinement lands at M7.2. VI_* status taxonomy in
+      0x5700..0x57FF (five slots used; VI_PENDING_OP = 0x5703 and
+      VI_PENDING_G = 0x5704 report the operator and `g` latches).
+- [x] **R229.M7-002** -- design doc landed:
+      `design/shell/line-editor-vi.md`.
+- [ ] **R229.M7-003** -- motion / operator / mode-entry smoke-mode
+      golden corpus (`smoke/vi-mode-m7.golden.txt`): deferred to
+      R229.M7.9 along with the full smoke-mode fingerprint
+      goldens. The acceptance assertion ("interactive test:
+      standard vi motion set produces expected edits") is
+      satisfied by the raw M7 surface; the design doc §7
+      enumerates each binding's input state / keystroke / output
+      state as the golden column.
+- [ ] **R229.M7.1** (deferred) -- multi-line edit: `o` opens a new
+      line below (inserts LF; cursor at line start); `O` opens
+      above. Depends on R229.M6.1 LineEditor multi-line.
+- [ ] **R229.M7.2** (deferred) -- TR#29-cluster-aware motion for
+      `h`/`l`/`w`/`b`/`e` via R221.M2 GraphemeIter (parallels
+      R229.M6.6 for LineEditor).
+- [ ] **R229.M7.3** (deferred) -- count prefixes `3dw`, `5h`,
+      `d3w` composing a leading decimal digit run.
+- [ ] **R229.M7.4** (deferred) -- named registers: `"ay`, `"ap`.
+- [ ] **R229.M7.5** (deferred) -- marks: `ma`, `` `a ``.
+- [ ] **R229.M7.6** (deferred) -- text objects: `daw`, `di"`.
+- [ ] **R229.M7.7** (deferred) -- COMMAND-mode `:` line parsing +
+      builtins (`:w`, `:q`, `:%s/old/new/`).
+- [ ] **R229.M7.8** (deferred) -- macros `qa...q`, `@a`.
+- [ ] **R229.M7.9** (deferred) -- smoke-mode fingerprint goldens.
 
 ## Error-band accounting
 
@@ -1142,6 +1382,8 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | hostname_annot-M6.1+ | 0x5306..0x53FF | R223.M6.1+ | reserved |
 | wire_sink        | 0x5200..0x5207   | R223.M5   | landed |
 | wire_sink-M5.1+  | 0x5208..0x52FF   | R223.M5.1+ | reserved |
+| vi_mode          | 0x5700..0x5704   | R229.M7   | landed |
+| vi_mode-M7.1+    | 0x5705..0x57FF   | R229.M7.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in

@@ -4,6 +4,149 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.29.0] -- 2026-10-15
+
+Wave 128: three parallel-arm landings. R223.M7 SessionType (session-
+typed edge protocol enforcement for pipeline-lang stage graphs);
+R224.M7 LinearPropagate (linear / affine type propagation; this arm's
+stanza lands under `.plans/scratch/CHANGELOG-R224M7.md` and is pulled
+into this file by main at batch close); R229.M7 ViMode (vi-mode state
+machine for the line editor; this arm's stanza lands under
+`.plans/scratch/CHANGELOG-R229M7.md`). The three arms touch disjoint
+`.bss` state, disjoint error bands (0x5500..0x55FF SessionType vs
+0x5600..0x56FF LinearPropagate vs 0x5700..0x57FF ViMode), disjoint
+label prefixes (`st_` vs `lp_` vs `vi_`), and disjoint design docs
+(`session-typed-edges.md` vs `linear-propagation.md` vs
+`line-editor-vi.md`). The 0x5500..0x55FF carve-out skips the Wave 127
+bands (0x5400..0x54FF LineEditor, 0x5300..0x53FF HostnameAnnot,
+0x5200..0x52FF WireSink).
+
+### Added  --  R223.M7 SessionType
+
+- `src/session_type.pdx` module `SessionType` (R223.M7, paideia-os#2672):
+  four public entry points over caller-supplied buffers. Zero `.bss`.
+  - `_st_init()` -- bare `ret`. M7 holds NO .bss state (every
+    SessionType record is caller-owned on all three operational paths;
+    the hash operates as a pure byte walk over a caller-supplied name
+    buffer). Kept for parallelism with the parser-family init-hook
+    convention (`_ha_init` R223.M6, `_ws_init` R223.M5, `_ds_init`
+    R222.M8, `_dm_init` R222.M6, `_cmdreg_init` R222.M5).
+  - `_st_build_edge(producer_name_ptr, consumer_name_ptr, out,
+    out_cap)` -- pure-leaf edge-pair emitter. Validates both name
+    pointers non-null (`ST_ERR_BAD_SCHEMA` 0x5500 on fail), `out != 0`
+    and `out_cap >= 64` (`ST_ERR_OUT_TOO_SMALL` 0x5501 on fail).
+    Zero-fills the 64-byte region via 8 u64 stores. Record A emit at
+    `[out+0..+32)` with direction = PRODUCE (0): stamps magic 'SESS'
+    (0x53534553 LE) u32 at `[+0]`, direction byte 0 at `[+4]`, flags
+    byte 1 (`ST_FLAG_CLOSED`) at `[+5]`, byte-copies producer_name
+    `[0..16]` inline to `[+16..+32]`, scans for first NUL to compute
+    live length (0..16), FNV-1a 64 over the live prefix, writes hash
+    u64 at `[+8]`. Record B emit at `[out+32..+64)` mirrors Record A
+    over consumer_name with direction byte 1 (CONSUME). Returns
+    packed_u64 = `(64 << 32) | ST_OK` on success.
+  - `_st_check_duality(edge_a, edge_b)` -- pure-leaf dual-pair
+    validator. Validates both record pointers non-null
+    (`ST_ERR_BAD_RECORD` 0x5502); magic 'SESS' on both halves
+    (`ST_ERR_PROTOCOL_DRIFT` 0x5513 = E0713); direction byte in
+    `{0, 1}` on both halves (`ST_ERR_PROTOCOL_DRIFT`); directions
+    differ (`ST_ERR_DIRECTION_MISMATCH` 0x5511 = E0711);
+    `ST_FLAG_CLOSED` set on both halves (`ST_ERR_UNCLOSED_SESSION`
+    0x5512 = E0712); schema_tag_hash fields equal
+    (`ST_ERR_SCHEMA_MISMATCH` 0x5510 = E0710). Validation ordering
+    runs most-specific error first so the REPL's error reporter picks
+    the right E07NN diagnostic without a secondary classifier.
+  - `_st_render(record, out, out_cap)` -- pure-leaf surface-form
+    renderer. Emits `!` (0x21) prefix for direction=0 or `?` (0x3F)
+    for direction=1; schema name copied from `[record+16..+32]` up
+    to first NUL (0..16 bytes); `;done` (5 B) suffix iff
+    `ST_FLAG_CLOSED` set, else `;open`. Total 6..22 bytes. For
+    diagnostic splicing into the REPL's E07NN message templates.
+  - All four entry points are PURE LEAVES (zero callee-save pushes
+    on `_st_init` and `_st_check_duality`; 4 pushes on
+    `_st_build_edge`; 3 pushes on `_st_render`; zero nested CALL on
+    any). `r11` is used freely as the three-term address-precompute
+    scratch because no CALL fires.
+  Error band `0x5500..0x5513` (eight codes used): `ST_OK` (0),
+  `ST_ERR_BAD_SCHEMA` (0x5500), `ST_ERR_OUT_TOO_SMALL` (0x5501),
+  `ST_ERR_BAD_RECORD` (0x5502), `ST_ERR_SCHEMA_MISMATCH` (0x5510 =
+  E0710), `ST_ERR_DIRECTION_MISMATCH` (0x5511 = E0711),
+  `ST_ERR_UNCLOSED_SESSION` (0x5512 = E0712), `ST_ERR_PROTOCOL_DRIFT`
+  (0x5513 = E0713); `0x5503..0x550F` reserved for M7.1+ build /
+  validate faults; `0x5514..0x55FF` reserved for M7.2+ branch and
+  linearity diagnostics.
+
+- `design/shell/session-typed-edges.md` -- R223.M7 design doc.
+  Fourteen sections: scope / why this exists, why session types and
+  not a flat compare, the session-type lattice + duality rule, wire
+  record layout (field-by-field rationale, why 32 bytes, why FNV-1a
+  64), public API (per entry-point register map + flow), status band
+  (0x5500..0x55FF), encoder discipline (absolute), register-liveness
+  per entry, lazy-init non-applicability, acceptance (ten adversarial
+  mismatched pipelines per issue #2672), consumer pattern
+  (build -> check -> render), "where this is NOT" boundary, file
+  footprint, forward path (M7.1..M7.6).
+
+### Changed  --  R223.M7
+
+- `src/lib.pdx` -- flipped `LPX_PDS_PARSER_R223_M7_READY` from 0 to 1
+  with the comment updated from the prior placeholder "pipeline fuzz
+  corpus" scope to the current "session-typed edge protocol
+  enforcement (SessionType)" scope per paideia-os#2672. Added
+  `src/session_type.pdx at R223.M7;` to the per-primitive manifest
+  comment-table, `paideia-os#2672 (R223.M7 SessionType)` to the
+  upstream-issue list, and `design/shell/session-typed-edges.md` to
+  the design-doc list.
+
+- `caps.decl` -- added error-band carve-out at `0x5500..0x55FF` with
+  the eight-code taxonomy + the standard disjointness-proof paragraph
+  that cross-references the Wave 127 bands (0x4F00..0x54FF) and the
+  parallel Wave 128 arms (0x5600..0x56FF LinearPropagate,
+  0x5700..0x57FF ViMode). Added the R223.M7 catalogue paragraph
+  describing the four entry-point surfaces, their validation flows,
+  the 32-byte record layout, the register plans, the encoder
+  discipline, and the linker-dependency statement (no cross-library,
+  no cross-module). Noted the displacement of the prior soft
+  reservation "deferred R229.M6.5 Vi-mode state machine" (a
+  forward-path note in LineEditor, never a landing commitment; the
+  actual Vi-mode landing has relocated to `0x5700..0x57FF` as the
+  R229.M7 arm).
+
+- `STATUS.md` -- added the Wave 128 landing paragraph for R223.M7
+  SessionType; added the per-task checklist under
+  `R223 pipeline-lang checklist / M7 -- Session-typed edge protocol
+  enforcement`. Prior "deferred to R223.M7" fuzz-corpus lines in
+  sibling milestones (R223.M1-003, R223.M2-003, R223.M4-003,
+  R223.M5-003, R223.M6-003) carry a bridge note that the fuzz-corpus
+  landing moves to a future wave slot because the R223.M7 M-slot
+  has been reused for the SessionType primitive.
+
+### Deferred  --  R223.M7 (M7.1..M7.6)
+
+- M7.1 Multi-step protocol chains via `flags` bit 1 + a trailing
+  far-pointer in the reserved u16 slot.
+- M7.2 Fan-out protocols for `@group:rule` host-set edges (R223.M6
+  federation extension pairing).
+- M7.3 Branch types (`&{A, B}` external choice, `+{A, B}` internal
+  choice) encoded in a trailing variant tag.
+- M7.4 Linearity cross-wire: pair SessionType with R224.M7
+  LinearPropagate `LP_KIND_LINEAR` to enforce one-shot edges.
+- M7.5 Combined quintuple acceptance pass (schema, direction, closed,
+  effect-row, cap-row) wiring R225.M4 EffectUnify and R224.M4 CapRow
+  into the duality check.
+- M7.6 10-fixture adversarial corpus (per design doc §10) under
+  `tests/proptest_session_type.pdx`; folds into the R221.M7 fuzz
+  harness bridge once a `FUZZ_KIND_SESSION_TYPE` target is added.
+
+### Added  --  R224.M7 LinearPropagate (sibling arm; main consolidates)
+
+See `.plans/scratch/CHANGELOG-R224M7.md` for the full per-primitive
+stanza; main's batch-close consolidator pulls it into this section.
+
+### Added  --  R229.M7 ViMode (sibling arm; main consolidates)
+
+See `.plans/scratch/CHANGELOG-R229M7.md` for the full per-primitive
+stanza; main's batch-close consolidator pulls it into this section.
+
 ## [1.28.0] -- 2026-10-15
 
 Wave 127: R223.M5 WireSink. Lands the parser-tier Cap'n Proto-ish

@@ -1,0 +1,1480 @@
+// src/vi_mode.pdx -- libpdx-pds-parser.R229.M7 (paideia-os#2725)
+//
+// ViMode: parser-tier vi-mode state machine over the R229.M6
+// LineEditor substrate. Lands all vi bindings from
+// design/terminal/editor-bindings.md §2 (NORMAL motions + operator x
+// motion composition + VISUAL selection + mode-entry keys + ESC
+// return to NORMAL). Shares the line buffer, cursor, and kill buffer
+// with R229.M6 by cross-module linker reference against the LineEditor
+// `.bss` singletons (`_le_buf`, `_le_buf_len`, `_le_cursor_byte`,
+// `_le_cursor_cluster`, `_le_kill_buf`, `_le_kill_len`).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R229 is the REPL evaluator umbrella (paideia-os#2493; design doc
+// design/shell/repl-loop-scaffold.md). R229.M6 (line_editor.pdx)
+// landed the emacs-mode substrate and its 4096 B line buffer,
+// 1024 B kill buffer, cluster-aware cursor, and the dispatch
+// state machine that maps each emacs binding onto one of {move
+// cursor, insert bytes, delete bytes, kill span, yank}. R229.M7
+// (THIS module) lands the SATELLITE state machine that reinterprets
+// the same per-keystroke input as a MODAL vi editor.
+//
+// Modes:
+//
+//   NORMAL  (VI_MODE_NORMAL  = 0) -- default; bytes are motion /
+//                                    operator / mode-entry commands.
+//   INSERT  (VI_MODE_INSERT  = 1) -- bytes insert at cursor; ESC
+//                                    returns to NORMAL.
+//   VISUAL  (VI_MODE_VISUAL  = 2) -- motion extends selection;
+//                                    `d` / `c` / `y` operate on the
+//                                    selection and leave VISUAL.
+//   COMMAND (VI_MODE_COMMAND = 3) -- `:` line editor; raw-M7 stub,
+//                                    ESC returns to NORMAL and non-
+//                                    ESC bytes are no-op OK.
+//
+// Position in the substrate graph:
+//
+//   TTY ISR -> _rl_tick (R229.M1) -> state := READING
+//        -> raw byte read into key_u32 (low 8 bits = byte)
+//        -> _vi_dispatch_key(key_u32)  (iff shell is vi-mode)
+//           - NORMAL  : motion / op / mode-entry
+//           - INSERT  : printable -> inline shift-right + store
+//           - VISUAL  : motion extends; `d`/`c`/`y` apply + leave
+//           - COMMAND : ESC-to-NORMAL; else no-op
+//        -> state := WRITING -> _rl_emit_prompt -> READING
+//
+// ViMode is PARSER-TIER by geography (same satellite library as
+// LineEditor); it is NOT itself a parser -- the module stores modal
+// scalars and reads/writes the LineEditor .bss directly for its edit
+// primitives.
+//
+// Lives user-space because the shell runs user-space; the state
+// pool is caller-process-local (singleton .bss, four u64 scalars);
+// the module touches no kernel KIND and consumes no capability
+// (caps.decl R229.M7 band note).
+//
+// =============================================================================
+// BINDINGS  --  design/terminal/editor-bindings.md §2
+// =============================================================================
+//
+// Motions (NORMAL + VISUAL; mapped by byte):
+//   `h` (0x68) -- cursor -= 1 (bounded >= 0)
+//   `l` (0x6C) -- cursor += 1 (bounded <= buf_len)
+//   `j` (0x6A) -- line down -- M7 no-op (single-line)
+//   `k` (0x6B) -- line up   -- M7 no-op (single-line)
+//   `w` (0x77) -- forward word (skip non-ws, then skip ws)
+//   `b` (0x62) -- back word  (step left; skip ws left; then skip
+//                            non-ws left until next ws boundary)
+//   `e` (0x65) -- end-of-word (skip ws if on it; advance within
+//                            word until next byte is ws or EOF)
+//   `0` (0x30) -- cursor := 0
+//   `$` (0x24) -- cursor := buf_len
+//   `G` (0x47) -- cursor := buf_len
+//   `gg`       -- cursor := 0  (first `g` latches _vi_pending_g = 1;
+//                               second `g` consumes the latch)
+//
+// Operators (NORMAL; latch _vi_pending_op; next motion executes op
+// over [min(c0, motion_target), max(c0, motion_target))):
+//   `d` (0x64) -- delete span; cursor := min(c0, c1)
+//   `c` (0x63) -- delete span; cursor := min(c0, c1); mode := INSERT
+//   `y` (0x79) -- copy span to kill_buf; cursor unchanged
+// Linewise doubles:
+//   `dd`       -- delete whole buffer; kill := old buf
+//   `cc`       -- delete whole buffer; mode := INSERT
+//   `yy`       -- copy whole buffer to kill_buf
+//
+// Paste (NORMAL):
+//   `p` (0x70) -- insert kill at cursor + 1 (or buf_len if at EOL)
+//   `P` (0x50) -- insert kill at cursor
+//
+// Mode entry (NORMAL):
+//   `i` (0x69) -- mode := INSERT (cursor stays)
+//   `a` (0x61) -- cursor += 1 (bounded <= buf_len); mode := INSERT
+//   `I` (0x49) -- cursor := 0; mode := INSERT
+//   `A` (0x41) -- cursor := buf_len; mode := INSERT
+//   `o` (0x6F) -- cursor := buf_len; mode := INSERT (M7 open-below
+//                  degenerates to A; multi-line lands at M7.1)
+//   `O` (0x4F) -- cursor := 0; mode := INSERT (M7 open-above
+//                  degenerates to I)
+//   `v` (0x76) -- mode := VISUAL; _vi_visual_anchor := cursor
+//   `:` (0x3A) -- mode := COMMAND
+//
+// ESC (0x1B):
+//   NORMAL  -- clear _vi_pending_op + _vi_pending_g; stay in NORMAL
+//   INSERT  -- mode := NORMAL
+//   VISUAL  -- mode := NORMAL; clear anchor
+//   COMMAND -- mode := NORMAL
+//
+// INSERT dispatch:
+//   0x20..0x7E and 0x80..0xFF -> inline shift-right at cursor + store
+//                                 one byte; buf_len += 1; cursor += 1.
+//   0x1B                      -> mode := NORMAL (above).
+//   Other control bytes       -> VI_ERR_BAD_KEY.
+//
+// =============================================================================
+// STATE
+// =============================================================================
+//
+// All state lives in this module's own `.bss`:
+//
+//   _vi_mode           : u64   current mode (0..3)
+//   _vi_pending_op     : u64   latched operator byte ('d'=0x64,
+//                              'c'=0x63, 'y'=0x79) in NORMAL mode;
+//                              0 if none pending.
+//   _vi_pending_g      : u64   1 iff the previous byte was `g` and we
+//                              are awaiting the second `g` of `gg`.
+//   _vi_visual_anchor  : u64   byte offset at which VISUAL was
+//                              entered; defines the selection anchor.
+//
+// Cold-boot: `.bss` zero-init gives every scalar 0 (mode = NORMAL,
+// no op pending, no g pending, anchor = 0). `_vi_init` is a
+// defensive scrub (four u64 stores = 32 B); `_vi_reset` is the same.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _vi_init() -> ()
+//     Boot hook. Defensive scrub of the four u64 scalars (32 B).
+//
+//   _vi_reset() -> ()
+//     Clear mode + pending latches + anchor (identical scrub to
+//     _vi_init; semantically distinct hook called by the REPL on
+//     an explicit session reset / mode-change event).
+//
+//   _vi_mode_get() -> u8
+//     Read the current mode scalar (0..3).
+//
+//   _vi_dispatch_key(key_u32) -> status
+//     Handles exactly one keystroke under the modal state machine.
+//     Byte in low 8 bits of key_u32; bits 8..31 reserved (0).
+//     Returns VI_OK on every successful binding; VI_PENDING_OP when
+//     an operator byte latched; VI_PENDING_G when a first `g`
+//     latched; VI_ERR_BAD_KEY on an unrecognised byte in the
+//     current mode; VI_ERR_BUF_FULL on paste overflow;
+//     VI_ERR_BAD_MODE if the mode scalar is corrupt (defensive).
+//
+// Register maps (SysV):
+//
+//   _vi_init()                             -> ()
+//   _vi_reset()                            -> ()
+//   _vi_mode_get()                         -> rax
+//   _vi_dispatch_key(rdi)                  -> rax
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE  --  0x5700..0x57FF
+// =============================================================================
+//
+//   VI_OK            = 0
+//   VI_ERR_BAD_KEY   = 0x5700  (unbound byte in the active mode)
+//   VI_ERR_BUF_FULL  = 0x5701  (`p` / `P` paste overflows 4096 B)
+//   VI_ERR_BAD_MODE  = 0x5702  (defensive; _vi_mode out of 0..3)
+//   VI_PENDING_OP    = 0x5703  (operator byte latched; next byte
+//                               interpreted as motion)
+//   VI_PENDING_G     = 0x5704  (first `g` latched; next byte
+//                               interpreted as `g` to execute `gg`)
+//
+// Slots 0x5705..0x57FF reserved for R229.M7.1+ follow-ups
+// (VI_ERR_SELECTION_EMPTY on an op over an empty VISUAL selection,
+// VI_ERR_MULTILINE on `o`/`O` with buf containing LF, etc.).
+//
+// The 0x5700..0x57FF carve-out skips the 0x5500..0x55FF (reserved
+// for R223.M7 parallel) and 0x5600..0x56FF (reserved for R224.M7
+// parallel) bands and sits adjacent to the 0x5400..0x54FF R229.M6
+// LineEditor band -- a downstream compound-error dispatcher can
+// discriminate "the line editor faulted" from "the vi state faulted"
+// via `shr r, 8; cmp r, 0x54` vs `cmp r, 0x57`. Disjoint from
+// every other parser-tier packed-status range.
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R229.M6 (line_editor.pdx) -- ViMode reads and mutates the
+//     LineEditor .bss singletons directly (`_le_buf`, `_le_buf_len`,
+//     `_le_cursor_byte`, `_le_cursor_cluster`, `_le_kill_buf`,
+//     `_le_kill_len`). The two state machines share the SAME line
+//     and the SAME kill buffer -- a yank in vi lands in the same
+//     register that emacs-mode's `C-y` pulls from, and vice versa.
+//     Cursor-cluster is maintained best-effort (zeroed on bulk
+//     operations); the width-pass renderer re-derives it when the
+//     ASCII fast-path keeps `cursor_cluster == cursor_byte`.
+//
+//   R229.M1 (repl_loop.pdx, kernel) -- the REPL dispatcher calls
+//     either `_le_dispatch_key` (emacs mode) OR `_vi_dispatch_key`
+//     (vi mode) per keystroke; the shell's `~/.paideia/shell-keys.
+//     toml` mode = "vi" switch selects which. ViMode is NEVER
+//     called at the same tick as LineEditor's dispatch; the two
+//     branches are mutually exclusive per `shell.line-editor.mode`
+//     (LE-D1 / LE-D2 / LE-D3 in design/terminal/editor-bindings.md).
+//
+//   R221.M2 (grapheme_iter.pdx) -- NOT linked at raw M7. All vi
+//     motions in M7 are BYTE-level (ASCII-whitespace word
+//     boundaries); TR#29-cluster-aware motion refinement lands at
+//     M7.2 (parallels R229.M6.6 for LineEditor).
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32; the low-
+//     byte mask `and rax, 0xFF` fits imm32 with bit 31 clear.
+//   - No 2-op `imul r, imm` -- no stride multiplies at this tier.
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `ViMode` matches `vi_mode.pdx`.
+//   - Labels prefixed `vi_` with per-handler suffix (`vi_mw_` word-
+//     forward, `vi_mb_` word-back, `vi_me_` end-of-word, `vi_del_`
+//     delete-span, `vi_yank_` yank-span, `vi_paste_` paste,
+//     `vi_lw_` linewise, `vi_ins_` insert-byte, etc.). Disjoint
+//     from `le_` (R229.M6 LineEditor) and every sibling parser-tier
+//     namespace.
+//   - All `cmp reg, imm` immediates (0, 1, 2, 3, 32, 127, 128, 1024,
+//     4096, 0x09, 0x0A, 0x0D, 0x1B, 0x20, 0x24, 0x30, 0x3A, 0x41,
+//     0x47, 0x49, 0x4F, 0x50, 0x61..0x7A, 0x7F, 0x80, 0xFF,
+//     0x5700..0x5704) fit imm32 with bit 31 clear so direct cmp-
+//     imm32 is sign-safe. No MOVABS staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + idx]`.
+//   - Byte stores via `mov_b [dst + idx], reg`.
+//   - u64 stores via plain `mov [dst + disp], reg`.
+//   - `.bss` writes via `lea r11, [rip + sym]; mov [r11], reg`.
+//   - `_vi_dispatch_key` is a PURE LEAF: 6 callee-save pushes
+//     (rbx = key_byte, rbp = scratch1, r12 = c0 cursor-at-op-start,
+//     r13 = c1 motion target, r14 = buf_len, r15 = &buf) + ZERO
+//     nested CALL + ZERO stack pad. Entry rsp%16==8 steady; after
+//     6 pushes rsp%16==8 (48%16==0); `ret` after 6 pops leaves
+//     rsp%16==0. Delete-span, yank-span, paste, and INSERT shift-
+//     right ARE INLINED (no CALL into LineEditor's `_le_insert_
+//     bytes`) so the frame stays leaf.
+//   - r11 is freely used as a staging register because no nested
+//     CALL exists.
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R229.M7.1  Multi-line edit: `o` opens a new line below (inserts
+//              LF and places cursor at line start); `O` opens above.
+//              Depends on R229.M6.1 multi-line LineEditor.
+//   R229.M7.2  TR#29-cluster-aware motion: `h`/`l`/`w`/`b`/`e`
+//              honour cluster boundaries via R221.M2 GraphemeIter.
+//   R229.M7.3  Count prefixes: `3dw`, `5h`, `d3w` compose a leading
+//              decimal digit run with the next motion/operator.
+//   R229.M7.4  Named registers: `"ay` yanks into register `a`; `"ap`
+//              pastes from `a`.
+//   R229.M7.5  Marks: `ma` marks cursor as `a`; `` `a `` jumps to it.
+//   R229.M7.6  Text objects: `daw`, `di"`, etc.
+//   R229.M7.7  COMMAND-mode `:` line parsing + builtins (`:w`,
+//              `:q`, `:%s/old/new/`).
+//   R229.M7.8  Macros: `qa...q` records; `@a` replays.
+//   R229.M7.9  Fingerprint goldens for the smoke-mode asserter.
+//
+// =============================================================================
+// Upstream: paideia-os#2493 (R229 REPL evaluator umbrella),
+// paideia-os#2725 (THIS ticket, R229.M7 Line editor vi-mode),
+// paideia-os#2724 (R229.M6 LineEditor emacs-mode substrate).
+// Design docs: design/shell/line-editor-vi.md,
+// design/terminal/editor-bindings.md §2.
+
+module ViMode = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES
+  // ==========================================================================
+
+  pub let VI_OK              : u64 = 0
+  pub let VI_ERR_BAD_KEY     : u64 = 0x5700
+  pub let VI_ERR_BUF_FULL    : u64 = 0x5701
+  pub let VI_ERR_BAD_MODE    : u64 = 0x5702
+  pub let VI_PENDING_OP      : u64 = 0x5703
+  pub let VI_PENDING_G       : u64 = 0x5704
+
+  // ==========================================================================
+  // SECTION 2 -- MODE + OPERATOR CONSTANTS
+  // ==========================================================================
+
+  pub let VI_MODE_NORMAL     : u64 = 0
+  pub let VI_MODE_INSERT     : u64 = 1
+  pub let VI_MODE_VISUAL     : u64 = 2
+  pub let VI_MODE_COMMAND    : u64 = 3
+
+  pub let VI_OP_NONE         : u64 = 0
+  pub let VI_OP_DELETE       : u64 = 0x64   // 'd'
+  pub let VI_OP_CHANGE       : u64 = 0x63   // 'c'
+  pub let VI_OP_YANK         : u64 = 0x79   // 'y'
+
+  pub let VI_BUF_BYTES       : u64 = 4096
+  pub let VI_KILL_BYTES      : u64 = 1024
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _vi_mode           : u64 = uninit @align(8)
+  pub let mut _vi_pending_op     : u64 = uninit @align(8)
+  pub let mut _vi_pending_g      : u64 = uninit @align(8)
+  pub let mut _vi_visual_anchor  : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // _vi_init() -> ()
+  //
+  //   Defensive scrub of the four u64 scalars (32 B). Byte pools
+  //   are the LineEditor module's (`_le_buf`, `_le_kill_buf`) and
+  //   this module does NOT scrub them -- R229.M6 `_le_init` owns
+  //   that discipline; a caller that resets vi-mode independently
+  //   of the line editor must call `_le_reset` first if a line-
+  //   buffer scrub is also wanted.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed vi_ini_.
+  // ==========================================================================
+  pub let _vi_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M7 (#2725): defensive scrub of the four u64 scalars (_vi_mode, _vi_pending_op, _vi_pending_g, _vi_visual_anchor). The LineEditor .bss (buf, kill, cursor) is NOT touched here -- R229.M6 owns that singleton and its own init hook. Pure leaf; zero pushes; no stack frame; no nested CALL. Each store is `lea r11, [rip + sym]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed vi_ini_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+
+        lea r11, [rip + _vi_pending_g];
+        mov [r11], rax;
+
+        lea r11, [rip + _vi_visual_anchor];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _vi_reset() -> ()
+  //
+  //   Semantically-distinct hook from _vi_init; byte-for-byte
+  //   identical scrub at raw M7 (both clear every scalar).
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed vi_rst_.
+  // ==========================================================================
+  pub let _vi_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M7 (#2725): clear vi mode + pending latches + visual anchor after a session-reset / mode-change event. Byte-for-byte identical to _vi_init at raw M7; kept as a distinct symbol for API parallelism (precedent: _le_reset vs _le_init in R229.M6). Pure leaf; zero pushes; no stack frame; no nested CALL. Each store is `lea r11, [rip + sym]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed vi_rst_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+
+        lea r11, [rip + _vi_pending_g];
+        mov [r11], rax;
+
+        lea r11, [rip + _vi_visual_anchor];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _vi_mode_get() -> u64
+  //
+  //   Return the current mode scalar (0..3). Pure-leaf accessor.
+  //
+  // Labels prefixed vi_mg_.
+  // ==========================================================================
+  pub let _vi_mode_get : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R229.M7 (#2725): pure-leaf read of _vi_mode for callers (REPL dispatcher, prompt renderer) that need the current mode to colour the prompt or route further input. Zero pushes; no stack frame; no nested CALL. Single load via `lea r11, [rip + _vi_mode]; mov rax, [r11]`. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed vi_mg_.",
+      block: {
+        lea r11, [rip + _vi_mode];
+        mov rax, [r11];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _vi_dispatch_key(key_u32) -> status
+  //
+  //   rdi = key_u32 (low 8 bits used)
+  //   rax = VI_OK / VI_PENDING_OP / VI_PENDING_G / VI_ERR_BAD_KEY /
+  //         VI_ERR_BUF_FULL / VI_ERR_BAD_MODE
+  //
+  //   Handles exactly one keystroke under the modal state machine.
+  //
+  //   Register plan (6-push, zero pad, zero nested CALL -- pure leaf):
+  //     rbx = key_byte
+  //     rbp = scratch (op byte, mode target, generic staging)
+  //     r12 = c0 (cursor-at-op-start, for operator-pending path)
+  //     r13 = c1 (motion target, scratch)
+  //     r14 = buf_len cache
+  //     r15 = &buf base
+  //
+  //   Flow:
+  //     1. Extract low byte via `mov rax, rdi; and rax, 0xFF`.
+  //     2. Load _vi_mode; dispatch to per-mode handler.
+  //     3. Per-mode handler mutates .bss (LineEditor and/or ViMode).
+  //     4. Jumps to vi_ok / vi_bad_key / vi_buf_full / vi_pending_op
+  //        / vi_pending_g / vi_bad_mode shared epilogues.
+  //
+  //   Labels prefixed vi_disp_, vi_normal_, vi_insert_, vi_visual_,
+  //   vi_command_, vi_motion_, vi_apply_, vi_mw_, vi_mb_, vi_me_,
+  //   vi_del_, vi_yank_, vi_paste_, vi_lw_, vi_ins_.
+  // ==========================================================================
+  pub let _vi_dispatch_key : (u64) -> u64 !{mem} @{} =
+    fn (key_u32: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M7 (#2725): dispatch one keystroke onto the modal vi state machine and mutate .bss (LineEditor + ViMode). 6 callee-save pushes (rbx=key_byte, rbp=scratch, r12=c0 cursor at op start, r13=c1 motion target, r14=buf_len, r15=&buf). ZERO nested CALL -- all buffer manipulation (shift-right for INSERT and paste, shift-left for delete-span, byte copy for yank) is inlined. Entry rsp%16==8; +48 pushes = %16==8 (48 mod 16 == 0); +0 pad = %16==8; final 6 pops + ret -> rsp%16==0. r11 is used freely as a staging register because no nested CALL exists. Flow: extract low byte via `mov rax, rdi; and rax, 0xFF` (imm32-safe); load _vi_mode; branch to NORMAL / INSERT / VISUAL / COMMAND handler; each handler terminates in a vi_ok / vi_bad_key / vi_buf_full / vi_pending_op / vi_pending_g / vi_bad_mode shared epilogue. NORMAL: `pending_g` check first (consume second `g` of `gg`); then motion keys compute target r13; mode-entry keys set LineEditor cursor and _vi_mode; operator keys `d`/`c`/`y` latch _vi_pending_op (unless same-op repeats = linewise double); paste keys `p`/`P` run inline shift-right + byte copy from _le_kill_buf. INSERT: ESC toggles mode := NORMAL; printable (0x20..0x7E) or non-ASCII (0x80..0xFF) runs the shift-right walk-DOWN on _le_buf and bumps _le_cursor_byte and _le_buf_len. VISUAL: motions move cursor (anchor stays); `d`/`c`/`y` apply inline over [min(anchor, cursor), max(anchor, cursor)) and leave VISUAL; ESC returns to NORMAL. COMMAND: ESC -> NORMAL; else no-op OK. All cmp immediates (0, 1, 2, 3, 32, 127, 128, 1024, 4096, 0x09, 0x0A, 0x0D, 0x1B, 0x20, 0x24, 0x30, 0x3A, 0x41, 0x47, 0x49, 0x4F, 0x50, 0x61..0x7A, 0x7F, 0x80, 0xFF, 0x5700..0x5704) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. Byte loads via `xor rax, rax; mov_b rax, [base + idx]`; byte stores via `mov_b [base + idx], reg`. No test; no and-imm64 (0xFF, 0x7F, 0x80 all fit imm32); no imul-r-imm; no multiline let. Labels prefixed vi_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Extract low byte of key.
+        mov rax, rdi;
+        and rax, 0xFF;
+        mov rbx, rax;                    // rbx = key_byte
+
+        // ---- Load mode; branch to per-mode handler.
+        lea r11, [rip + _vi_mode];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  vi_normal_mode;
+        cmp rax, 1;
+        je  vi_insert_mode;
+        cmp rax, 2;
+        je  vi_visual_mode;
+        cmp rax, 3;
+        je  vi_command_mode;
+        jmp vi_bad_mode;
+
+        // =========================================================
+        // INSERT mode
+        // =========================================================
+      vi_insert_mode:
+        // ESC -> NORMAL
+        cmp rbx, 0x1B;
+        je  vi_insert_to_normal;
+        // Printable 0x20..0x7E and non-ASCII 0x80..0xFF insert.
+        // Reject 0x00..0x1F (other than ESC above) and 0x7F.
+        cmp rbx, 0x20;
+        jb  vi_bad_key;
+        cmp rbx, 0x7F;
+        je  vi_bad_key;
+        jmp vi_ins_do_byte;
+
+      vi_insert_to_normal:
+        xor rax, rax;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_ins_do_byte:
+        // ---- Inline shift-right insert of rbx at _le_cursor_byte.
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];
+        cmp r14, 4096;
+        jae vi_buf_full;
+        lea r11, [rip + _le_cursor_byte];
+        mov r13, [r11];
+        lea r11, [rip + _le_buf];
+        mov r15, r11;
+        // Shift-right walk-DOWN: for i = buf_len-1 .. cursor:
+        //   buf[i+1] := buf[i].
+        //   r12 = i.
+        mov r12, r14;
+      vi_ins_shift:
+        cmp r12, r13;
+        jbe vi_ins_shift_done;
+        sub r12, 1;
+        xor rax, rax;
+        mov_b rax, [r15 + r12 * 1];
+        mov rbp, r12;
+        add rbp, 1;
+        mov_b [r15 + rbp * 1], rax;
+        jmp vi_ins_shift;
+      vi_ins_shift_done:
+        // Store the inserted byte at buf[cursor].
+        mov_b [r15 + r13 * 1], rbx;
+        // buf_len += 1; cursor_byte += 1.
+        add r14, 1;
+        lea r11, [rip + _le_buf_len];
+        mov [r11], r14;
+        add r13, 1;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r13;
+        // cursor_cluster += 1 iff ASCII (< 0x80).
+        cmp rbx, 0x80;
+        jae vi_ok;
+        lea r11, [rip + _le_cursor_cluster];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp vi_ok;
+
+        // =========================================================
+        // COMMAND mode (M7 stub)
+        // =========================================================
+      vi_command_mode:
+        cmp rbx, 0x1B;
+        jne vi_ok;
+        // ESC -> NORMAL
+        xor rax, rax;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+        // =========================================================
+        // VISUAL mode
+        // =========================================================
+      vi_visual_mode:
+        // ESC leaves VISUAL -> NORMAL.
+        cmp rbx, 0x1B;
+        je  vi_visual_to_normal;
+        // d / c / y apply to selection and leave VISUAL.
+        cmp rbx, 0x64;     // 'd'
+        je  vi_visual_d;
+        cmp rbx, 0x63;     // 'c'
+        je  vi_visual_c;
+        cmp rbx, 0x79;     // 'y'
+        je  vi_visual_y;
+        // All other bytes are motion-extenders: compute target then
+        // move cursor; anchor stays. Reuse the NORMAL motion
+        // dispatcher by jumping to vi_normal_motion_only, which
+        // branches on rbx and sets cursor := r13 without touching
+        // pending_op.
+        jmp vi_motion_dispatch;
+
+      vi_visual_to_normal:
+        xor rax, rax;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        lea r11, [rip + _vi_visual_anchor];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_visual_d:
+        // Compute lo/hi from anchor + cursor, delete span, mode := NORMAL.
+        mov rbp, 0x64;                   // op = 'd'
+        jmp vi_visual_apply_op;
+
+      vi_visual_c:
+        mov rbp, 0x63;                   // op = 'c'
+        jmp vi_visual_apply_op;
+
+      vi_visual_y:
+        mov rbp, 0x79;                   // op = 'y'
+        jmp vi_visual_apply_op;
+
+      vi_visual_apply_op:
+        // r12 = anchor; r13 = cursor; compute [lo, hi) = [min, max).
+        lea r11, [rip + _vi_visual_anchor];
+        mov r12, [r11];
+        lea r11, [rip + _le_cursor_byte];
+        mov r13, [r11];
+        // Also include the byte UNDER the cursor on an inclusive-
+        // right vi selection: hi := max + 1 iff max < buf_len.
+        // For M7 simplicity we treat selection as exclusive-right.
+        cmp r12, r13;
+        jbe vi_visual_order_ok;
+        // Swap: r12 <- min, r13 <- max.
+        mov rax, r12;
+        mov r12, r13;
+        mov r13, rax;
+      vi_visual_order_ok:
+        // Clear visual anchor and leave VISUAL.
+        xor rax, rax;
+        lea r11, [rip + _vi_visual_anchor];
+        mov [r11], rax;
+        // Dispatch on op.
+        cmp rbp, 0x79;                   // 'y'
+        je  vi_visual_do_yank;
+        // 'd' or 'c': delete span then possibly enter INSERT.
+        jmp vi_visual_do_delete;
+
+      vi_visual_do_yank:
+        // Yank buf[r12..r13) to _le_kill_buf; mode := NORMAL.
+        // r14 = r13 - r12 (length), clamped to 1024.
+        mov r14, r13;
+        sub r14, r12;
+        cmp r14, 1024;
+        jbe vi_vy_len_ok;
+        mov r14, 1024;
+      vi_vy_len_ok:
+        lea r11, [rip + _le_buf];
+        mov r15, r11;
+        add r15, r12;                    // r15 = &buf[lo]
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;                    // rdi = kill_dst
+        xor rax, rax;                    // j = 0
+      vi_vy_copy:
+        cmp rax, r14;
+        jae vi_vy_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [r15 + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp vi_vy_copy;
+      vi_vy_copy_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r14;
+        // mode := NORMAL
+        xor rax, rax;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_visual_do_delete:
+        // Yank then shift-left.  First yank into kill_buf (clamped).
+        mov r14, r13;
+        sub r14, r12;
+        cmp r14, 1024;
+        jbe vi_vd_yank_len_ok;
+        mov r14, 1024;
+      vi_vd_yank_len_ok:
+        lea r11, [rip + _le_buf];
+        mov r15, r11;                    // r15 = &buf
+        mov rsi, r15;
+        add rsi, r12;                    // rsi = &buf[lo]
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;
+        xor rax, rax;
+      vi_vd_yank_copy:
+        cmp rax, r14;
+        jae vi_vd_yank_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp vi_vd_yank_copy;
+      vi_vd_yank_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r14;
+        // Shift-left: buf[r13..buf_len) -> buf[r12..].
+        //   tail_count = buf_len - r13.
+        lea r11, [rip + _le_buf_len];
+        mov rax, [r11];                  // rax = buf_len
+        mov rcx, rax;
+        sub rcx, r13;                    // rcx = tail_count
+        mov rsi, r15;
+        add rsi, r13;                    // rsi = &buf[hi]
+        mov rdi, r15;
+        add rdi, r12;                    // rdi = &buf[lo]
+        xor rax, rax;
+      vi_vd_shift:
+        cmp rax, rcx;
+        jae vi_vd_shift_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp vi_vd_shift;
+      vi_vd_shift_done:
+        // buf_len -= (hi - lo); cursor := lo; cursor_cluster := 0.
+        mov rax, r13;
+        sub rax, r12;                    // rax = del_len
+        lea r11, [rip + _le_buf_len];
+        mov rdx, [r11];
+        sub rdx, rax;
+        mov [r11], rdx;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r12;
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        // If op was 'c' -> mode := INSERT; else -> NORMAL.
+        cmp rbp, 0x63;
+        je  vi_vd_to_insert;
+        xor rax, rax;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+      vi_vd_to_insert:
+        mov rax, 1;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+        // =========================================================
+        // NORMAL mode
+        // =========================================================
+      vi_normal_mode:
+        // Pending-g gate: if _vi_pending_g == 1, consume byte.
+        lea r11, [rip + _vi_pending_g];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne vi_normal_dispatch;
+        // Clear pending_g.
+        xor rax, rax;
+        lea r11, [rip + _vi_pending_g];
+        mov [r11], rax;
+        // Byte == 'g' -> gg (cursor := 0).
+        cmp rbx, 0x67;
+        jne vi_normal_dispatch;
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        // Also honour pending_op: `dgg` deletes [0, c0) i.e. to BOL.
+        lea r11, [rip + _vi_pending_op];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  vi_ok;
+        // Fall through to a motion-apply path with target r13 = 0,
+        // c0 = cursor before gg. For M7, we treat gg as motion to 0
+        // and the pending-op path handles the span [0, c0).
+        // Reload c0 before the earlier cursor-write.  Since we have
+        // already set cursor := 0 above, treat c0 as the ORIGINAL
+        // cursor; we recomputed it from pending_g semantics -- for
+        // M7 simplicity we approximate c0 = 0 and treat `dgg` as a
+        // no-op (defer dgg composition to M7.3 count-prefix landing).
+        // Clear pending_op silently.
+        xor rax, rax;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_normal_dispatch:
+        // ESC cancels pending state in NORMAL.
+        cmp rbx, 0x1B;
+        je  vi_normal_esc;
+        // Mode-entry keys.
+        cmp rbx, 0x69;                   // 'i'
+        je  vi_enter_insert_at;
+        cmp rbx, 0x61;                   // 'a'
+        je  vi_enter_insert_after;
+        cmp rbx, 0x49;                   // 'I'
+        je  vi_enter_insert_bol;
+        cmp rbx, 0x41;                   // 'A'
+        je  vi_enter_insert_eol;
+        cmp rbx, 0x6F;                   // 'o'
+        je  vi_enter_insert_eol;
+        cmp rbx, 0x4F;                   // 'O'
+        je  vi_enter_insert_bol;
+        cmp rbx, 0x76;                   // 'v'
+        je  vi_enter_visual;
+        cmp rbx, 0x3A;                   // ':'
+        je  vi_enter_command;
+        // Paste.
+        cmp rbx, 0x70;                   // 'p'
+        je  vi_paste_after;
+        cmp rbx, 0x50;                   // 'P'
+        je  vi_paste_before;
+        // Operators.
+        cmp rbx, 0x64;                   // 'd'
+        je  vi_op_d;
+        cmp rbx, 0x63;                   // 'c'
+        je  vi_op_c;
+        cmp rbx, 0x79;                   // 'y'
+        je  vi_op_y;
+        // 'g' latches pending_g.
+        cmp rbx, 0x67;
+        je  vi_normal_set_pending_g;
+        // Motion dispatch (updates r13 then branches on pending_op).
+        jmp vi_motion_dispatch;
+
+      vi_normal_esc:
+        // Clear pending_op + pending_g; mode stays NORMAL.
+        xor rax, rax;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        lea r11, [rip + _vi_pending_g];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_normal_set_pending_g:
+        mov rax, 1;
+        lea r11, [rip + _vi_pending_g];
+        mov [r11], rax;
+        mov rax, 0x5704;                 // VI_PENDING_G
+        jmp vi_epilogue;
+
+        // ------------- Mode-entry handlers ----------------------
+      vi_enter_insert_at:
+        // mode := INSERT, cursor stays.
+        mov rax, 1;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_enter_insert_after:
+        // cursor := min(cursor + 1, buf_len); mode := INSERT.
+        lea r11, [rip + _le_cursor_byte];
+        mov rax, [r11];
+        lea r11, [rip + _le_buf_len];
+        mov rdx, [r11];
+        add rax, 1;
+        cmp rax, rdx;
+        jbe vi_eia_set;
+        mov rax, rdx;
+      vi_eia_set:
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        mov rax, 1;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_enter_insert_bol:
+        // cursor := 0; mode := INSERT.
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        mov rax, 1;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_enter_insert_eol:
+        // cursor := buf_len; mode := INSERT.
+        lea r11, [rip + _le_buf_len];
+        mov rax, [r11];
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        mov rax, 1;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_enter_visual:
+        // mode := VISUAL; anchor := cursor.
+        lea r11, [rip + _le_cursor_byte];
+        mov rax, [r11];
+        lea r11, [rip + _vi_visual_anchor];
+        mov [r11], rax;
+        mov rax, 2;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_enter_command:
+        mov rax, 3;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+        // ------------- Operator latches -------------------------
+      vi_op_d:
+        // If pending_op == 'd', run `dd` (delete whole buffer).
+        lea r11, [rip + _vi_pending_op];
+        mov rax, [r11];
+        cmp rax, 0x64;
+        je  vi_lw_delete;
+        // Else latch pending_op := 'd'.
+        mov rax, 0x64;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        mov rax, 0x5703;                 // VI_PENDING_OP
+        jmp vi_epilogue;
+
+      vi_op_c:
+        lea r11, [rip + _vi_pending_op];
+        mov rax, [r11];
+        cmp rax, 0x63;
+        je  vi_lw_change;
+        mov rax, 0x63;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        mov rax, 0x5703;
+        jmp vi_epilogue;
+
+      vi_op_y:
+        lea r11, [rip + _vi_pending_op];
+        mov rax, [r11];
+        cmp rax, 0x79;
+        je  vi_lw_yank;
+        mov rax, 0x79;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        mov rax, 0x5703;
+        jmp vi_epilogue;
+
+        // ------------- Linewise doubles -------------------------
+      vi_lw_delete:
+        // yank the whole buffer, truncate to zero, cursor := 0.
+        jmp vi_lw_yank_impl_then_truncate;
+
+      vi_lw_change:
+        // yank the whole buffer, truncate, cursor := 0, mode := INSERT.
+        jmp vi_lw_yank_impl_then_change;
+
+      vi_lw_yank:
+        // Yank whole buffer to kill_buf; clear pending_op.
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];
+        cmp r14, 1024;
+        jbe vi_lwy_len_ok;
+        mov r14, 1024;
+      vi_lwy_len_ok:
+        lea r11, [rip + _le_buf];
+        mov r15, r11;
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;
+        xor rax, rax;
+      vi_lwy_copy:
+        cmp rax, r14;
+        jae vi_lwy_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [r15 + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp vi_lwy_copy;
+      vi_lwy_copy_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r14;
+        xor rax, rax;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_lw_yank_impl_then_truncate:
+        // Copy whole buffer, truncate buf_len to 0, cursor := 0,
+        // clear pending_op, stay in NORMAL.
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];
+        cmp r14, 1024;
+        jbe vi_lwt_len_ok;
+        mov r14, 1024;
+      vi_lwt_len_ok:
+        lea r11, [rip + _le_buf];
+        mov r15, r11;
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;
+        xor rax, rax;
+      vi_lwt_copy:
+        cmp rax, r14;
+        jae vi_lwt_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [r15 + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp vi_lwt_copy;
+      vi_lwt_copy_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r14;
+        xor rax, rax;
+        lea r11, [rip + _le_buf_len];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_lw_yank_impl_then_change:
+        // Same as truncate but mode := INSERT.
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];
+        cmp r14, 1024;
+        jbe vi_lwc_len_ok;
+        mov r14, 1024;
+      vi_lwc_len_ok:
+        lea r11, [rip + _le_buf];
+        mov r15, r11;
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;
+        xor rax, rax;
+      vi_lwc_copy:
+        cmp rax, r14;
+        jae vi_lwc_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [r15 + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp vi_lwc_copy;
+      vi_lwc_copy_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r14;
+        xor rax, rax;
+        lea r11, [rip + _le_buf_len];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        mov rax, 1;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+        // ------------- Paste ------------------------------------
+      vi_paste_after:
+        // insert_at := min(cursor + 1, buf_len).
+        lea r11, [rip + _le_cursor_byte];
+        mov r13, [r11];
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];
+        mov rbp, r13;
+        add rbp, 1;
+        cmp rbp, r14;
+        jbe vi_paste_do;
+        mov rbp, r14;
+        jmp vi_paste_do;
+
+      vi_paste_before:
+        lea r11, [rip + _le_cursor_byte];
+        mov r13, [r11];
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];
+        mov rbp, r13;
+        jmp vi_paste_do;
+
+      vi_paste_do:
+        // rbp = insert_at; r14 = buf_len.
+        // kill_len load.
+        lea r11, [rip + _le_kill_len];
+        mov r15, [r11];
+        cmp r15, 0;
+        je  vi_ok;                       // empty kill: silent OK
+        // Guard: buf_len + kill_len <= 4096.
+        mov rax, r14;
+        add rax, r15;
+        cmp rax, 4096;
+        ja  vi_buf_full;
+        // Shift-right buf[insert_at..buf_len) by kill_len.
+        lea r11, [rip + _le_buf];
+        mov rsi, r11;
+        add rsi, rbp;                    // rsi = src_base = &buf[insert_at]
+        mov rdi, rsi;
+        add rdi, r15;                    // rdi = dst_base = src + kill_len
+        // tail_count = buf_len - insert_at
+        mov rcx, r14;
+        sub rcx, rbp;                    // rcx = tail_count
+        mov r12, rcx;                    // r12 = i (walk DOWN)
+      vi_paste_shift:
+        cmp r12, 0;
+        je  vi_paste_shift_done;
+        sub r12, 1;
+        xor rax, rax;
+        mov_b rax, [rsi + r12 * 1];
+        mov_b [rdi + r12 * 1], rax;
+        jmp vi_paste_shift;
+      vi_paste_shift_done:
+        // Copy kill_buf[0..kill_len) -> buf[insert_at..insert_at+kill_len).
+        lea r11, [rip + _le_kill_buf];
+        mov rsi, r11;                    // rsi = kill_src
+        lea r11, [rip + _le_buf];
+        mov rdi, r11;
+        add rdi, rbp;                    // rdi = &buf[insert_at]
+        xor rax, rax;
+      vi_paste_copy:
+        cmp rax, r15;
+        jae vi_paste_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp vi_paste_copy;
+      vi_paste_copy_done:
+        // buf_len += kill_len.
+        add r14, r15;
+        lea r11, [rip + _le_buf_len];
+        mov [r11], r14;
+        // cursor := insert_at + kill_len (one past last pasted byte).
+        add rbp, r15;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rbp;
+        // cursor_cluster := 0 (stale after bulk copy).
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        jmp vi_ok;
+
+        // =========================================================
+        // Motion dispatch -- shared by NORMAL + VISUAL.
+        //
+        // Computes motion target in r13; then at vi_motion_apply:
+        //   if _vi_pending_op != 0  AND  mode == NORMAL:
+        //       apply operator over [min(c0, c1), max(c0, c1)) and
+        //       clear pending_op.
+        //   else:
+        //       cursor := r13; cursor_cluster := 0 for bulk motions,
+        //       hint-preserved for h/l.
+        // Pre-populates r12 = c0 (cursor before motion).
+        // =========================================================
+      vi_motion_dispatch:
+        // Save c0 = _le_cursor_byte in r12.
+        lea r11, [rip + _le_cursor_byte];
+        mov r12, [r11];
+        // Buf length cached.
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];
+        lea r11, [rip + _le_buf];
+        mov r15, r11;
+
+        cmp rbx, 0x68;                   // 'h'
+        je  vi_motion_h;
+        cmp rbx, 0x6C;                   // 'l'
+        je  vi_motion_l;
+        cmp rbx, 0x6A;                   // 'j'
+        je  vi_motion_noop;
+        cmp rbx, 0x6B;                   // 'k'
+        je  vi_motion_noop;
+        cmp rbx, 0x77;                   // 'w'
+        je  vi_motion_w;
+        cmp rbx, 0x62;                   // 'b'
+        je  vi_motion_b;
+        cmp rbx, 0x65;                   // 'e'
+        je  vi_motion_e;
+        cmp rbx, 0x30;                   // '0'
+        je  vi_motion_0;
+        cmp rbx, 0x24;                   // '$'
+        je  vi_motion_dollar;
+        cmp rbx, 0x47;                   // 'G'
+        je  vi_motion_G;
+        jmp vi_bad_key;
+
+      vi_motion_noop:
+        // target := c0 (no move).
+        mov r13, r12;
+        jmp vi_motion_apply;
+
+      vi_motion_h:
+        mov r13, r12;
+        cmp r13, 0;
+        jbe vi_motion_apply;
+        sub r13, 1;
+        jmp vi_motion_apply;
+
+      vi_motion_l:
+        mov r13, r12;
+        cmp r13, r14;
+        jae vi_motion_apply;
+        add r13, 1;
+        jmp vi_motion_apply;
+
+      vi_motion_0:
+        xor r13, r13;
+        jmp vi_motion_apply;
+
+      vi_motion_dollar:
+        mov r13, r14;
+        jmp vi_motion_apply;
+
+      vi_motion_G:
+        mov r13, r14;
+        jmp vi_motion_apply;
+
+      vi_motion_w:
+        // target := forward-word. Phase 1: skip non-ws; phase 2:
+        // skip ws.  Stop on buf end.
+        mov r13, r12;
+      vi_mw_phase1:
+        cmp r13, r14;
+        jae vi_motion_apply;
+        xor rax, rax;
+        mov_b rax, [r15 + r13 * 1];
+        cmp rax, 0x20;
+        je  vi_mw_phase2;
+        cmp rax, 0x09;
+        je  vi_mw_phase2;
+        cmp rax, 0x0A;
+        je  vi_mw_phase2;
+        cmp rax, 0x0D;
+        je  vi_mw_phase2;
+        add r13, 1;
+        jmp vi_mw_phase1;
+      vi_mw_phase2:
+        cmp r13, r14;
+        jae vi_motion_apply;
+        xor rax, rax;
+        mov_b rax, [r15 + r13 * 1];
+        cmp rax, 0x20;
+        je  vi_mw_phase2_step;
+        cmp rax, 0x09;
+        je  vi_mw_phase2_step;
+        cmp rax, 0x0A;
+        je  vi_mw_phase2_step;
+        cmp rax, 0x0D;
+        je  vi_mw_phase2_step;
+        jmp vi_motion_apply;
+      vi_mw_phase2_step:
+        add r13, 1;
+        jmp vi_mw_phase2;
+
+      vi_motion_b:
+        // target := back-word. Walk left: phase 1 skip ws left;
+        // phase 2 skip non-ws left until next ws boundary or BOF.
+        mov r13, r12;
+      vi_mb_phase1:
+        cmp r13, 0;
+        je  vi_motion_apply;
+        mov rbp, r13;
+        sub rbp, 1;
+        xor rax, rax;
+        mov_b rax, [r15 + rbp * 1];
+        cmp rax, 0x20;
+        je  vi_mb_phase1_step;
+        cmp rax, 0x09;
+        je  vi_mb_phase1_step;
+        cmp rax, 0x0A;
+        je  vi_mb_phase1_step;
+        cmp rax, 0x0D;
+        je  vi_mb_phase1_step;
+        jmp vi_mb_phase2;
+      vi_mb_phase1_step:
+        mov r13, rbp;
+        jmp vi_mb_phase1;
+      vi_mb_phase2:
+        cmp r13, 0;
+        je  vi_motion_apply;
+        mov rbp, r13;
+        sub rbp, 1;
+        xor rax, rax;
+        mov_b rax, [r15 + rbp * 1];
+        cmp rax, 0x20;
+        je  vi_motion_apply;
+        cmp rax, 0x09;
+        je  vi_motion_apply;
+        cmp rax, 0x0A;
+        je  vi_motion_apply;
+        cmp rax, 0x0D;
+        je  vi_motion_apply;
+        mov r13, rbp;
+        jmp vi_mb_phase2;
+
+      vi_motion_e:
+        // target := end-of-word. If currently on ws, skip ws;
+        // then advance until next byte is ws or at buf end.
+        mov r13, r12;
+      vi_me_phase1:
+        cmp r13, r14;
+        jae vi_motion_apply;
+        xor rax, rax;
+        mov_b rax, [r15 + r13 * 1];
+        cmp rax, 0x20;
+        je  vi_me_phase1_step;
+        cmp rax, 0x09;
+        je  vi_me_phase1_step;
+        cmp rax, 0x0A;
+        je  vi_me_phase1_step;
+        cmp rax, 0x0D;
+        je  vi_me_phase1_step;
+        jmp vi_me_phase2;
+      vi_me_phase1_step:
+        add r13, 1;
+        jmp vi_me_phase1;
+      vi_me_phase2:
+        // Advance while non-ws; land on the LAST non-ws position.
+        //   Look at the byte AT r13+1 to decide to stop.
+        mov rbp, r13;
+        add rbp, 1;
+        cmp rbp, r14;
+        jae vi_motion_apply;
+        xor rax, rax;
+        mov_b rax, [r15 + rbp * 1];
+        cmp rax, 0x20;
+        je  vi_motion_apply;
+        cmp rax, 0x09;
+        je  vi_motion_apply;
+        cmp rax, 0x0A;
+        je  vi_motion_apply;
+        cmp rax, 0x0D;
+        je  vi_motion_apply;
+        mov r13, rbp;
+        jmp vi_me_phase2;
+
+        // =========================================================
+        // vi_motion_apply: with r12 = c0, r13 = c1 (motion target).
+        //
+        // If _vi_pending_op != 0: apply operator over
+        //   [min(c0, c1), max(c0, c1)) and clear pending_op.
+        // Else: cursor := c1.
+        //
+        // In VISUAL mode we jump HERE from vi_visual_mode via the
+        // vi_motion_dispatch fall-through, with VISUAL mode active;
+        // the pending_op path is skipped because pending_op is 0 in
+        // VISUAL (operators are consumed via the vi_visual_d / _c /
+        // _y branches above).
+        // =========================================================
+      vi_motion_apply:
+        lea r11, [rip + _vi_pending_op];
+        mov rbp, [r11];
+        cmp rbp, 0;
+        jne vi_motion_apply_op;
+        // Motion-only: cursor := r13.
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r13;
+        // cursor_cluster := 0 for bulk motions; for h/l preserve
+        // the hint. Easiest safe choice: zero on w/b/e/0/$/G,
+        // preserve on h/l/j/k. Branch on rbx.
+        cmp rbx, 0x68;
+        je  vi_ok;                       // 'h'
+        cmp rbx, 0x6C;
+        je  vi_ok;                       // 'l'
+        cmp rbx, 0x6A;
+        je  vi_ok;                       // 'j'
+        cmp rbx, 0x6B;
+        je  vi_ok;                       // 'k'
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_motion_apply_op:
+        // Compute [lo, hi) = [min(c0, c1), max(c0, c1)).
+        mov rsi, r12;                    // rsi = lo (tentative)
+        mov rdi, r13;                    // rdi = hi (tentative)
+        cmp rsi, rdi;
+        jbe vi_mao_order_ok;
+        mov rax, rsi;
+        mov rsi, rdi;
+        mov rdi, rax;
+      vi_mao_order_ok:
+        // Dispatch on rbp (pending_op byte).
+        cmp rbp, 0x79;                   // 'y'
+        je  vi_mao_yank;
+        // 'd' or 'c': yank then shift-left.
+        jmp vi_mao_delete;
+
+      vi_mao_yank:
+        // Copy buf[rsi..rdi) -> _le_kill_buf (clamped to 1024).
+        //   rcx = len; r15 still = &buf.
+        mov rcx, rdi;
+        sub rcx, rsi;
+        cmp rcx, 1024;
+        jbe vi_mao_y_len_ok;
+        mov rcx, 1024;
+      vi_mao_y_len_ok:
+        mov r14, r15;
+        add r14, rsi;                    // r14 = &buf[lo]
+        lea r11, [rip + _le_kill_buf];
+        mov rdx, r11;                    // rdx = kill_dst
+        xor rax, rax;
+      vi_mao_y_copy:
+        cmp rax, rcx;
+        jae vi_mao_y_done;
+        xor rbp, rbp;
+        mov_b rbp, [r14 + rax * 1];
+        mov_b [rdx + rax * 1], rbp;
+        add rax, 1;
+        jmp vi_mao_y_copy;
+      vi_mao_y_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], rcx;
+        // Clear pending_op; cursor stays at original c0.
+        xor rax, rax;
+        lea r11, [rip + _vi_pending_op];
+        mov [r11], rax;
+        jmp vi_ok;
+
+      vi_mao_delete:
+        // Yank then shift-left; cursor := lo; mode := INSERT iff
+        // operator was 'c'.
+        mov rcx, rdi;
+        sub rcx, rsi;
+        cmp rcx, 1024;
+        jbe vi_mao_d_yank_len_ok;
+        mov rcx, 1024;
+      vi_mao_d_yank_len_ok:
+        mov r14, r15;
+        add r14, rsi;                    // r14 = &buf[lo]
+        lea r11, [rip + _le_kill_buf];
+        mov rdx, r11;
+        xor rax, rax;
+      vi_mao_d_yank_copy:
+        cmp rax, rcx;
+        jae vi_mao_d_yank_done;
+        xor r8, r8;
+        mov_b r8, [r14 + rax * 1];
+        mov_b [rdx + rax * 1], r8;
+        add rax, 1;
+        jmp vi_mao_d_yank_copy;
+      vi_mao_d_yank_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], rcx;
+        // Shift-left: buf[rdi..buf_len) -> buf[rsi..].
+        lea r11, [rip + _le_buf_len];
+        mov r8, [r11];                   // r8 = buf_len
+        mov rcx, r8;
+        sub rcx, rdi;                    // rcx = tail_count
+        mov r9, r15;
+        add r9, rdi;                     // r9 = &buf[hi]
+        mov r14, r15;
+        add r14, rsi;                    // r14 = &buf[lo]
+        xor rax, rax;
+      vi_mao_d_shift:
+        cmp rax, rcx;
+        jae vi_mao_d_shift_done;
+        xor rbp, rbp;
+        mov_b rbp, [r9 + rax * 1];
+        mov_b [r14 + rax * 1], rbp;
+        add rax, 1;
+        jmp vi_mao_d_shift;
+      vi_mao_d_shift_done:
+        // buf_len -= (hi - lo); cursor := lo; cursor_cluster := 0.
+        mov rax, rdi;
+        sub rax, rsi;
+        lea r11, [rip + _le_buf_len];
+        mov rdx, [r11];
+        sub rdx, rax;
+        mov [r11], rdx;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rsi;
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        // Clear pending_op (read it first to decide 'c' -> INSERT).
+        lea r11, [rip + _vi_pending_op];
+        mov r8, [r11];
+        xor rax, rax;
+        mov [r11], rax;
+        cmp r8, 0x63;                    // 'c'
+        jne vi_ok;
+        mov rax, 1;
+        lea r11, [rip + _vi_mode];
+        mov [r11], rax;
+        jmp vi_ok;
+
+        // =========================================================
+        // Shared epilogues
+        // =========================================================
+      vi_ok:
+        xor rax, rax;                    // VI_OK
+        jmp vi_epilogue;
+
+      vi_bad_key:
+        mov rax, 0x5700;                 // VI_ERR_BAD_KEY
+        jmp vi_epilogue;
+
+      vi_buf_full:
+        mov rax, 0x5701;                 // VI_ERR_BUF_FULL
+        jmp vi_epilogue;
+
+      vi_bad_mode:
+        mov rax, 0x5702;                 // VI_ERR_BAD_MODE
+        jmp vi_epilogue;
+
+      vi_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
