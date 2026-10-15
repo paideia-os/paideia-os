@@ -14,23 +14,30 @@ landed. R221.M2 (GraphemeIter: TR#29 grapheme-cluster boundary
 iterator) -- landed. R221.M3 (WidthPass: TR#11 column classifier +
 cluster-aware column accumulator with locale-amb overlay) --
 landed. R221.M4 (CtxLexer: context-tracking lexer over pipeline /
-datalog / lambda tiers) -- landed. R222.M1 (SchemasSig parser) --
+datalog / lambda tiers) -- landed. R221.M5 (Ast: unified SyntaxNode
+sum type over a 256-slot bump-pointer pool with Q-A5 source-span
+invariants) -- landed. R222.M1 (SchemasSig parser) --
 landed. R222.M2 (CommandSig parser) -- landed. R222.M3
 (FunctorInstance: instantiation materialization record) -- landed.
 R222.M4 (ArgFlagSpec: HM-typed arg + flag descriptors and
-invocation checker) -- landed. R223.M1 (Pipeline stage parser) --
+invocation checker) -- landed. R222.M5 (CmdRegistry: per-session
+command-registry client with user-shadow override) -- landed.
+R223.M1 (Pipeline stage parser) --
 landed. R223.M2 (RecordProjection: select/project FIELDS) --
 landed. R224.M1 (LambdaLit grammar) -- landed. R224.M2
 (ClosureCapture list parser) -- landed. R224.M3 (EffectRow:
 effect-polymorphic row sub-grammar + width-covariant subtype check
 per Q-A3) -- landed. R224.M4 (CapRow: capability-row sub-grammar
 over Q-A2 substructural lattice + env-mask covering check with
-E0820-family diagnostic) -- landed. R225.M1 (HM algorithm W core) -- landed.
+E0820-family diagnostic) -- landed. R224.M5 (LetScope: nested
+lambda + let / let-rec scope-frame pool with inner-first parent-
+chain resolve per standard HM shadowing, E0830-family diagnostic)
+-- landed. R225.M1 (HM algorithm W core) -- landed.
 R225.M2 (RowTypes: Remy-style row polymorphism) -- landed. R226.M1
 (Datalog parser) -- landed. R229.M2 (SessionEnv: session-scoped
 bindings) -- landed. R229.M3 (TypeEnv: type-environment threading
 = scheme store + specialisation cache) -- landed.
-**Version:** 1.18.0.
+**Version:** 1.19.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -110,19 +117,45 @@ is landed).
       follow-up. The user-space parser-tier satellite does not know
       its own boot position.
 
-### M5 -- Unified AST sum type + node constructors (deferred)
+### M5 -- Unified AST sum type + node constructors (paideia-os#2655, landed)
 
-Blocked by: M4.
+- [x] **R221.M5-001** -- `src/ast.pdx` module `Ast` landed: seven
+      public entry points (`_ast_init`, `_ast_set_source`,
+      `_ast_alloc`, `_ast_set_payload_u32`, `_ast_set_child_ref`,
+      `_ast_set_extra_ref`, `_ast_render`) over a 256-slot `.bss`
+      bump-pointer SyntaxNode pool with 32-byte record stride
+      (`kind` u16, `flags` u16, `src_offset` u32, `src_length` u32,
+      `payload_u32` u32, `child_ref` u64, `extra_ref` u64) and the
+      Q-A5 source-span invariant on every node. SyntaxKind enum
+      spans five families on kilo-step boundaries
+      (`0x0100..0x05FF`): pipeline, datalog, lambda, record,
+      literal. AST_* status taxonomy in `0x4400..0x44FF` with six
+      slots used + 250 reserved for M5.1+ follow-ups. All seven
+      entry points are PURE LEAVES (zero callee-save pushes, zero
+      stack frames, zero nested CALLs); allocator inlines the
+      lazy-init.
+- [x] **R221.M5-002** -- design doc landed:
+      `design/shell/unified-ast.md` (record layout, SyntaxKind
+      enum, pool + allocation, round-trip strategy, public API,
+      error band, encoder discipline, 10-example fixture subset of
+      the 100-sample round-trip anchor, forward path, ABI freeze).
+- [ ] **R221.M5-003** -- 100-sample round-trip test corpus +
+      proptest harness (`tests/proptest_ast_roundtrip.pdx`):
+      deferred to a follow-up; the design doc §9 enumerates the
+      pipeline / datalog / lambda / record / literal fixture
+      shapes for the acceptance anchor.
 
 ### M6 -- Source-span tracking through NFC normalization (deferred)
 
-Blocked by: M1 + M5. Will add a sibling entry point
+Blocked by: M1 + M5 (unblocked). Will add a sibling entry point
 `_u8n_decode_and_normalize_with_map` that emits a span-mapping
-table alongside the output bytes.
+table alongside the output bytes, feeding into the AST module's
+`src_offset` / `src_length` slot so diagnostics quote the user's
+original (pre-NFC) input.
 
 ### M7 -- Fuzz corpus for parser + Unicode (deferred)
 
-Blocked by: M5. 24-hour AFL run gates landing.
+Blocked by: M5 (unblocked). 24-hour AFL run gates landing.
 
 ## R222 cmd-functor checklist
 
@@ -162,12 +195,26 @@ Blocked by: M5. 24-hour AFL run gates landing.
       doc §Acceptance enumerates the 10 well-typed + 10 ill-typed
       representative cases.
 
-### M5 -- Registry client (deferred)
+### M5 -- Registry client (paideia-os#2662, landed)
 
-Blocked by: M4 (consumes ArgSpec + FlagSpec records) + R222.M2
-(CommandSig) + R222.M1 (SchemasSig). Reads commands.toml, materialises
-the per-command spec quartet, hashes into the schema-registry
-fingerprint.
+- [x] **R222.M5-001** -- `src/cmd_registry.pdx` module `CmdRegistry`
+      landed: `_cmdreg_init` zero-fills the 128-slot .bss table
+      (48-byte stride), `_cmdreg_register(scope, name, name_len,
+      cs_body_ref, functor_ref)` interns a tuple via FNV-1a 64 hash +
+      linear probe, `_cmdreg_lookup(name, name_len, out_entry_ptr)`
+      walks the probe chain and prefers CMDREG_SCOPE_USER over
+      CMDREG_SCOPE_SYSTEM on a hash tie, `_cmdreg_dump(out, out_cap)`
+      lists all occupied entries for the `describe` builtin.
+      `_cmdreg_fnv1a64` is a pure-leaf FNV-1a 64 byte-for-byte
+      identical to R222.M2 `_cmd_sig_fnv1a64` and R222.M3
+      `_fi_fnv1a64`. CMDREG_* status taxonomy in 0x4500..0x45FF.
+- [x] **R222.M5-002** -- design doc landed:
+      `design/shell/command-registry-client.md`.
+- [ ] **R222.M5-003** -- 5-command seed fixture + user-shadow test
+      (`tests/proptest_cmd_registry.pdx`): deferred to R222.M7
+      fuzz-corpus milestone per the umbrella; the design doc
+      §Acceptance enumerates the 5-command seed + user-shadow override
+      case and the ≤50 μs per-lookup target.
 
 ### M6 -- commands.toml bind (deferred)
 
@@ -377,9 +424,55 @@ rather than a semantic unlock.
       `_cr_render`: filed as R224.M4.3 follow-up. Currently every
       `ROW_VAR` renders as bare `rho`.
 
-### M5 -- Nested lambda + let-rec scoping (deferred)
+### M5 -- Nested lambda + let-rec scoping (paideia-os#2679, landed)
 
-Blocked by: M2.
+- [x] **R224.M5-001** -- `src/let_scope.pdx` module `LetScope`
+      landed: `_ls_init` boot hook (idempotent lazy init, reserves
+      slot 0 as the null-sentinel), three thin push wrappers
+      (`_ls_push_let`, `_ls_push_letrec`, `_ls_push_lambda`) that
+      CALL the shared module-private `_ls_push_impl` with r8 set
+      to the kind byte (1/2/3), `_ls_resolve` inner-first parent-
+      chain walker returning `(type_scheme_ref << 32) | LS_OK` on
+      byte-level name match, `_ls_pop` pure-leaf parent-u32
+      accessor. 32-byte Frame record (kind u16, flags u16, parent
+      u32, name_inline `[u8; 16]`, name_len u8, 3 reserved bytes,
+      type_scheme_ref u32); 128-slot pool (slot 0 null-sentinel,
+      127 usable); LS_* status taxonomy in 0x4600..0x4604 (band
+      0x4600..0x46FF with 251 slots reserved for M5.1+ follow-ups).
+- [x] **R224.M5-002** -- design doc landed:
+      `design/shell/let-in-scoping.md`. 12-test acceptance corpus
+      enumerated at §7 (basic let, nested lets, shadowing, let-rec
+      self-recursion, let-rec + lambda, lambda shadowing, three-
+      level nesting, not-found, pop-returns-parent, pool-full,
+      bad-frame, bad-name).
+- [x] **R224.M5-003** -- lib.pdx: version 1.18.0 -> 1.19.0 (shared
+      with the parallel Wave 122 R221.M5 Ast and R222.M5
+      CmdRegistry arms); `LPX_PDS_PARSER_R224_M5_READY` flipped to 1.
+- [x] **R224.M5-004** -- caps.decl: 0x4600..0x46FF band section +
+      per-milestone catalogue entry + grep-disjointness line +
+      linker-dependency entry.
+- [ ] **R224.M5-005** (deferred) -- `tests/proptest_let_scope.pdx`
+      12-test corpus + fingerprint goldens: filed as R224.M5.5
+      follow-up. The design doc §7 enumerates the OK/error cases
+      so a late-landing test harness can golden them from the spec.
+- [ ] **R224.M5-006** (deferred) -- TypeEnv scheme_id payload
+      reinterpretation (flags bit 0 selects HmCore pool_idx vs
+      TypeEnv scheme_id for the stored `type_scheme_ref` u32):
+      filed as R224.M5.1 follow-up. Currently every caller passes
+      a HmCore pool_idx and leaves flags=0.
+- [ ] **R224.M5-007** (deferred) -- `_ls_push_letrec_group` batch
+      mutual-recursion helper: filed as R224.M5.2 follow-up.
+      Currently the caller loops over `_ls_push_letrec`.
+- [ ] **R224.M5-008** (deferred) -- `_ll_parse` splice-points for
+      `let` / `let rec` prefix syntax inside a lambda body: filed
+      as R224.M5.3 follow-up. Currently the M5 substrate is driven
+      by the R221.M5 unified-AST walker at the R224.M5-dispatch
+      layer.
+- [ ] **R224.M5-009** (deferred) -- compacting pop
+      (`_ls_pop_and_reclaim`): filed as R224.M5.4 follow-up.
+      Currently `_ls_pop` returns the parent-ref without
+      reclaiming the slot (frames are append-only within a parse
+      pass).
 
 ### M6 -- First-class pipeline value (deferred)
 
@@ -563,7 +656,9 @@ Blocked by: M4 + pdxfs user profile schema.
 | command_sig      | 0x3300..0x3303   | R222.M2   | landed |
 | functor_instance | 0x3900..0x3906   | R222.M3   | landed |
 | arg_flag_spec    | 0x3C00..0x3C0A   | R222.M4   | landed |
-| arg_flag_spec-M5+| 0x3C0B..0x3CFF   | R222.M5+  | reserved |
+| arg_flag_spec-M6+| 0x3C0B..0x3CFF   | R222.M6+  | reserved |
+| cmd_registry     | 0x4500..0x4505   | R222.M5   | landed |
+| cmd_registry-M6+ | 0x4506..0x45FF   | R222.M6+  | reserved |
 | pipeline         | 0x2B00..0x2B04   | R223.M1   | landed |
 | pipeline-M3+     | 0x2B05..0x2BFF   | R223.M3+  | reserved |
 | record_projection | 0x3400..0x3402  | R223.M2   | landed |
@@ -576,6 +671,8 @@ Blocked by: M4 + pdxfs user profile schema.
 | effect_row-M3.1+ | 0x4008..0x40FF   | R224.M3.1+ | reserved |
 | cap_row          | 0x4300..0x4309   | R224.M4   | landed |
 | cap_row-M4.1+    | 0x430A..0x43FF   | R224.M4.1+ | reserved |
+| let_scope        | 0x4600..0x4604   | R224.M5   | landed |
+| let_scope-M5.1+  | 0x4605..0x46FF   | R224.M5.1+ | reserved |
 | hm_core          | 0x2D00..0x2D03   | R225.M1   | landed |
 | hm_core-M3+      | 0x2D04..0x2DFF   | R225.M3+  | reserved |
 | row_types        | 0x3600..0x3606   | R225.M2   | landed |

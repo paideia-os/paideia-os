@@ -4,6 +4,414 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] -- 2026-10-15
+
+Wave 122 joint landing: R222.M5 CmdRegistry (paideia-os#2662) +
+R224.M5 LetScope (paideia-os#2679) + R221.M5 Ast (paideia-os#2655)
+land in parallel. Each softarch arm declared 1.19.0 as its per-
+primitive version per the parallel-CHANGELOG discipline; main
+consolidates all three into this single stanza at wave close. The
+three arms touch disjoint `.bss` state (`_cmdreg_*` vs the
+LetScope `.bss` vs `_ast_*`), disjoint error bands
+(`0x4500..0x45FF` vs the LetScope band vs `0x4400..0x44FF`),
+disjoint label prefixes (`cmdreg_` vs the LetScope prefix vs
+`ast_`), and disjoint design docs — their only shared surfaces are
+the top-of-file lib.pdx manifest and this CHANGELOG.
+
+### R222.M5 -- CmdRegistry
+
+Per-session command-registry client that resolves `<name> <args>...`
+into a `(cs_body_ref, functor_ref)` tuple at every REPL dispatch.
+Companion to R222.M1..M4 which land the four per-command signature
+records (SchemasSig, CommandSig, FunctorInstance, ArgFlagSpec); this
+M5 wires them together through a hash-indexed catalogue populated at
+session start.
+
+### Added
+
+- `src/cmd_registry.pdx` module `CmdRegistry` (R222.M5,
+  paideia-os#2662): five public entry points over a 128-slot .bss
+  hash table with 48-byte entry stride.
+  - `_cmdreg_init() -> ()` -- idempotent boot hook; zero-fills
+    `_cmdreg_entries` (6144 B = 128 x 48), clears
+    `_cmdreg_count_system` / `_cmdreg_count_user`, sets
+    `_cmdreg_init_state := 1`. Pure leaf.
+  - `_cmdreg_fnv1a64(ptr, len) -> hash` -- pure-leaf FNV-1a 64 over
+    caller bytes; byte-for-byte identical to R222.M2
+    `_cmd_sig_fnv1a64` and R222.M3 `_fi_fnv1a64` (same offset basis
+    0xCBF29CE484222325 + prime 0x100000001B3), so a downstream
+    consumer that compares name_hash values across the three parser-
+    family modules is guaranteed numerical equality.
+  - `_cmdreg_register(scope, name, name_len, cs_body_ref,
+    functor_ref) -> errno` -- validates scope in {0, 1} and
+    name_len in [1, CMDREG_NAME_MAX=16]; CALLs `_cmdreg_init` +
+    `_cmdreg_fnv1a64`; linear-probes from `hash mod 128` and claims
+    the first unoccupied slot; writes the 48-byte entry (name_hash
+    u64, cs_body_ref u64, functor_ref u64, scope u8, flags u8,
+    name_len u8, reserved u8, name_inline u8[16], reserved u32);
+    bumps the per-scope cursor.
+  - `_cmdreg_lookup(name, name_len, out_entry_ptr) -> errno` --
+    CALLs `_cmdreg_init` + `_cmdreg_fnv1a64`; walks the probe chain
+    up to 128 attempts; on name_hash match, picks SCOPE_USER (1) over
+    SCOPE_SYSTEM (0) when both exist on the chain; writes the winning
+    entry base address to `*out_entry_ptr` on OK, 0 on error.
+  - `_cmdreg_dump(out, out_cap) -> (bytes_written << 32) | status`
+    -- walks slot 0..127, copying each occupied entry's 48 bytes into
+    the caller buffer; returns OUT_TOO_SMALL on insufficient capacity.
+- 48-byte entry record: name_hash u64 (FNV-1a 64), cs_body_ref u64
+  (opaque), functor_ref u64 (opaque), scope u8 (0=system, 1=user),
+  flags u8, name_len u8 (1..16), reserved u8, name_inline `[u8; 16]`
+  (zero-padded past name_len), reserved u32. 48-byte stride uses
+  `shl idx, 5` (* 32) + `shl idx, 4` (* 16) summed into a scratch
+  register -- never 2-op `imul r,imm` (per feedback_pdx_encoder_pitfalls).
+- 128-slot .bss table (`_cmdreg_entries`, 6144 B, @align(8)); scope
+  cursors (`_cmdreg_count_system`, `_cmdreg_count_user`); boot
+  sentinel (`_cmdreg_init_state`).
+- Error band 0x4500..0x45FF (6 slots used; 0x4506..0x45FF reserved
+  for R222.M6+ follow-ups): CMDREG_OK (0), CMDREG_ERR_NOT_FOUND
+  (0x4501), CMDREG_ERR_BAD_SCOPE (0x4502), CMDREG_ERR_BAD_NAME
+  (0x4503), CMDREG_ERR_TABLE_FULL (0x4504), CMDREG_ERR_OUT_TOO_SMALL
+  (0x4505).
+- Pure in-process; no KIND surface; no external linker dependency;
+  no cross-library dependency.
+- Label prefix `cmdreg_` (grep-confirmed free of linker-visible
+  symbol collisions; disjoint from the parser-family's `cr_`
+  prefix which is TAKEN by R224.M4 CapRow).
+- Hash-slot mod uses `shl r, 57; shr r, 57` to isolate low 7 bits
+  (= hash mod 128) -- never `and r, imm64` (per
+  feedback_pdx_encoder_pitfalls). Precedent: row_types.pdx
+  `shl r, 40; shr r, 40` for low-24-bit idx masking.
+- Lazy-init discipline: every public API that READS the table CALLs
+  `_cmdreg_init` at its first instruction after the SysV prologue
+  (Wave 120 lesson, reaffirmed at Wave 121 across R224.M3 EffectRow
+  + R224.M4 CapRow).
+
+### Changed
+
+- `src/lib.pdx`: flipped `LPX_PDS_PARSER_R222_M5_READY` from 0 to 1;
+  bumped MINOR 18 -> 19; module-filename comment extended with
+  `src/cmd_registry.pdx at R222.M5`; upstream-issues doc comment
+  picks up `paideia-os#2662 (R222.M5 CmdRegistry)`; design-doc
+  comment picks up `design/shell/command-registry-client.md`.
+- `caps.decl`: added the full 0x4500..0x45FF band section (6 slots +
+  reservation note), the R222.M5 landing paragraph to the per-
+  milestone catalogue, the grep-disjointness confirmation line for
+  `0x450[1-5]\b` (with explicit note that 0x4500 as the APIC ICR
+  INIT delivery-mode base in src/kernel/core/apic/init_sipi.pdx
+  sits in a disjoint semantic namespace), and the R222.M5 linker-
+  dependency entry (NO external linker deps; no cross-library dep;
+  no cross-module CALL into command_sig.pdx or functor_instance.pdx
+  -- cs_body_ref and functor_ref are handed in as opaque u64 handles
+  by the caller).
+
+### Design doc
+
+- `design/shell/command-registry-client.md` -- hash-table rationale
+  (closed addressing + linear probe for predictable O(1) lookup
+  on a 128-slot table scanned with ≤50 μs/call for 5-command
+  fixtures), 48-byte entry layout, user-shadow override rule
+  (preferring SCOPE_USER over SCOPE_SYSTEM on a name_hash tie),
+  TOML-free M5 boundary (the kernel-side cmd_registry_parser.pdx
+  at R123.M2 landed earlier; M5 reads a pre-flattened byte buffer
+  of entries), encoder-pitfall discipline (no `test`, no
+  `and r,imm64`, no 2-op `imul r,imm`, no multiline `pub let`,
+  `shl idx,5 + shl idx,4` stride, `cmdreg_` label prefix),
+  register-liveness note (r11 clobbered across nested CALLs;
+  survivors in r12..r15 or stack), lazy-init discipline (every
+  reader CALLs `_cmdreg_init` at entry), forward path through
+  R222.M6 (commands.toml bind), R222.M7 (fuzz corpus),
+  R222.M8 (`describe <cmd>` serialization).
+
+### R221.M5 -- Ast
+
+R221.M5 of the parser-tier Unicode + lexer umbrella (paideia-os#2485,
+decomposed into paideia-os#2655 for this M5) — UNIFIED AST SUM TYPE:
+one `SyntaxNode` sum spanning pipeline, datalog, lambda, record and
+literal sub-languages over a singleton 8 KiB bump-pointer node pool
+with Q-A5 source-span invariants on every node.
+
+### Added
+
+- `src/ast.pdx` module `Ast` (R221.M5, paideia-os#2655): seven
+  public entry points over a 256-slot `.bss` SyntaxNode pool.
+  - `_ast_init() -> ()` — hard-reset of three scalar `.bss`
+    singletons (`_ast_pool_next`, `_ast_src_ptr`, `_ast_src_len`);
+    idempotent in the trivial sense (re-zeroing an already-zero
+    state is a no-op). Pure leaf.
+  - `_ast_set_source(bytes_ptr, bytes_len) -> ()` — stash caller-
+    supplied source-byte buffer for span-copy render. Pure leaf.
+  - `_ast_alloc(kind, src_offset, src_length) -> node_ref` — bump-
+    allocate one 32-byte slot and populate `kind` + Q-A5 span
+    fields; pool_idx 0 reserved as nil sentinel; returns 0 on
+    pool-full. Pure leaf with inlined lazy-init (precedent:
+    `_rt_alloc_node`). `AST_ERR_POOL_FULL` on `_ast_pool_next >=
+    AST_POOL_CAP` (256).
+  - `_ast_set_payload_u32(node_ref, payload) -> ()` — overwrite
+    the u32 `payload_u32` slot at [+12] of the given node. Silent
+    no-op on out-of-range `node_ref` (void return).
+  - `_ast_set_child_ref(node_ref, child_array_ref) -> ()` —
+    overwrite the u64 `child_ref` slot at [+16]. Silent no-op on
+    out-of-range `node_ref`.
+  - `_ast_set_extra_ref(node_ref, extra_ref) -> ()` — overwrite
+    the u64 `extra_ref` slot at [+24]. Silent no-op on out-of-
+    range `node_ref`.
+  - `_ast_render(node_ref, out, out_cap) -> (bytes_written << 32)
+    | status` — span-copy the N bytes at `_ast_src_ptr +
+    src_offset` into `out`. Returns packed_u64 with the byte count
+    in the high 32 and `AST_OK` (0) / `AST_ERR_*` in the low 32.
+- 32-byte SyntaxNode record stride: `kind` u16, `flags` u16,
+  `src_offset` u32, `src_length` u32, `payload_u32` u32, `child_ref`
+  u64, `extra_ref` u64. 32-byte stride matches `shl r, 5` for slot
+  addressing. Every node carries a Q-A5 source span so diagnostics
+  can point into the source without walking the parent chain.
+- SyntaxKind enum with family / subkind nibble layout:
+  - Pipeline family (`0x0100..0x01FF`): `AST_SK_PIPELINE_ROOT`,
+    `AST_SK_STAGE`, `AST_SK_PIPE`, `AST_SK_REDIRECT`,
+    `AST_SK_HOSTNAME_ANNOT`.
+  - Datalog family (`0x0200..0x02FF`): `AST_SK_DATALOG_BLOCK`,
+    `AST_SK_FACT`, `AST_SK_RULE`, `AST_SK_ATOM`, `AST_SK_GOAL`,
+    `AST_SK_RULE_HEAD`, `AST_SK_RULE_BODY`.
+  - Lambda family (`0x0300..0x03FF`): `AST_SK_LAMBDA`,
+    `AST_SK_PARAM`, `AST_SK_BODY`, `AST_SK_LET`, `AST_SK_LET_REC`,
+    `AST_SK_CAPTURE_LIST`, `AST_SK_EFFECT_ROW`, `AST_SK_CAP_ROW`.
+  - Record family (`0x0400..0x04FF`): `AST_SK_RECORD`,
+    `AST_SK_FIELD`, `AST_SK_FIELD_SELECTOR`.
+  - Literal family (`0x0500..0x05FF`): `AST_SK_LIT_INT`,
+    `AST_SK_LIT_STR`, `AST_SK_LIT_BOOL`, `AST_SK_LIT_PATH`,
+    `AST_SK_LIT_HASH32`, `AST_SK_IDENT`.
+- Error band `0x4400..0x44FF` (six slots used: `AST_ERR_POOL_FULL`
+  `0x4400`, `AST_ERR_BAD_REF` `0x4401`, `AST_ERR_BAD_KIND` `0x4402`,
+  `AST_ERR_OUT_TOO_SMALL` `0x4403`, `AST_ERR_SPAN_OOB` `0x4404`,
+  `AST_ERR_NO_SOURCE` `0x4405`; 250 slots reserved for M5.1+).
+- `.bss` state: `_ast_node_pool : [u8; 8192] @align(8)`,
+  `_ast_pool_next : u64 @align(8)`, `_ast_src_ptr : u64 @align(8)`,
+  `_ast_src_len : u64 @align(8)`. All stores via `lea r11,
+  [rip + sym]; mov [r11+disp], reg` (precedent: `_cl_init`,
+  `_rt_alloc_node`).
+- Pure-leaf discipline: all seven entry points have zero callee-
+  save pushes, zero stack frames, zero nested CALLs. The allocator
+  inlines the lazy-init (`cmp _ast_pool_next, 0; jne have; mov
+  rax, 1; have:`) rather than CALLing `_ast_init`, avoiding the
+  alignment-math prologue and the register-save of rdi/rsi/rdx
+  across the call site.
+- Label prefix `ast_` with per-function suffix (`ast_i_`,
+  `ast_ss_`, `ast_al_`, `ast_sp_`, `ast_sc_`, `ast_se_`,
+  `ast_r_`); grep-confirmed disjoint from every sibling parser-
+  tier module's label namespace and from paideia-as reserved
+  keywords.
+- `design/shell/unified-ast.md` (R221.M5 spec; 10-example fixture
+  subset of the 100-sample round-trip anchor at §9; forward path
+  through R221.M5.1 child-aware render, R221.M5.2 kind-table
+  enforcement, R221.M6 span-mapping NFC, R221.M7 fuzz corpus,
+  R225.M3+ typechecker, R229.M3-dispatch evaluator; §11 ABI-freeze
+  note).
+
+### Changed
+
+- `src/lib.pdx`: `LPX_PDS_PARSER_M5_READY` flipped from 0 to 1;
+  module-filename and upstream-issues comment extended for the new
+  module + the new design doc. Version stays at 1.19.0 per the
+  Wave 122 parallel-arm consolidation convention.
+- `caps.decl`: added the full `0x4400..0x44FF` band section (six
+  slots used + 250 reserved); added the `grep -rE '0x440[0-5]\b'`
+  disjointness-proof line; added the `R221.M5 (ast.pdx)` linker-
+  dependency note (no external dep, no intra-library dep at M5);
+  swapped the R221.M4 note's "R221.M5 will add" wording for the
+  current state ("R221.M5 is the first intra-library consumer of
+  Token records; the AST module itself does not CALL into CtxLexer
+  at the link level").
+
+### Design notes
+
+- Round-trip strategy: every node carries its EXACT source span.
+  `_ast_render` emits the N bytes at `_ast_src_ptr + src_offset`
+  verbatim. The ROOT's span covers `[0, input_len)`, so
+  `_ast_render(root, ...)` is a straight span-copy — trivially
+  byte-identical. A child-aware render that walks `child_ref` and
+  concatenates child spans is architecturally compatible with the
+  same ABI; M5 lands the simpler span-copy variant.
+- Pool_idx 0 is reserved as the "nil" sentinel: a 0 return from
+  `_ast_alloc` signals pool exhaustion; a 0 `child_ref` /
+  `extra_ref` means "no reference". Valid handles are 1..255. The
+  allocator inlines a lazy-check so a zero sentinel bumps to 1 on
+  first use (skip reserved idx 0; precedent: `_rt_alloc_node`).
+- Reset between parses: callers hard-reset via `_ast_init`. The
+  previously-allocated SyntaxNode records remain in the backing
+  byte array but become unreachable because every valid handle
+  must satisfy `node_ref < _ast_pool_next`; a stale handle fails
+  this check and becomes a silent no-op in the setters,
+  `AST_ERR_BAD_REF` in `_ast_render`.
+
+### Linker dependencies
+
+- No external cross-library dependency; no intra-library linker-
+  visible dependency at M5. The AST is a self-contained arena the
+  parser-tier downstream fills from CtxLexer R221.M4 Token records
+  by VALUE through the caller-passed args rather than a cross-
+  module CALL. R225.M3+ typechecker landings will CALL
+  `_ast_set_extra_ref` from this module to write HmCore type-pool
+  pool_idx into the SyntaxNode's extra_ref slot; no cross-library
+  dependency is planned.
+
+### R224.M5 -- LetScope
+
+R224.M5 of the lambda-lang umbrella (paideia-os#2488, decomposed
+into paideia-os#2679 for this M5) -- NESTED LAMBDA + `let` /
+`let rec` SCOPING: a user-space parser-tier working-memory
+substrate backing standard Hindley-Milner shadowing on a stack-of-
+frames pool. A 128-slot ring of 32-byte scope frames (slot 0 is
+the null-sentinel so `parent_frame_ref == 0` means "no enclosing
+scope"); each frame records one lexical binding and chains to its
+enclosing frame via a `parent_frame_ref` u32. The chain-walk
+resolver (`_ls_resolve`) hits the first byte-level name match
+inner-first, so shadowing is natural (the inner binding of a
+name wins within its lexical scope). Recursion is enabled by
+`let rec` pre-pushing the self-frame BEFORE the elaborator types
+the RHS; mutual recursion by pre-pushing N `let rec` frames over
+the common parent before any RHS is typed.
+
+#### Added
+
+- `src/let_scope.pdx` module `LetScope` (R224.M5, paideia-os#2679):
+  seven public entry points over a 128-slot .bss frame pool with
+  32-byte stride.
+  - `_ls_init() -> ()` -- idempotent boot hook; reserves slot 0 as
+    the null-sentinel by setting `_ls_frame_next := 1` on a cold
+    .bss. Pure leaf.
+  - `_ls_push_let(parent, name_ptr, name_len, type_scheme_ref)
+     -> frame_ref` -- thin wrapper: sets r8 = 1 (SCOPE_LET), CALLs
+    `_ls_push_impl`.
+  - `_ls_push_letrec(parent, name_ptr, name_len, type_scheme_ref)
+     -> frame_ref` -- same shape; sets r8 = 2 (SCOPE_LETREC).
+  - `_ls_push_lambda(parent, name_ptr, name_len, type_scheme_ref)
+     -> frame_ref` -- same shape; sets r8 = 3 (SCOPE_LAMBDA).
+  - `_ls_push_impl(parent, name_ptr, name_len, type_scheme_ref,
+     kind) -> frame_ref` -- module-private helper; validates
+    `name_len` in [1..16] and `kind` in [1..3], checks pool-not-
+    full, writes the 32-byte header (kind u16, flags u16, parent
+    u32, name_inline u8[16], name_len u8, 3 reserved u8,
+    type_scheme_ref u32), bumps `_ls_frame_next`, returns the
+    pre-increment slot index. Lazy-init idempotent at entry
+    (Wave 120 lesson).
+  - `_ls_resolve(frame_ref, name_ptr, name_len) -> packed_u64` --
+    walks the parent chain inner-first comparing name_len then
+    bytes; on first match returns `(type_scheme_ref << 32) |
+    LS_OK`. On chain-end (cursor == 0) returns
+    `LS_ERR_NOT_FOUND` (0x4601); on cursor >= 128 or kind==0
+    mid-walk returns `LS_ERR_BAD_FRAME` (0x4602); on bad input
+    name_len returns `LS_ERR_BAD_NAME` (0x4603). Lazy-init
+    idempotent at entry.
+  - `_ls_pop(frame_ref) -> parent_frame_ref` -- pure-leaf accessor
+    reading the stored parent u32 at `&_ls_frame_pool +
+    frame_ref*32 + 4`. Does NOT reclaim the slot (frames are
+    append-only within a parse pass).
+- Frame record layout (32 B stride, `shl r,5`): kind u16 at +0,
+  flags u16 at +2, parent u32 at +4, name_inline u8[16] at +8,
+  name_len u8 at +24, 3 reserved u8 at +25..+27, type_scheme_ref
+  u32 at +28. Three kinds share one record; only the kind-byte
+  discriminator differs. The `type_scheme_ref` u32 payload is
+  caller-opaque: at raw M5 it is a HmCore pool_idx; at the M5.1
+  wire-up a TypeEnv scheme_id is used instead (flags bit 0
+  discriminates).
+- Pool geometry: `_ls_frame_pool : [u8; 4096] @align(8)` (128
+  slots x 32 B); `_ls_frame_next : u64 @align(8)` next-free
+  cursor (1..128 after init). Slot 0 reserved as the null-
+  sentinel so `parent_frame_ref == 0` reads as "top-level, no
+  enclosing scope". Pool-full is `_ls_frame_next >= 128`.
+- Error band 0x4600..0x46FF (five slots used: `LS_ERR_POOL_FULL`
+  0x4600, `LS_ERR_NOT_FOUND` 0x4601, `LS_ERR_BAD_FRAME` 0x4602,
+  `LS_ERR_BAD_NAME` 0x4603, `LS_ERR_BAD_KIND` 0x4604; 251 slots
+  reserved for M5.1+). Diagnostic-family mapping:
+  `E0830_NAME_NOT_FOUND` = 0x4601,
+  `E0831_BAD_FRAME` = 0x4602,
+  `E0832_BAD_NAME` = 0x4603,
+  `E0833_POOL_FULL` = 0x4600,
+  `E0834_BAD_KIND` = 0x4604.
+- NO external cross-library linker dependency; NO intra-library
+  linker dependency at raw M5. LetScope stores the `type_scheme_ref`
+  u32 as an opaque payload and does not call into HmCore, TypeEnv,
+  RowTypes, or any sibling module. All seven public entry points
+  can be linked standalone.
+- Label prefix `ls_` with per-function suffix (`ls_ini_`,
+  `ls_pi_`, `ls_pl_`, `ls_plr_`, `ls_pla_`, `ls_r_`, `ls_po_`).
+  Grep-confirmed disjoint from every sibling parser-tier module
+  in this library (u8n_, gi_, wp_, cl_, sch_sig_, cmd_sig_, fi_,
+  afs_, pl_, rp_, ll_, cc_, er_, cr_, hm_, rt_, dl_, se_, te_,
+  cmdreg_, ast_).
+- `design/shell/let-in-scoping.md` (R224.M5 spec; 12-test
+  acceptance corpus enumerated at §7 covering 10 OK cases
+  (basic let, nested lets, shadowing, let-rec self-rec, let-rec
+  + lambda, lambda shadowing, three-level nesting, pop-returns-
+  parent) + 4 error cases (not-found, pool-full, bad-frame, bad-
+  name)).
+
+#### Changed
+
+- `src/lib.pdx`: `LPX_PDS_PARSER_R224_M5_READY` flipped from 0 to 1
+  (version bump 1.18.0 -> 1.19.0 shared with the parallel R221.M5
+  Ast and R222.M5 CmdRegistry arms of Wave 122); module-filename
+  comment extended with `src/let_scope.pdx at R224.M5`; upstream-
+  issues comment extended with `paideia-os#2679 (R224.M5
+  LetScope)`; design-doc list extended with
+  `design/shell/let-in-scoping.md`.
+- `caps.decl`: added the full 0x4600..0x46FF band section (five
+  slots used, 251 reserved for M5.1+), the R224.M5 landing
+  paragraph in the per-milestone catalogue (replacing the former
+  R224.M5+ forward-reference comment with the landed R224.M5 entry
+  + the still-reserved R224.M6+ comment), the `0x460[0-4]\b`
+  grep-disjointness confirmation line, the R224.M5 linker-
+  dependency entry (NO external cross-library dep, NO intra-
+  library dep at raw M5), and the scope-family .bss disjointness
+  note appended to the CmdRegistry closing paragraph.
+- `STATUS.md`: R224.M5 moved from "deferred" to "landed"; the R224
+  wave checklist gains the M5 row with items R224.M5-001..009
+  (001..004 landed, 005..009 deferred); the error-band accounting
+  table gains the `let_scope` + `let_scope-M5.1+` rows.
+
+#### Design notes
+
+- Standard HM shadowing chosen over Q-A5a (flat lexical name
+  table; rejected because of O(n) scope-pop rehash cost on frame
+  exit) and Q-A5b (persistent scope-env records; rejected because
+  parse-tree reuse is not a current workflow and copy-on-push cost
+  would dominate at R224 grammar sizes).
+- The pool mirrors R225.M1 HmCore's own frame-indexed convention
+  (slot 0 reserved as null-sentinel; 1-indexed usable slots; pool-
+  full checked against the slot-count ceiling). Resolve shadowing
+  falls out naturally from the inner-first chain walk; no explicit
+  shadowing-aware predicate is needed in the resolve loop.
+- The three public push wrappers each `sub rsp, 8` for SysV
+  alignment, set `r8 = kind` to the literal 1/2/3, CALL
+  `_ls_push_impl`, `add rsp, 8`, RET. The shared helper avoids
+  triple-maintaining the ~60-instruction push body; the kind byte
+  flows through r8 (SysV 5th arg slot) with no caller-side
+  rewrite.
+- The `type_scheme_ref` u32 is stored and returned verbatim at
+  raw M5 so the R229.M4+ REPL dispatch can choose between a HmCore
+  pool_idx (monomorphic) and a TypeEnv scheme_id (polymorphic)
+  via the flags byte. M5.1 wires the flag.
+- `_ls_pop` is a convenience accessor that does NOT reclaim the
+  slot; the enclosing cursor is restored by the AST driver which
+  held it in a local register BEFORE the push. The pool is
+  append-only within a parse pass. M5.4 lands a compacting pop
+  if the use-case firms up.
+- Wave 120 lazy-init lesson replicated at every public API that
+  reads OR writes the frame pool. `_ls_pop` deliberately skips
+  the init call because a never-pushed pool has every parent u32
+  as .bss zero, which equals the correct "top-level" sentinel.
+
+#### Linker dependencies
+
+- No external cross-library dependency; no intra-library linker-
+  visible dependency at raw M5. LetScope stores the
+  `type_scheme_ref` u32 as an opaque payload; the HM-dispatch and
+  TypeEnv-cache interpretation happens at the R229.M4+ REPL layer
+  which reads the resolve-returned u32 and routes to the right
+  substrate.
+- All seven public entry points can be linked against a bare
+  parser-tier object graph; no `--extra-obj-dir` is introduced
+  for this M5.
+
 ## [1.18.0] -- 2026-10-15
 
 Wave 121 joint landing: R221.M4 CtxLexer (paideia-os#2654) +
