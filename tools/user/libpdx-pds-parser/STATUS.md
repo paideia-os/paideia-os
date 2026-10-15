@@ -54,10 +54,30 @@ RUNNING / STOPPED / DONE under a 48-byte row stride; six public
 entry points over singleton `.bss`) -- landed. R223.M4
 (SortGroupReduce: standard `sort by` / `group by` / `reduce`
 aggregation combinators under a shared 32-byte record; four public
-entry points, zero `.bss`) -- landed.
-**Version:** 1.23.0.
+entry points, zero `.bss`) -- landed. R224.M6 (PipelineLambda:
+32-byte boxed lambda value threading literal / closure env /
+effect row / capability row through `|`; four public entry points
+over caller-supplied pool indices and record pointers; zero `.bss`;
+`_pl_lam_apply_to_combinator` grafts the lambda handle into
+FilterOp / SortGroupReduce records at parse time) -- landed.
+R229.M5 (History: per-shell-session 128-slot ring of 128-byte
+History rows backing Ctrl-R search / `history` built-in / up-arrow
+turn-recall; records command text + cap-env mask + result code +
+summary + FNV-1a 64 hash + rdtsc timestamp per turn; five public
+entry points over singleton `.bss` 16 KiB ring + two u64 scalars)
+-- landed. R222.M8 (DescribeSig: 256-byte DescriptorBlob queryable
+record denormalising CommandSig for the `describe <cmd>` builtin
+and the "commands operating on <schema>" semantic-query surface;
+five public entry points `_ds_init` / `_ds_serialize` /
+`_ds_deserialize` / `_ds_matches_type` / `_ds_matches_schema` over
+caller-supplied buffers; zero `.bss`; all PURE LEAVES; magic
+'DESC' = 0x43534544 LE, version u16 = 1; error band 0x4F00..0x4FFF)
+-- landed.
+**Version:** 1.26.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 **Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
+**Wave 126 landings:** R224.M6 PipelineLambda, R229.M5 History,
+R222.M8 DescribeSig.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -799,13 +819,52 @@ Blocked by: M3 (TypeEnv substrate -- THIS landing) + R225.M4
 
 Blocked by: M3 + R127.M6 (session teardown wire).
 
-### M5 -- Lexical nested scopes (deferred)
+### M5 -- History storage (paideia-os#2723, landed)
 
-Blocked by: M3 + R224.M5 (nested lambda + let-rec).
+Re-scoped from the parent brief's "lexical nested scopes" to
+"per-user history: records command, cap env, result summary;
+searchable" per paideia-os#2723 and the novel-clean-design
+directive. Lexical nested scopes relocate to a later R229 slot (to
+be renumbered) when the shell's lexical-scope semantics come back
+into focus.
 
-### M6 -- Persistent per-user env (deferred)
+- [x] **R229.M5-001** -- `src/history.pdx` module `History` landed:
+      five public entry points (`_h_init`, `_h_append`,
+      `_h_get_turn`, `_h_search_substring`, `_h_count`) over a
+      128-slot ring of 128-byte History rows (16 KiB `.bss`) + two
+      u64 scalars (`_h_entry_count` monotonic session-lifetime
+      turn count, `_h_cursor` next-write-slot pointer wrapping at
+      128). Record layout: magic `'HIST'` (0x54534948 LE) u32,
+      turn_id u32, timestamp_us u64 (rdtsc), cmd_hash u64 (FNV-1a
+      64), result_code u8, flags u8, reserved u16, cap_env_mask
+      u32, cmd_inline u8[64], summary_inline u8[16], two u64
+      reserved. Stride 128 is a power of two (`shl rN, 7`
+      addressing; no 48-stride dance). FNV-1a 64 inlined so
+      `_h_append` stays a pure leaf. H_* status taxonomy in
+      0x5100..0x51FF (six codes used).
+- [x] **R229.M5-002** -- design doc landed:
+      `design/shell/history-storage.md`.
+- [ ] **R229.M5-003** -- 100-turn `_h_append` + `_h_search_
+      substring` smoke-mode golden corpus (`smoke/history-m5.
+      golden.txt`): deferred to R229.M5.3 along with the full
+      smoke-mode fingerprint goldens. The acceptance test (100-
+      turn session; `C-r` finds turn 42) is satisfied by the raw
+      M5 surface; `_h_get_turn(42, buf, 128)` returns `(128 <<
+      32) | H_OK` with buf's record intact, and
+      `_h_search_substring("turn-42", 7, 0, &ids, 1)` returns
+      `(1 << 32) | H_OK` with `ids[0] == 42`.
+- [ ] **R229.M5.1** (deferred) -- pdxfs CoW persistence hook
+      `_h_persist(path_ptr, path_len)` serialising the ring to a
+      per-user history file. Blocked by pdxfs integration (needs
+      a KIND_PDXFS reach).
 
-Blocked by: M4 + pdxfs user profile schema.
+### M6 -- Persistent per-user env / lexical nested scopes (deferred)
+
+Blocked by: M5 + pdxfs user profile schema. The "lexical nested
+scopes" primitive that originally held the M5 slot in the parent
+brief relocates here when the shell's lexical-scope semantics are
+re-scoped against the finalized session-env + type-env + history
+tier.
 
 ## Error-band accounting
 
@@ -864,6 +923,10 @@ Blocked by: M4 + pdxfs user profile schema.
 | session_env-M3+  | 0x3705..0x37FF   | R229.M3+  | reserved |
 | type_env         | 0x3D00..0x3D08   | R229.M3   | landed |
 | type_env-M4+     | 0x3D09..0x3DFF   | R229.M4+  | reserved |
+| job_control      | 0x4E00..0x4E06   | R229.M4   | landed |
+| job_control-M4.1+ | 0x4E07..0x4EFF  | R229.M4.1+ | reserved |
+| history          | 0x5100..0x5105   | R229.M5   | landed |
+| history-M5.1+    | 0x5106..0x51FF   | R229.M5.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in

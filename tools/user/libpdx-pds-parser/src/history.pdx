@@ -1,0 +1,1106 @@
+// src/history.pdx -- libpdx-pds-parser.R229.M5 (paideia-os#2723)
+//
+// History: per-session shell history substrate. Records each
+// dispatched REPL turn (command text, cap-env mask snapshot, result
+// code, result summary) into a 128-slot ring of 128-byte records so
+// the shell's Ctrl-R lookup, `history` built-in, and later pdxfs
+// persistence can read a bounded recent-turn window.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R229 is the REPL evaluator umbrella (paideia-os#2493; design doc
+// design/shell/repl-loop-scaffold.md). R229.M1 (src/kernel/core/shell/
+// repl_loop.pdx) landed the PROMPT/READING/PARSED/EVAL/WRITING/IDLE
+// state machine but owns NO per-turn state. R229.M2 (session_env.pdx)
+// landed the per-session binding map. R229.M3 (type_env.pdx) landed
+// the type-scheme storage + specialisation cache. R229.M4
+// (job_control.pdx) landed the 32-slot Job table backing `cmd &` /
+// `fg %n` / `bg %n` / `jobs`. R229.M5 (THIS module) lands the
+// companion substrate every REPL dispatch surfaces on turn commit:
+// a 128-slot ring of 128-byte History rows plus a two-slot scalar
+// header (`_h_entry_count` u64 monotonic turn counter + `_h_cursor`
+// u64 next-slot-to-write pointer).
+//
+// Position in the substrate graph:
+//
+//   TTY ISR -> _rl_tick (R229.M1) -> state := PARSED
+//        -> _rl_dispatch (R229.M4+) -- parses, infers, evaluates
+//              -> on turn-commit (just before state := WRITING):
+//                 _h_append(cmd_ptr, cmd_len, result_code,
+//                           cap_env_mask, summary_ptr, summary_len)
+//                 -> klog_s1_fingerprint "HIST APPEND OK ..."
+//              -> `C-r` (Ctrl-R) chord in READING state:
+//                    _h_search_substring(needle, needle_len,
+//                                        start_turn, out_turn_ids,
+//                                        max_results)
+//                    -> renders turn text from the hit
+//              -> `history` built-in:
+//                    _h_count() + _h_get_turn(turn_id, out, out_cap)
+//                    in a for-loop
+//              -> turn-recall via up-arrow in READING state:
+//                    _h_count() + _h_get_turn(_h_count() - cursor,
+//                                              line_buf, line_cap)
+//        -> state := WRITING -> _rl_emit_prompt -> READING
+//
+// History is PARSER-TIER by geography (same satellite library as
+// SessionEnv, TypeEnv, JobControl, HmCore, LambdaLit, Pipeline,
+// etc.) but is NOT itself a parser -- the module stores opaque
+// command byte spans, opaque summary bytes, and a FNV-1a 64 hash
+// of the full command text for duplicate-detection and lookup.
+//
+// Lives user-space because the shell runs user-space; the pool is
+// caller-process-local (singleton .bss, 16 KiB entries + 16 B
+// scalar header); the module touches no kernel KIND and consumes
+// no capability (caps.decl R229.M5 band note).
+//
+// Why History (R229.M5) is distinct from R127.M4 (shell_history.pdx,
+// kernel-side):
+//   * R127.M4 lives KERNEL-side (src/kernel/core/svc/
+//     shell_history.pdx); its 128-byte entries record a shell_session-
+//     anchored (len u16, cmd_bytes u8[126]) under the kernel's
+//     shell_session table, and the reach is via the KIND_SHELL_SESSION
+//     cap-invoke op surface (R127.M2).
+//   * R229.M5 lives USER-space; its 128-byte entries record the
+//     SHELL evaluator's richer per-turn state (command text + cap-env
+//     mask + result code + result summary + command hash + rdtsc
+//     timestamp) under the user-space satellite. The shell owns
+//     `cmd_inline` + `summary_inline` + `cmd_hash` (the kernel does
+//     not); the shell owns the full turn provenance (cap_env_mask,
+//     result_code).
+//   * The two tiers co-exist: the kernel-side table is the ground-
+//     truth log for the KIND_SHELL_SESSION cap-invoke op surface;
+//     the user-side table is the shell evaluator's working-memory
+//     ring for Ctrl-R / up-arrow / `history` reads. R229.M5.1
+//     (pdxfs CoW persistence) adds a serialisation hook that
+//     writes this user-side ring to a per-user history file via
+//     a kernel bridge.
+//
+// =============================================================================
+// RECORD LAYOUT
+// =============================================================================
+//
+// History record (128 B, H_RECORD_BYTES):
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//    0x00    4   magic              u32  'HIST' (0x54534948 LE). Zero
+//                                        for a never-used slot;
+//                                        non-zero marks the slot live.
+//                                        `_h_append` writes it on
+//                                        every allocation (including
+//                                        slot recycles when the ring
+//                                        wraps past 128).
+//    0x04    4   turn_id            u32  1-based monotonic turn id
+//                                        across the session's
+//                                        lifetime; equals
+//                                        `_h_entry_count` BEFORE the
+//                                        append's increment, plus 1.
+//                                        After 100 appends this ranges
+//                                        1..100 (none evicted); after
+//                                        300 appends it ranges 173..300
+//                                        (173 = 300 - 127; turns 1..172
+//                                        evicted).
+//    0x08    8   timestamp_us       u64  rdtsc sample at append time
+//                                        (combined edx:eax). The
+//                                        tsc_hz divisor is caller
+//                                        responsibility; this module
+//                                        stores the raw TSC.
+//    0x10    8   cmd_hash           u64  FNV-1a 64 of the command text
+//                                        [cmd_ptr, cmd_ptr+cmd_len).
+//                                        Deterministic duplicate-
+//                                        detection seed for a later
+//                                        M5.1 `history --unique` /
+//                                        pdxfs-side de-duplication.
+//    0x18    1   result_code        u8   low 8 bits of the caller-
+//                                        supplied result_code (0 for
+//                                        success, non-zero for a
+//                                        shell-level error enum).
+//    0x19    1   flags              u8   reserved; 0 at M5. M5.1 may
+//                                        set bit 0 for "command text
+//                                        truncated" (cmd_len > 64) +
+//                                        bit 1 for "summary truncated"
+//                                        (summary_len > 16).
+//    0x1A    2   reserved           u16  zeroed; reserved for M5.1+
+//                                        (per-turn exit disposition,
+//                                        cap-row diff flags, etc.).
+//    0x1C    4   cap_env_mask       u32  caller-supplied snapshot of
+//                                        the session's cap environment
+//                                        mask AT TURN DISPATCH TIME.
+//                                        Opaque to this module; the
+//                                        shell-side cap-env tracker
+//                                        (R229.M3-dispatch) assigns the
+//                                        bit layout.
+//    0x20   64   cmd_inline         u8[64] bytes 0..min(cmd_len, 64);
+//                                        zero-padded past. Longer
+//                                        commands reference the pdxfs
+//                                        side-store at M5.1+ via a
+//                                        `flags` bit; at raw M5 any
+//                                        over-length command is
+//                                        truncated and the hash
+//                                        covers the full text so a
+//                                        duplicate detector still
+//                                        works.
+//    0x60   16   summary_inline     u8[16] bytes 0..min(summary_len,
+//                                        16); zero-padded past. Short
+//                                        line of result summary (e.g.
+//                                        "15 files", "0 bytes",
+//                                        "err: perm denied"); longer
+//                                        summaries reference the pdxfs
+//                                        side-store at M5.1+.
+//    0x70    8   reserved           u64  zeroed; reserved for M5.1+
+//                                        (pdxfs persist offset).
+//    0x78    8   reserved           u64  zeroed; reserved for M5.1+
+//                                        (per-turn ipc fingerprint).
+//
+//   total: 128 B
+//
+// Pool (`_h_entries`, 16384 B): 128 x 128 B. Slot base = `_h_entries +
+// idx * 128`. Stride 128 IS a power of two; address compute uses
+// `shl rN, 7` directly (no `(idx<<5) + (idx<<4)` 48-stride dance; no
+// 2-op `imul r, imm` -- feedback_pdx_encoder_pitfalls).
+//
+// Scalars:
+//   `_h_entry_count : u64` -- MONOTONIC total-turn counter; equals
+//     the turn_id of the most recently appended record. Serves
+//     `_h_count()` return (session-lifetime turn count), serves as
+//     the `turn_id - 1` basis for `_h_append`, and gates
+//     `_h_get_turn` + `_h_search_substring` lower-bound checks.
+//     Never decremented. Realistic lifetime bound: 2^64 appends at
+//     1 GHz = 584 years.
+//   `_h_cursor : u64` -- next write slot (0..127; wraps). Equals
+//     `_h_entry_count & 127` by construction, carried as a scalar
+//     for cache locality (the append fast-path reads cursor once
+//     without re-deriving from entry_count).
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _h_init() -> ()
+//     Boot hook. Defensive scrub of `_h_entry_count` and
+//     `_h_cursor` (two u64 stores = 16 B). The `_h_entries` pool
+//     is NOT scrubbed -- .bss zero-init already satisfies the
+//     "magic == 0 means never-used slot" invariant at cold boot.
+//     A chaos-restart re-entry re-drives this hook defensively.
+//
+//   _h_append(cmd_ptr, cmd_len, result_code, cap_env_mask,
+//             summary_ptr, summary_len) -> errno
+//     Allocates slot_idx = `_h_cursor` (0..127); writes a 128-byte
+//     History record (magic 'HIST', turn_id = _h_entry_count + 1,
+//     timestamp = rdtsc, cmd_hash = FNV-1a 64 of command text,
+//     result_code (low 8), flags (0), reserved (0), cap_env_mask,
+//     cmd_inline (64 B, zero-padded), summary_inline (16 B, zero-
+//     padded), two u64 reserved (0)). Bumps `_h_entry_count` and
+//     `_h_cursor` on success. H_OK on success;
+//     H_ERR_BAD_CMD (cmd_ptr == 0 OR cmd_len == 0) /
+//     H_ERR_BAD_SUMMARY (summary_len > 0 AND summary_ptr == 0)
+//     on guards.
+//
+//   _h_get_turn(turn_id, out, out_cap) -> packed_u64
+//     Validates turn_id in the live-ring range [max(1, entry_count
+//     - 127), entry_count], out != 0, out_cap >= 128. On OK: copies
+//     the 128-byte record at slot_idx = (turn_id - 1) & 127 into
+//     the caller buffer. Returns (bytes_written << 32) | status;
+//     bytes_written == 128 on success. H_ERR_BAD_TURN /
+//     H_ERR_BAD_OUT_PTR / H_ERR_OUT_TOO_SMALL on guards.
+//
+//   _h_search_substring(needle, needle_len, start_turn,
+//                       out_turn_ids, max_results) -> packed_u64
+//     Walks the ring newest-to-oldest from start_turn (or
+//     entry_count if start_turn == 0), bounded below by max(1,
+//     entry_count - 127). For each live slot (magic == 'HIST'),
+//     scans cmd_inline[0..64] for the first substring match of
+//     `needle[0..needle_len]`. On a hit, writes the matching
+//     turn_id (u32) to `out_turn_ids[result_count]` and bumps
+//     result_count. Returns (result_count << 32) | status on
+//     success; result_count may be 0. H_ERR_BAD_NEEDLE /
+//     H_ERR_BAD_OUT_PTR on guards.
+//
+//   _h_count() -> u64
+//     Returns `_h_entry_count` (session-lifetime turn count;
+//     monotonic). A fresh session with no appends returns 0; a
+//     session that has run 100 turns returns 100 regardless of
+//     ring eviction (turn 1 may be evicted but the counter stays).
+//
+// Register maps (SysV):
+//
+//   _h_init()                                                 -> ()
+//   _h_append(rdi, rsi, rdx, rcx, r8, r9)                     -> rax
+//   _h_get_turn(rdi, rsi, rdx)                                -> rax
+//   _h_search_substring(rdi, rsi, rdx, rcx, r8)               -> rax
+//   _h_count()                                                -> rax
+//
+// =============================================================================
+// RING SEMANTICS
+// =============================================================================
+//
+// At cold start: `_h_entry_count = _h_cursor = 0`.
+//
+// On the N-th append (1-based):
+//   slot_idx     := _h_cursor                      // = (N - 1) & 127
+//   turn_id      := _h_entry_count + 1             // = N
+//   write slot_idx-th record (128 bytes)
+//   _h_entry_count := _h_entry_count + 1           // = N
+//   _h_cursor      := (_h_cursor + 1) & 127        // = N & 127
+//
+// Live-turn range after N appends:
+//   if N <= 128:   turn_id in [1, N]        (nothing evicted)
+//   if N  > 128:   turn_id in [N - 127, N]  (turns 1..N-128 evicted)
+//
+// Combined lower bound: `max(1, N - 127)`.
+//
+// `_h_get_turn(t)` admits iff `t > 0 AND t <= N AND (N - t) < 128`.
+// `_h_search_substring` walks `t` from `start_turn` (clamped to N)
+// down to `max(1, N - 127)`.
+//
+// Record 42 of a 100-turn session (acceptance test from
+// paideia-os#2723):
+//
+//   N = 100; turn_id = 42.
+//   Lower bound = max(1, 100 - 127) = 1; upper = 100.
+//   42 in [1, 100] -> admitted. Slot idx = (42 - 1) & 127 = 41.
+//   `_h_get_turn(42, buf, 128)` -> copies slot 41's 128 B into buf.
+//   `_h_search_substring("turn-42", 7, 0, &ids, 1)` -> walks t from
+//     100 down to 1, finds the match at slot 41 whose cmd_inline
+//     starts with "turn-42-", writes 42 to ids[0], returns
+//     (1 << 32) | H_OK.
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE  --  0x5100..0x51FF
+// =============================================================================
+//
+// History packed-status range. Six slots used at R229.M5:
+//
+//   H_OK                   = 0
+//   H_ERR_BAD_CMD          = 0x5100  (_h_append: cmd_ptr == 0 OR
+//                                     cmd_len == 0)
+//   H_ERR_BAD_SUMMARY      = 0x5101  (_h_append: summary_len > 0 AND
+//                                     summary_ptr == 0)
+//   H_ERR_BAD_TURN         = 0x5102  (_h_get_turn: turn_id == 0,
+//                                     > entry_count, OR evicted
+//                                     from the ring)
+//   H_ERR_OUT_TOO_SMALL    = 0x5103  (_h_get_turn: out_cap < 128)
+//   H_ERR_BAD_OUT_PTR      = 0x5104  (_h_get_turn: out == 0;
+//                                     _h_search_substring:
+//                                     out_turn_ids == 0)
+//   H_ERR_BAD_NEEDLE       = 0x5105  (_h_search_substring:
+//                                     needle == 0, needle_len == 0,
+//                                     OR needle_len > 64)
+//
+// Slots 0x5106..0x51FF reserved for R229.M5.1+ follow-ups
+// (H_ERR_PERSIST_UNAVAILABLE on the pdxfs CoW bridge, H_ERR_CAP_
+// DENIED on a KIND_HISTORY cap-invoke surface, H_ERR_FS_FULL on a
+// per-user-history-file quota hit, etc.).
+//
+// Disjoint from every other parser-tier packed-status band
+// (0x27 utf8_nfc / 0x2A schemas_sig / 0x2B pipeline / 0x2C
+// lambda_lit / 0x2D hm_core / 0x2E datalog / 0x30 repl_loop
+// kernel-side / 0x33 command_sig / 0x34 record_projection /
+// 0x35 closure_capture / 0x36 row_types / 0x37 session_env /
+// 0x38 grapheme_iter / 0x39 functor_instance / 0x3C arg_flag_spec
+// / 0x3D type_env / 0x3E effect_row / 0x3F width_pass /
+// 0x40 utf8_nfc_m2 / 0x42 ctx_lexer / 0x43 cap_row / 0x44 ast
+// / 0x45 cmd_registry / 0x46 let_scope / 0x47 dispatch_mode /
+// 0x48 span_map / 0x49 effect_unify / 0x4A fuzz_harness /
+// 0x4C filter_op / 0x4D sort_group_reduce / 0x4E job_control /
+// 0x51 THIS). Bands 0x4F / 0x50 remain reserved for R222.M8
+// (describe serialisation) + R224.M6 (first-class pipeline value)
+// per the parent brief; R229.M5 skips to 0x51 to keep the
+// disjointness proof straightforward.
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R229.M1 (repl_loop.pdx, kernel) -- drives per-cycle state; does
+//     NOT touch History at M1. R229.M4+ wires the EVAL -> WRITING
+//     tick to call `_h_append` on turn commit (just before state
+//     transitions to WRITING).
+//
+//   R229.M2 (session_env.pdx) -- holds the session's bindings.
+//     Does NOT interact with History at M5; a turn that binds via
+//     `let x = ...` writes through SessionEnv unchanged and the
+//     command text (`"let x = ..."`) flows separately into History
+//     via `_h_append`.
+//
+//   R229.M3 (type_env.pdx) -- holds the session's type schemes.
+//     Does NOT interact with History at M5; same orthogonality as
+//     R229.M2.
+//
+//   R229.M4 (job_control.pdx) -- holds the session's in-flight
+//     job table. Does NOT interact with History at M5; a background
+//     command (`cmd &`) flows into BOTH `_jc_submit` AND `_h_append`
+//     at the R229.M4+ REPL dispatch layer; the two substrates
+//     capture orthogonal state (job lifecycle vs committed-turn
+//     log).
+//
+//   R127.M1 (shell_session.pdx) -- session_id is NOT part of the
+//     History record at M5 (the pool is a flat 128-slot ring,
+//     session-flat). A multi-session REPL that wants per-session
+//     isolation partitions at the dispatch layer; raw M5 is
+//     session-flat so the 100-turn acceptance test runs against a
+//     single session.
+//
+//   R127.M4 (shell_history.pdx, KERNEL side) -- the kernel's
+//     history substrate. R229.M5.1 pdxfs persistence wire-up may
+//     reconcile the two tables; at raw M5 they co-exist with
+//     disjoint reach (kernel-side via KIND_SHELL_SESSION cap, user-
+//     side via direct link).
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32; the
+//     slot_idx mask `and rax, 0x7F` fits imm8.
+//   - No 2-op `imul r, imm` -- slot stride 128 uses `shl rN, 7`
+//     directly (power-of-two; no (<<5)+(<<4) 48-stride dance).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `History` matches `history.pdx`.
+//   - Labels prefixed `h_` (grep-disjoint from `ss_` / `sh_` /
+//     `sj_` / `hf_` / `cr_` / `rl_` / `se_` / `te_` / `jc_` kernel
+//     + sibling namespaces, and from parser-tier `u8n_` / `pl_` /
+//     `rp_` / `ll_` / `cc_` / `er_` / `hm_` / `rt_` / `dl_` /
+//     `sch_sig_` / `cmd_sig_` / `cl_` / `ast_` / `cmdreg_` / `ls_`
+//     / `fh_` / `fo_` / `eu_` / `sm_` / `dm_` / `sgr_` namespaces).
+//     No bare `loop`, `if`, `let`, `fn`, `ret`, or `done` reserved-
+//     keyword labels.
+//   - All `cmp reg, imm` immediates (0, 1, 16, 64, 65, 127, 128,
+//     0x5100..0x5105, 0x54534948) fit imm32 with bit 31 clear so
+//     direct `cmp reg, imm32` is sign-extension-safe. No MOVABS
+//     staging. The FNV constants (0xCBF29CE484222325 basis +
+//     0x100000001B3 prime) are >32-bit and are loaded via `mov
+//     rN, imm64` which the encoder emits as REX.W + MOV r64, imm64.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + disp]`.
+//   - Byte stores via `mov_b [dst + disp], reg`.
+//   - u32 loads via `xor rax, rax; mov_d rax, [base + disp]`.
+//   - u32 stores via `mov_d [dst + disp], reg`.
+//   - u64 stores via plain `mov [dst + disp], reg`.
+//   - `.bss` writes via `lea r11, [rip + sym]; mov [r11 + disp],
+//     reg`.
+//   - Precomputed destination base for the inline-byte copy loops
+//     (precedent: session_env.pdx / job_control.pdx) -- `mov rsi,
+//     slot_addr; add rsi, 32` for cmd_inline; `mov rsi, slot_addr;
+//     add rsi, 96` for summary_inline. Store form
+//     `mov_b [rsi + r10 * 1], rax` sidesteps the
+//     `mov_b [reg + reg + imm], reg` encoder gap.
+//   - All five entry points are pure leaves (zero nested CALL) so
+//     no `sub rsp` align pad is required. `_h_append` and
+//     `_h_search_substring` use 6-push callee-save frames;
+//     `_h_init`, `_h_count`, and `_h_get_turn` are zero-push leaves.
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R229.M5.1  pdxfs CoW persistence hook: `_h_persist(path_ptr,
+//              path_len)` serialises the ring to a per-user history
+//              file. Needs pdxfs integration.
+//   R229.M5.2  `_h_get_turn_all` variant that INCLUDES evicted
+//              turns via a cold-cache pdxfs read.
+//   R229.M5.3  Fingerprint goldens for the smoke-mode asserter:
+//              four OK + three REJ tags, keyed to the 100-turn
+//              acceptance test (`APPEND OK`, `GET_TURN OK`,
+//              `SEARCH HIT`, `SEARCH MISS`; `APPEND BAD_CMD`,
+//              `GET_TURN BAD_TURN`, `SEARCH BAD_NEEDLE`).
+//   R229.M6    Cross-session history query (user profile scope).
+//
+// =============================================================================
+// Upstream: paideia-os#2493 (R229 REPL evaluator umbrella),
+// paideia-os#2723 (THIS ticket, R229.M5 History storage),
+// paideia-os#2719 (R229.M1 REPL loop substrate), paideia-os#2720
+// (R229.M2 SessionEnv), paideia-os#2721 (R229.M3 TypeEnv),
+// paideia-os#2722 (R229.M4 JobControl), paideia-os#2600 (R127.M4
+// kernel-side shell_history substrate). Design doc:
+// design/shell/history-storage.md.
+
+module History = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax; low 32 bits)
+  // ==========================================================================
+  //
+  // Small-value range 0x5100..0x51FF, reserved for the R229.M5
+  // history band. Disjoint from every other parser-tier packed-
+  // status range in the paideia-os tree (see header note).
+
+  pub let H_OK                   : u64 = 0
+  pub let H_ERR_BAD_CMD          : u64 = 0x5100
+  pub let H_ERR_BAD_SUMMARY      : u64 = 0x5101
+  pub let H_ERR_BAD_TURN         : u64 = 0x5102
+  pub let H_ERR_OUT_TOO_SMALL    : u64 = 0x5103
+  pub let H_ERR_BAD_OUT_PTR      : u64 = 0x5104
+  pub let H_ERR_BAD_NEEDLE       : u64 = 0x5105
+
+  // ==========================================================================
+  // SECTION 2 -- LAYOUT + KIND CONSTANTS
+  // ==========================================================================
+
+  pub let H_POOL_SLOTS           : u64 = 128     // ring depth
+  pub let H_RECORD_BYTES         : u64 = 128     // row stride (power of two)
+  pub let H_POOL_BYTES           : u64 = 16384   // 128 * 128
+  pub let H_CMD_INLINE_MAX       : u64 = 64      // bytes in cmd_inline
+  pub let H_SUMMARY_INLINE_MAX   : u64 = 16      // bytes in summary_inline
+  pub let H_SLOT_IDX_MASK        : u64 = 127     // (H_POOL_SLOTS - 1)
+  pub let H_SLOT_IDX_SHIFT       : u64 = 7       // log2(H_RECORD_BYTES)
+
+  // Magic marker ('HIST' little-endian: 'H'=0x48, 'I'=0x49,
+  // 'S'=0x53, 'T'=0x54 -> u32 LE = 0x54534948).
+  pub let H_MAGIC                : u64 = 0x54534948
+
+  // Record field offsets (bytes, from slot base).
+  pub let H_OFF_MAGIC            : u64 = 0
+  pub let H_OFF_TURN_ID          : u64 = 4
+  pub let H_OFF_TIMESTAMP        : u64 = 8
+  pub let H_OFF_CMD_HASH         : u64 = 16
+  pub let H_OFF_RESULT_CODE      : u64 = 24
+  pub let H_OFF_FLAGS            : u64 = 25
+  pub let H_OFF_RESERVED_1A      : u64 = 26  // u16 (2 bytes)
+  pub let H_OFF_CAP_ENV_MASK     : u64 = 28
+  pub let H_OFF_CMD_INLINE       : u64 = 32
+  pub let H_OFF_SUMMARY_INLINE   : u64 = 96
+  pub let H_OFF_RESERVED_70      : u64 = 112
+  pub let H_OFF_RESERVED_78      : u64 = 120
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _h_entries      : [u8; 16384] = uninit @align(8)
+  pub let mut _h_entry_count  : u64         = uninit @align(8)
+  pub let mut _h_cursor       : u64         = uninit @align(8)
+
+  // ==========================================================================
+  // _h_init() -> ()
+  //
+  //   Boot hook. Defensive scrub of _h_entry_count and _h_cursor
+  //   (two u64 stores = 16 B). The _h_entries pool is NOT scrubbed
+  //   -- .bss zero-init already satisfies the "magic == 0 means
+  //   never-used slot" invariant at cold boot. A chaos-restart
+  //   re-entry re-drives this hook defensively.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed h_ini_.
+  // ==========================================================================
+  pub let _h_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M5 (#2723): defensive scrub of _h_entry_count and _h_cursor (two u64 stores = 16 B). _h_entries pool is NOT scrubbed because .bss is already zero at real boot (magic == 0 => never-used slot). Pure leaf; zero pushes; no stack frame; no nested CALL. Store 0 u64 to _h_entry_count and to _h_cursor via `lea r11, [rip + sym]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed h_ini_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _h_entry_count];
+        mov [r11], rax;
+
+        lea r11, [rip + _h_cursor];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _h_count() -> u64
+  //
+  //   Returns _h_entry_count (session-lifetime monotonic turn
+  //   count). A fresh session returns 0; a 100-turn session
+  //   returns 100 whether or not the ring has evicted.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed h_cnt_.
+  // ==========================================================================
+  pub let _h_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M5 (#2723): return the monotonic session-lifetime turn count in _h_entry_count. Pure leaf; zero pushes; no stack frame; no nested CALL. Load _h_entry_count into rax via `lea r11, [rip + _h_entry_count]; mov rax, [r11]`. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed h_cnt_.",
+      block: {
+        lea r11, [rip + _h_entry_count];
+        mov rax, [r11];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _h_append(cmd_ptr, cmd_len, result_code, cap_env_mask,
+  //           summary_ptr, summary_len) -> errno
+  //
+  //   rdi = cmd_ptr
+  //   rsi = cmd_len
+  //   rdx = result_code    (low 8 bits written to slot[+24])
+  //   rcx = cap_env_mask   (low 32 bits written to slot[+28])
+  //   r8  = summary_ptr    (nullable iff summary_len == 0)
+  //   r9  = summary_len    (0..anything; clamped to 16 on copy)
+  //   rax = H_OK /
+  //         H_ERR_BAD_CMD (cmd_ptr == 0 OR cmd_len == 0) /
+  //         H_ERR_BAD_SUMMARY (summary_len > 0 AND summary_ptr == 0)
+  //
+  //   Allocates slot_idx = _h_cursor (0..127), writes the 128-byte
+  //   History record (magic 'HIST', turn_id = _h_entry_count + 1,
+  //   timestamp = rdtsc, cmd_hash = FNV-1a 64, result_code (low 8),
+  //   flags 0, reserved 0, cap_env_mask, cmd_inline, summary_inline,
+  //   two u64 reserved 0), bumps _h_entry_count by 1, and advances
+  //   _h_cursor := (cursor + 1) & 127.
+  //
+  // Register plan (6-push, pure-leaf; no nested CALL -- FNV-1a 64
+  // is inlined):
+  //   rbx = cmd_ptr
+  //   rbp = cmd_len
+  //   r12 = result_code
+  //   r13 = cap_env_mask
+  //   r14 = summary_ptr
+  //   r15 = summary_len
+  // Transient: rax (misc), rcx (FNV prime after FNV completes:
+  // scratch), rdx (misc), r8 (cursor / scratch), r9 (slot_addr --
+  // STABLE across the write sequence), r10 (loop counter), r11
+  // (lea staging / byte scratch).
+  //
+  // Labels prefixed h_app_.
+  // ==========================================================================
+  pub let _h_append : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (cmd_ptr: u64) (cmd_len: u64) (result_code: u64)
+       (cap_env_mask: u64) (summary_ptr: u64)
+       (summary_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M5 (#2723): allocate a History slot and record the just-committed REPL turn. 6 callee-save pushes (rbx=cmd_ptr, rbp=cmd_len, r12=result_code, r13=cap_env_mask, r14=summary_ptr, r15=summary_len); pure leaf (FNV-1a 64 inlined) with no nested CALL so no sub-rsp pad is needed. Guards: cmd_ptr != 0 AND cmd_len > 0 (H_ERR_BAD_CMD); summary_len > 0 => summary_ptr != 0 (H_ERR_BAD_SUMMARY). After guards + save, load _h_cursor into r8; slot_addr = &_h_entries + (r8 << 7) via `mov rax, r8; shl rax, 7; lea r11, [rip + _h_entries]; add rax, r11; mov r9, rax` (r9 holds slot_addr across the whole write sequence). Write magic 'HIST' (0x54534948) at [slot+0] via mov_d. Load _h_entry_count into rax, compute turn_id = count + 1, write u32 low 32 at [slot+4] via mov_d. rdtsc + shl rdx,32 + or rax,rdx; store at [slot+8]. Write result_code (r12 low 8) at [slot+24] via mov_b; write flags/reserved_1A bytes 25,26,27 as zero via mov_b. Write cap_env_mask (r13 low 32) at [slot+28] via mov_d. Precompute rsi = r9 + 32 for cmd_inline destination base; copy min(cmd_len, 64) bytes from rbx with mov_b [rsi + r10*1], rax to sidestep the mov_b [reg + reg + off], reg encoder gap (precedent: session_env.pdx / job_control.pdx); zero-pad to 64. Precompute rsi = r9 + 96 for summary_inline destination base; copy min(summary_len, 16) bytes from r14; zero-pad to 16. Write reserved u64 0 at [slot+112] and [slot+120] via plain mov. Compute FNV-1a 64 of (rbx, rbp): rax = basis 0xCBF29CE484222325 (imm64), rcx = prime 0x100000001B3 (imm64), r10 = 0 (i); loop: cmp r10, rbp / jae done / xor r11, r11 / mov_b r11, [rbx + r10] / xor rax, r11 / xor rdx, rdx / mul rcx / add r10, 1 / jmp loop; done -> write rax at [slot+16]. Bump _h_entry_count by 1 via lea + mov. Compute new _h_cursor := (r8 + 1) & 127 via `add r8, 1; and r8, 0x7F` (0x7F = imm8-safe); store back. Return H_OK. All cmp immediates (0, 1, 16, 64, 127, 128) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe; 0x54534948 (H_MAGIC) fits as imm32 with bit 31 clear; 0x5100 / 0x5101 status codes fit imm32. No test; no and-imm64 (0x7F fits imm8); no 2-op imul-r-imm (the one `mul rcx` is the one-op unsigned-mul form, distinct from the pitfall-listed shape); no multiline let. Labels prefixed h_app_.",
+      block: {
+        // ---- Prologue (6 callee-save pushes; no stack pad: pure leaf).
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Guard: cmd_ptr != 0.
+        cmp rdi, 0;
+        je  h_app_bad_cmd;
+
+        // ---- Guard: cmd_len > 0.
+        cmp rsi, 0;
+        je  h_app_bad_cmd;
+
+        // ---- Guard: summary_len > 0 => summary_ptr != 0.
+        cmp r9, 0;
+        je  h_app_sum_ptr_ok;        // summary_len == 0: ptr is don't-care.
+        cmp r8, 0;
+        je  h_app_bad_summary;
+
+      h_app_sum_ptr_ok:
+        // Stash inputs in callee-saves.
+        mov rbx, rdi;                // cmd_ptr
+        mov rbp, rsi;                // cmd_len
+        mov r12, rdx;                // result_code
+        mov r13, rcx;                // cap_env_mask
+        mov r14, r8;                 // summary_ptr
+        mov r15, r9;                 // summary_len
+
+        // ---- Load _h_cursor into r8 (slot index 0..127).
+        lea r11, [rip + _h_cursor];
+        mov r8, [r11];
+
+        // ---- Compute slot_addr = &_h_entries + (r8 << 7).
+        mov rax, r8;
+        shl rax, 7;                  // H_SLOT_IDX_SHIFT = 7
+        lea r11, [rip + _h_entries];
+        add rax, r11;
+        mov r9, rax;                 // r9 = slot_addr (stable)
+
+        // ---- Write magic 'HIST' at [slot+0] (u32).
+        mov rax, 0x54534948;         // H_MAGIC
+        mov_d [r9 + 0], rax;
+
+        // ---- Compute turn_id = _h_entry_count + 1; write at [slot+4] (u32).
+        lea r11, [rip + _h_entry_count];
+        mov rax, [r11];              // rax = entry_count (= turn_id - 1)
+        add rax, 1;                  // rax = turn_id
+        mov_d [r9 + 4], rax;
+
+        // ---- rdtsc timestamp -> [slot+8] (u64).
+        rdtsc;                       // edx:eax = TSC
+        shl rdx, 32;
+        or  rax, rdx;
+        mov [r9 + 8], rax;
+
+        // ---- result_code (r12 low 8) -> [slot+24] (u8).
+        mov_b [r9 + 24], r12;
+
+        // ---- flags = 0 -> [slot+25] (u8).
+        xor rax, rax;
+        mov_b [r9 + 25], rax;
+
+        // ---- reserved u16 = 0 -> [slot+26..+28] (two u8 writes).
+        mov_b [r9 + 26], rax;
+        mov_b [r9 + 27], rax;
+
+        // ---- cap_env_mask (r13 low 32) -> [slot+28] (u32).
+        mov_d [r9 + 28], r13;
+
+        // -----------------------------------------------------------
+        // cmd_inline[0..64]: copy min(cmd_len, 64) from cmd_ptr;
+        // zero-pad. Precomputed destination base in rsi to sidestep
+        // the mov_b [reg + reg + off], reg encoder gap.
+        // -----------------------------------------------------------
+        mov rsi, r9;
+        add rsi, 32;                 // H_OFF_CMD_INLINE
+
+        mov rax, rbp;                // rax = cmd_len
+        cmp rax, 64;                 // H_CMD_INLINE_MAX
+        jbe h_app_cmd_len_ok;
+        mov rax, 64;
+      h_app_cmd_len_ok:
+        mov rdx, rax;                // rdx = copy_len
+
+        xor r10, r10;                // j = 0
+
+      h_app_cmd_copy:
+        cmp r10, rdx;
+        jae h_app_cmd_pad;
+        xor rax, rax;
+        mov_b rax, [rbx + r10 * 1];
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp h_app_cmd_copy;
+
+      h_app_cmd_pad:
+        xor rax, rax;
+
+      h_app_cmd_pad_loop:
+        cmp r10, 64;                 // H_CMD_INLINE_MAX
+        jae h_app_cmd_done;
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp h_app_cmd_pad_loop;
+
+      h_app_cmd_done:
+
+        // -----------------------------------------------------------
+        // summary_inline[0..16]: copy min(summary_len, 16) from
+        // summary_ptr; zero-pad. If summary_len == 0, loop writes
+        // 16 zeros via the pad path.
+        // -----------------------------------------------------------
+        mov rsi, r9;
+        add rsi, 96;                 // H_OFF_SUMMARY_INLINE
+
+        mov rax, r15;                // rax = summary_len
+        cmp rax, 16;                 // H_SUMMARY_INLINE_MAX
+        jbe h_app_sum_len_ok;
+        mov rax, 16;
+      h_app_sum_len_ok:
+        mov rdx, rax;                // rdx = copy_len
+
+        xor r10, r10;                // j = 0
+
+      h_app_sum_copy:
+        cmp r10, rdx;
+        jae h_app_sum_pad;
+        xor rax, rax;
+        mov_b rax, [r14 + r10 * 1];
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp h_app_sum_copy;
+
+      h_app_sum_pad:
+        xor rax, rax;
+
+      h_app_sum_pad_loop:
+        cmp r10, 16;                 // H_SUMMARY_INLINE_MAX
+        jae h_app_sum_done;
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp h_app_sum_pad_loop;
+
+      h_app_sum_done:
+
+        // ---- reserved u64 = 0 at [slot+112] and [slot+120].
+        xor rax, rax;
+        mov [r9 + 112], rax;
+        mov [r9 + 120], rax;
+
+        // -----------------------------------------------------------
+        // Inlined FNV-1a 64 over (rbx = cmd_ptr, rbp = cmd_len).
+        // h = 0xCBF29CE484222325 (basis); prime = 0x100000001B3.
+        // Produces hash in rax; written to [slot + 16] (u64).
+        // -----------------------------------------------------------
+        mov rax, 0xCBF29CE484222325; // h = fnv_offset_basis
+        mov rcx, 0x100000001B3;      // fnv_prime (held across loop)
+        xor r10, r10;                // i = 0
+
+      h_app_fnv_loop:
+        cmp r10, rbp;
+        jae h_app_fnv_done;
+
+        xor r11, r11;
+        mov_b r11, [rbx + r10 * 1];  // byte load (zero-extended)
+        xor rax, r11;                // h ^= byte
+
+        xor rdx, rdx;                // clear mul high half
+        mul rcx;                     // rdx:rax = rax * fnv_prime
+
+        add r10, 1;
+        jmp h_app_fnv_loop;
+
+      h_app_fnv_done:
+        mov [r9 + 16], rax;          // cmd_hash u64
+
+        // -----------------------------------------------------------
+        // Bump _h_entry_count by 1.
+        // -----------------------------------------------------------
+        lea r11, [rip + _h_entry_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // -----------------------------------------------------------
+        // Advance _h_cursor := (cursor + 1) & 127. r8 still holds
+        // the pre-advance cursor.
+        // -----------------------------------------------------------
+        add r8, 1;
+        and r8, 127;                 // H_SLOT_IDX_MASK; imm8-safe (0x7F)
+        lea r11, [rip + _h_cursor];
+        mov [r11], r8;
+
+        // ---- Return H_OK.
+        xor rax, rax;
+        jmp h_app_epilogue;
+
+      h_app_bad_cmd:
+        mov rax, 0x5100;             // H_ERR_BAD_CMD
+        jmp h_app_epilogue;
+
+      h_app_bad_summary:
+        mov rax, 0x5101;             // H_ERR_BAD_SUMMARY
+        jmp h_app_epilogue;
+
+      h_app_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _h_get_turn(turn_id, out, out_cap) -> packed_u64
+  //
+  //   rdi = turn_id   (1..entry_count, within the live ring window)
+  //   rsi = out       (ptr to caller buffer; filled on OK)
+  //   rdx = out_cap   (byte capacity; must be >= 128)
+  //   rax = (bytes_written << 32) | status
+  //
+  //   Validates the request, computes slot_idx = (turn_id - 1) &
+  //   127, and copies the 128-byte record from _h_entries + slot *
+  //   128 into out via 16 u64 loads / stores. Returns (128 << 32)
+  //   | H_OK on success.
+  //
+  // Pure leaf -- zero callee-save pushes, no stack frame, no nested
+  // CALL. The 16-u64-move copy is straight-line, no loop.
+  //
+  // Labels prefixed h_gt_.
+  // ==========================================================================
+  pub let _h_get_turn : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (turn_id: u64) (out: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M5 (#2723): fetch a single History record by turn_id. Pure leaf; zero pushes; no stack frame; no nested CALL. Guards: out != 0 (H_ERR_BAD_OUT_PTR); out_cap >= 128 (H_ERR_OUT_TOO_SMALL); turn_id != 0 (H_ERR_BAD_TURN); turn_id <= entry_count (H_ERR_BAD_TURN); entry_count - turn_id < 128 (not evicted; H_ERR_BAD_TURN). Compute slot_addr = &_h_entries + ((turn_id - 1) & 127) * 128 via `mov rax, rdi; sub rax, 1; and rax, 0x7F; shl rax, 7; lea r11, [rip + _h_entries]; add rax, r11`. Copy 128 B = 16 u64 moves from slot to out at offsets 0, 8, 16, ..., 120. Return (128 << 32) | H_OK via `mov rax, 128; shl rax, 32`. All immediates (0, 1, 128, 0x7F, 0x5102, 0x5103, 0x5104) fit imm32 with bit 31 clear; 0x7F fits imm8. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed h_gt_.",
+      block: {
+        // ---- Guard: out != 0.
+        cmp rsi, 0;
+        je  h_gt_bad_out_ptr;
+
+        // ---- Guard: out_cap >= 128.
+        cmp rdx, 128;                // H_RECORD_BYTES
+        jb  h_gt_oos;
+
+        // ---- Guard: turn_id != 0.
+        cmp rdi, 0;
+        je  h_gt_bad_turn;
+
+        // ---- Load entry_count.
+        lea r11, [rip + _h_entry_count];
+        mov rax, [r11];              // rax = entry_count
+
+        // ---- Guard: turn_id <= entry_count.
+        cmp rdi, rax;
+        ja  h_gt_bad_turn;
+
+        // ---- Guard: entry_count - turn_id < 128 (not evicted).
+        //        rax = entry_count; rdi = turn_id.
+        mov r8, rax;
+        sub r8, rdi;                 // r8 = entry_count - turn_id
+        cmp r8, 128;                 // H_POOL_SLOTS
+        jae h_gt_bad_turn;
+
+        // ---- slot_addr = &_h_entries + ((turn_id - 1) & 127) * 128.
+        mov rax, rdi;
+        sub rax, 1;
+        and rax, 127;                // H_SLOT_IDX_MASK (imm8-safe)
+        shl rax, 7;                  // H_SLOT_IDX_SHIFT
+        lea r11, [rip + _h_entries];
+        add rax, r11;                // rax = slot_addr
+
+        // ---- Copy 128 B = 16 u64 moves to out (rsi).
+        mov r8, [rax + 0];
+        mov [rsi + 0], r8;
+        mov r8, [rax + 8];
+        mov [rsi + 8], r8;
+        mov r8, [rax + 16];
+        mov [rsi + 16], r8;
+        mov r8, [rax + 24];
+        mov [rsi + 24], r8;
+        mov r8, [rax + 32];
+        mov [rsi + 32], r8;
+        mov r8, [rax + 40];
+        mov [rsi + 40], r8;
+        mov r8, [rax + 48];
+        mov [rsi + 48], r8;
+        mov r8, [rax + 56];
+        mov [rsi + 56], r8;
+        mov r8, [rax + 64];
+        mov [rsi + 64], r8;
+        mov r8, [rax + 72];
+        mov [rsi + 72], r8;
+        mov r8, [rax + 80];
+        mov [rsi + 80], r8;
+        mov r8, [rax + 88];
+        mov [rsi + 88], r8;
+        mov r8, [rax + 96];
+        mov [rsi + 96], r8;
+        mov r8, [rax + 104];
+        mov [rsi + 104], r8;
+        mov r8, [rax + 112];
+        mov [rsi + 112], r8;
+        mov r8, [rax + 120];
+        mov [rsi + 120], r8;
+
+        // ---- Return (128 << 32) | H_OK.
+        mov rax, 128;                // H_RECORD_BYTES
+        shl rax, 32;
+        ret;
+
+      h_gt_bad_turn:
+        mov rax, 0x5102;             // H_ERR_BAD_TURN
+        ret;
+
+      h_gt_oos:
+        mov rax, 0x5103;             // H_ERR_OUT_TOO_SMALL
+        ret;
+
+      h_gt_bad_out_ptr:
+        mov rax, 0x5104;             // H_ERR_BAD_OUT_PTR
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _h_search_substring(needle, needle_len, start_turn,
+  //                     out_turn_ids, max_results) -> packed_u64
+  //
+  //   rdi = needle            (ptr to needle bytes)
+  //   rsi = needle_len        (1..64)
+  //   rdx = start_turn        (0 = search from newest; else inclusive
+  //                            upper bound; clamped to entry_count)
+  //   rcx = out_turn_ids      (ptr to u32 array of >= max_results)
+  //   r8  = max_results       (0 => trivially 0 hits with H_OK)
+  //   rax = (result_count << 32) | status
+  //
+  //   Walks live-ring turns from eff_start down to eff_end = max(1,
+  //   entry_count - 127), inclusive. For each slot whose magic ==
+  //   'HIST', scans cmd_inline[0..64] for the FIRST substring match
+  //   of needle[0..needle_len]. On hit, writes turn_id (u32) at
+  //   out_turn_ids[result_count * 4] and bumps result_count. Stops
+  //   at result_count == max_results.
+  //
+  // Register plan (6-push, pure-leaf):
+  //   rbx = needle_ptr
+  //   rbp = needle_len
+  //   r12 = out_turn_ids
+  //   r13 = max_results
+  //   r14 = current_turn t (walk cursor)
+  //   r15 = result_count
+  // Transient: rax (scratch), rcx (slot_addr per iteration), rdx
+  // (position limit = 64 - needle_len + 1; recomputed per iter),
+  // r8 (eff_end persisted across walk), r9 (inner k), r10 (outer
+  // j), r11 (lea / byte scratch).
+  //
+  // Labels prefixed h_srch_.
+  // ==========================================================================
+  pub let _h_search_substring : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (needle: u64) (needle_len: u64) (start_turn: u64)
+       (out_turn_ids: u64) (max_results: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M5 (#2723): walk the live-ring newest-to-oldest finding command substrings. 6 callee-save pushes (rbx=needle, rbp=needle_len, r12=out_turn_ids, r13=max_results, r14=current_turn, r15=result_count); pure leaf with no nested CALL so no sub-rsp pad is needed. Guards: needle != 0, needle_len in [1..64] (H_ERR_BAD_NEEDLE); out_turn_ids != 0 (H_ERR_BAD_OUT_PTR). If max_results == 0 OR entry_count == 0, trivially return (0 << 32) | H_OK. Compute eff_start := min(start_turn, entry_count) if start_turn > 0 else entry_count. Compute eff_end := max(1, entry_count - 127). Walk t from eff_start down: slot_addr = &_h_entries + ((t - 1) & 127) * 128. magic != 'HIST' (0x54534948) -> skip. Else inner substring scan: compute pos_limit := 65 - needle_len (max j + 1 = (H_CMD_INLINE_MAX + 1) - needle_len); for each j in [0..pos_limit), inner k loop compares cmd_inline[j+k] vs needle[k] for k in [0..needle_len). On full match, write turn_id (u32) at out_turn_ids + result_count * 4 via mov_d, bump result_count. If result_count >= max_results, exit. On inner mismatch, bump j. On j == pos_limit (no match), skip to next t. Loop condition: t >= eff_end. Return (result_count << 32) | H_OK. All cmp immediates (0, 1, 64, 65, 127, 128) fit imm32 with bit 31 clear; 0x5104, 0x5105 fit imm32; 0x54534948 (H_MAGIC) fits imm32 with bit 31 clear (loaded via mov r11, imm32 then compare). No test; no and-imm64 (0x7F fits imm8); no imul-r-imm; no multiline let. Labels prefixed h_srch_.",
+      block: {
+        // ---- Guards (pre-push: fail-fast on bad input).
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        cmp rdi, 0;
+        je  h_srch_bad_needle;
+        cmp rsi, 0;
+        je  h_srch_bad_needle;
+        cmp rsi, 64;                 // H_CMD_INLINE_MAX
+        ja  h_srch_bad_needle;
+
+        cmp rcx, 0;
+        je  h_srch_bad_out_ptr;
+
+        // Stash inputs.
+        mov rbx, rdi;                // needle_ptr
+        mov rbp, rsi;                // needle_len
+        mov r12, rcx;                // out_turn_ids
+        mov r13, r8;                 // max_results
+        xor r15, r15;                // result_count = 0
+
+        // ---- Trivial exit: max_results == 0.
+        cmp r13, 0;
+        je  h_srch_done;
+
+        // ---- Load entry_count.
+        lea r11, [rip + _h_entry_count];
+        mov r9, [r11];               // r9 = entry_count
+        cmp r9, 0;
+        je  h_srch_done;             // empty history
+
+        // ---- Determine eff_start := start_turn (clamped) or entry_count.
+        //        rdx = start_turn (input).
+        cmp rdx, 0;
+        je  h_srch_use_cursor_start;
+        cmp rdx, r9;
+        jbe h_srch_have_start;       // rdx <= entry_count
+        mov rdx, r9;                 // clamp to entry_count
+        jmp h_srch_have_start;
+
+      h_srch_use_cursor_start:
+        mov rdx, r9;
+
+      h_srch_have_start:
+        mov r14, rdx;                // r14 = current_turn t
+
+        // ---- Determine eff_end := max(1, entry_count - 127).
+        mov r8, r9;
+        cmp r8, 128;                 // H_POOL_SLOTS
+        jbe h_srch_end_is_one;
+        sub r8, 127;
+        jmp h_srch_have_end;
+
+      h_srch_end_is_one:
+        mov r8, 1;
+
+      h_srch_have_end:
+
+      h_srch_walk:
+        cmp r14, r8;
+        jb  h_srch_done;             // t < eff_end: stop
+
+        // ---- slot_addr = &_h_entries + ((t - 1) & 127) * 128.
+        mov rax, r14;
+        sub rax, 1;
+        and rax, 127;                // H_SLOT_IDX_MASK
+        shl rax, 7;                  // H_SLOT_IDX_SHIFT
+        lea r11, [rip + _h_entries];
+        add rax, r11;
+        mov rcx, rax;                // rcx = slot_addr
+
+        // ---- magic check: load u32 at [slot+0], compare 'HIST'.
+        xor rax, rax;
+        mov_d rax, [rcx + 0];
+        mov r11, 0x54534948;         // H_MAGIC
+        cmp rax, r11;
+        jne h_srch_skip_slot;
+
+        // ---- Inner scan: positions j in [0..65 - needle_len).
+        //        pos_limit := 65 - needle_len.
+        mov rdx, 65;
+        sub rdx, rbp;                // rdx = pos_limit (max j + 1)
+        xor r10, r10;                // j = 0
+
+      h_srch_pos:
+        cmp r10, rdx;
+        jae h_srch_skip_slot;        // no match in this slot
+
+        // ---- Inner cmp: for k in [0..needle_len), compare
+        //      cmd_inline[j+k] vs needle[k].
+        xor r9, r9;                  // k = 0
+
+      h_srch_cmp:
+        cmp r9, rbp;
+        jae h_srch_match;            // all bytes matched
+
+        // Load cmd_inline[j+k].
+        mov r11, rcx;
+        add r11, 32;                 // H_OFF_CMD_INLINE
+        add r11, r10;                // + j
+        xor rax, rax;
+        mov_b rax, [r11 + r9 * 1];   // = cmd_inline[j+k]
+
+        // Load needle[k].
+        xor r11, r11;
+        mov_b r11, [rbx + r9 * 1];   // = needle[k]
+
+        cmp rax, r11;
+        jne h_srch_mismatch;
+
+        add r9, 1;
+        jmp h_srch_cmp;
+
+      h_srch_mismatch:
+        add r10, 1;
+        jmp h_srch_pos;
+
+      h_srch_match:
+        // ---- Write turn_id (u32) at out_turn_ids + result_count * 4.
+        mov r11, r15;
+        shl r11, 2;                  // * 4
+        mov rax, r12;
+        add rax, r11;                // dst = out_turn_ids + rc*4
+        mov_d [rax + 0], r14;        // u32 turn_id low 32
+
+        add r15, 1;
+        cmp r15, r13;
+        jae h_srch_done;             // hit max_results
+
+      h_srch_skip_slot:
+        // ---- Advance t -= 1. Watch for t == eff_end case: the
+        //      walk_loop guard handles t < eff_end next iteration.
+        //      If eff_end was 1 and t was 1, after sub r14 becomes 0,
+        //      then walk_loop cmp r14 (0) vs r8 (1) is below -> stop.
+        cmp r14, 0;
+        je  h_srch_done;             // safeguard against underflow
+        sub r14, 1;
+        jmp h_srch_walk;
+
+      h_srch_done:
+        // ---- Return (result_count << 32) | H_OK.
+        mov rax, r15;
+        shl rax, 32;
+        jmp h_srch_epilogue;
+
+      h_srch_bad_needle:
+        mov rax, 0x5105;             // H_ERR_BAD_NEEDLE
+        jmp h_srch_epilogue;
+
+      h_srch_bad_out_ptr:
+        mov rax, 0x5104;             // H_ERR_BAD_OUT_PTR
+        jmp h_srch_epilogue;
+
+      h_srch_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

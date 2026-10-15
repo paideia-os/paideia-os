@@ -4,6 +4,394 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.0] -- 2026-10-15
+
+Wave 126: R222.M8 DescribeSig. Lands the parser-tier serialization
+surface the `describe <cmd>` builtin and the "commands operating on
+<schema>" semantic-query consume. A 256-byte DescriptorBlob record
+denormalises CommandSig (R222.M2) so both query shapes are O(1)
+index lookups rather than requiring per-call reparse of the
+CommandSig body. Sibling arm of Wave 126; layers additively on
+`0x4F00..0x4FFF` disjoint from R224.M6 (0x5000..0x50FF) and R229.M5.
+
+### Added
+
+- `src/describe_sig.pdx` module `DescribeSig` (R222.M8,
+  paideia-os#2665): five public entry points over caller-supplied
+  buffers. Zero `.bss`.
+  - `_ds_init()` — bare `ret`. M8 holds NO .bss state (the blob is
+    caller-owned on every path). Kept for parallelism with the
+    DispatchMode (R222.M6) / CmdRegistry (R222.M5) init-hook family
+    so a later landing that adds .bss (per-session describe counters,
+    a schema_tag intern table) does not break the API.
+  - `_ds_serialize(cs_body, cs_len, name_hash, out, out_cap)` —
+    pure-leaf packer. Validates CommandSig record (`cs_body != 0`,
+    `cs_len >= 128`, 'CSIG' magic at [+0]) and output buffer
+    (`out != 0`, `out_cap >= 256`). Zero-fills the 256-B blob via
+    a u64 stepping loop (32 iters stepping by 8). Stamps:
+    magic 'DESC' (0x43534544) u32 at [+0]; version u16 (= 1) lo
+    byte at [+4]; flags u16 copied byte-wise from CommandSig
+    flags u32 at [cs_body + 80..82] to [+6..+8]; name_hash u64 at
+    [+8]; name_inline[32] copied from CommandSig [+8..+40] to
+    [+16..+48]; cs_body_ref u64 (= cs_body input) at [+56]. Leaves
+    arg_count / flag_count / schema_count / reserved /
+    arg_type_mask / schema_hash_ids / query_payload zero (M8
+    default; M8.1 populates from companion sigs).
+  - `_ds_deserialize(blob, blob_len, out_cs_body_ref, out_name_hash)`
+    — pure-leaf validator + extractor. Validates blob pointer,
+    length, out-ptrs, magic 'DESC', version 1; extracts cs_body_ref
+    at [+56] and name_hash at [+8] into caller-owned out slots.
+  - `_ds_matches_type(blob, type_code)` — pure-leaf bitmap test
+    over arg_type_mask at [blob + 64..96]. `byte_idx = type_code >> 3`;
+    `bit_idx = type_code & 7` (imm8); `bit = (byte >> bit_idx) & 1`
+    via `shr r, cl` + `and r, 1` (variable shift via CL; precedent
+    cap_row.pdx:1204). At raw M8 arg_type_mask is zero-filled; the
+    predicate returns 0 for every type_code until M8.1 wires in
+    the companion-signature folder.
+  - `_ds_matches_schema(blob, schema_tag)` — pure-leaf list scan
+    over schema_hash_ids at [blob + 96..128]. Reads schema_count
+    u16 at [+52] via two byte loads (lo | (hi << 8)); caps at
+    DS_SCHEMA_HASH_IDS_MAX (32); scans for schema_tag. At raw M8
+    schema_count is zero; the predicate returns 0 for every
+    schema_tag until M8.1 wires in the companion-signature folder.
+  - All five entry points are PURE LEAVES (zero callee-save
+    pushes, zero stack frame, zero nested CALL). `r11` is used
+    freely as a staging register because no nested CALL exists.
+  Error band `0x4F00..0x4F03` (four codes used: DS_OK (0),
+  DS_ERR_BAD_RECORD (0x4F00), DS_ERR_OUT_TOO_SMALL (0x4F01),
+  DS_ERR_BAD_BLOB (0x4F02), DS_ERR_TOO_MANY_SCHEMAS (0x4F03,
+  reserved for the M8.1 fold path)); `0x4F04..0x4FFF` reserved
+  for R222.M8.1+ follow-ups.
+
+- `design/shell/describe-wire-format.md` — R222.M8 design doc.
+  Thirteen sections: scope / motivation, wire format (field-by-field
+  rationale, why 256 bytes), public API (per entry-point register
+  map + flow), status band (0x4F00..0x4FFF), encoder discipline
+  (absolute), register-liveness per entry, lazy-init non-applicability,
+  acceptance (5-CommandSig round-trip fixture; query predicates
+  deferred to M8.1), consumer pattern (describe builtin sketch),
+  "where this is NOT" boundary, file footprint, forward path
+  (M8.1..M8.5), related docs cross-ref.
+
+### Changed
+
+- `src/lib.pdx` — flipped `LPX_PDS_PARSER_R222_M8_READY` from 0 to 1;
+  added `src/describe_sig.pdx at R222.M8` to the module-filename
+  comment; added `paideia-os#2665 (R222.M8 DescribeSig)` to the
+  upstream-issues comment; added `design/shell/describe-wire-format.md`
+  to the design-doc list; top-of-file provenance line bumped from
+  `R229.M5 (paideia-os#2723, Wave 126)` to `R222.M8 (paideia-os#2665,
+  Wave 126)`. Version bumped 1.25.0 → 1.26.0 (MINOR: additive, new
+  M-wave landing).
+
+- `caps.decl` — added `0x4F00..0x4FFF` error-band section listing
+  all four DS_* slots (OK, BAD_RECORD, OUT_TOO_SMALL, BAD_BLOB,
+  TOO_MANY_SCHEMAS) with 252 slots reserved for M8.1+ follow-ups.
+  Added the R222.M8 catalogue paragraph (DescribeSig primitives
+  summary, 256-byte wire shape, five-entry-point API, pure-leaf
+  discipline). Added the R222.M8 linker-dependency entry (NO
+  external cross-library dep, NO intra-library linker-visible dep;
+  CSIG magic replicated locally as DS_CS_HEADER_MAGIC; structural
+  dependency on ArgFlagSpec + SchemasSig at M8.1 but still no
+  linker-visible dependency because body-byte buffers flow in as
+  opaque caller-managed pointers). Added the `0x4F0[0-3]\b`
+  grep-disjointness confirmation line.
+
+- `STATUS.md` — added R222.M8 to the Current milestones paragraph;
+  Wave 126 landing notes updated to include R222.M8.
+
+### Design notes
+
+- Wire format matches the parent brief verbatim (256-byte power-
+  of-two stride for `shl idx, 8` catalogue indexing; two cache
+  lines on x86-64; magic 'DESC' = 0x43534544 LE reading as "DESC"
+  in a hex-dump sequential scan per the Wave 125 SortGroupReduce
+  magic-reconciliation lesson). Version u16 = 1 locks the M8
+  commitment surface; a wire-format change bumps the field and
+  the deserializer rejects stale blobs with DS_ERR_BAD_BLOB.
+- Single-source serializer. The parent brief's acceptance line
+  "`describe find` returns the right ArgSpec set" is a two-stage
+  anchor: raw M8 (this landing) commits to the byte-identical
+  round-trip of the 5-CommandSig fixture; M8.1 (companion-signature
+  folder) populates arg_type_mask + schema_hash_ids + the three
+  u16 counts from ArgSpec + FlagSpec + SchemasSig body buffers and
+  the `describe find` acceptance anchors there. Shipping the
+  predicate entry points at M8 locks the API shape so M8.1 is
+  purely additive.
+- Denormalized shape. The query path NEVER dereferences the
+  cs_body_ref pointer: `commands operating on <schema>` matches
+  the schema_hash_ids slot; `describe <cmd>` prints the
+  name_inline window and the type set from arg_type_mask — all
+  pure bitmap tests against a 256-byte record. The cs_body_ref
+  lets a caller walk back to the authoritative CommandSig record
+  on demand (e.g., `describe --verbose <cmd>` renders the cap
+  array by reparsing the 128+32*n_caps original bytes).
+- Pure-leaf discipline. Every entry point is PURE LEAF — zero
+  callee-save pushes, zero stack frame, zero nested CALL — because
+  the module holds no `.bss` at M8 and the operations are all
+  flat byte reads/writes over caller-supplied buffers. The r11
+  clobber contract never activates because no CALL fires.
+- Status band disjointness. 0x4F00..0x4FFF carves a non-adjacent
+  kilo-step past Wave 125's 0x4E00..0x4EFF (R229.M4 JobControl)
+  and below Wave 126's 0x5000..0x50FF (R224.M6 PipelineLambda).
+  The six prior R222 submodule bands (0x2A00 SchemasSig, 0x3300
+  CommandSig, 0x3900 FunctorInstance, 0x3C00 ArgFlagSpec, 0x4500
+  CmdRegistry, 0x4800 DispatchMode) remain error-disjoint so a
+  downstream dispatcher's compound error path can distinguish
+  describe-serialization faults from every other R222 submodule
+  fault.
+
+### Linker dependencies
+
+- NO external cross-library linker dependency.
+- NO intra-library cross-module linker dependency. The CommandSig
+  magic constant (0x47495343) is replicated as a local
+  `DS_CS_HEADER_MAGIC` constant so the serializer validates the
+  input without a cross-module linker dep on command_sig.pdx —
+  the same disjoint-leaf precedent as the parser-family's
+  `_sch_sig_skip_ws` / `_cmd_sig_skip_ws` / `_fi_skip_ws` /
+  `_afs_skip_ws` quartet.
+- R222.M8.1+ (companion-signature folder: ArgSpec + FlagSpec +
+  SchemasSig fold into the bitmap slots) will introduce a one-way
+  intra-library STRUCTURAL dependency on R222.M1 SchemasSig +
+  R222.M4 ArgFlagSpec but STILL no linker-visible dependency: the
+  body-byte buffers are handed in as opaque caller-managed
+  pointers; no cross-library dependency is planned at those
+  milestones either.
+
+### Notes
+
+- 5-CommandSig round-trip fixture (per the design doc §8.2)
+  anchors the raw M8 acceptance. Query predicates (`_ds_matches_type`
+  / `_ds_matches_schema`) return 0 for every input at raw M8 since
+  the bitmaps are zero-filled; the predicate acceptance anchors
+  at M8.1 with the companion-signature folder.
+- The M8.1 scope sketch (per the design doc §12 Forward path):
+  new entry point `_ds_serialize_full(cs_body, cs_len, args_body,
+  args_len, flags_body, flags_len, schemas_body, schemas_len,
+  name_hash, out, out_cap)` threads the companion signatures in
+  and populates arg_count / flag_count / schema_count /
+  arg_type_mask / schema_hash_ids. The current landing locks the
+  API shape so M8.1 is purely additive.
+- Open questions (per the design doc §12 Forward path): DS-O1
+  whether on-disk cache (`/system/shell/describe.cache`) belongs
+  at M8.4 or later; DS-O2 whether the DescriptorBlob fingerprint
+  pass (M8.5) belongs in this module or in a sibling landing;
+  DS-O3 the exact `query_payload` encoding pending the semantic-
+  query DSL at R229+.
+
+## [1.25.0] -- 2026-10-15
+
+Wave 126: R229.M5 History storage. Lands the parser-tier user-space
+history substrate backing the shell's Ctrl-R lookup, `history`
+built-in output, and up-arrow turn-recall. A 128-slot ring of
+128-byte History rows (16 KiB `.bss`) plus a two-slot scalar
+header (`_h_entry_count` u64 monotonic turn counter, `_h_cursor`
+u64 next-write-slot pointer wrapping at 128) threads each
+dispatched REPL turn (command text, cap-env mask snapshot, result
+code, result summary, FNV-1a 64 cmd hash, rdtsc timestamp) through
+a session-lifetime log. Companion piece deferred: pdxfs CoW
+persistence (R229.M5.1) adds a kernel-side serialisation bridge;
+raw M5 is pure in-memory substrate.
+
+### Added
+
+- `src/history.pdx` module `History` (R229.M5, paideia-os#2723):
+  five public entry points over singleton `.bss` state
+  (`_h_entries` 16384 B = 128 slots x 128 B, `_h_entry_count`
+  u64, `_h_cursor` u64).
+  - `_h_init()` -- defensive scrub of the two u64 scalars
+    (`_h_entry_count`, `_h_cursor`); `_h_entries` relies on .bss
+    zero-init for the "magic == 0 means never-used slot"
+    invariant.
+  - `_h_append(cmd_ptr, cmd_len, result_code, cap_env_mask,
+               summary_ptr, summary_len) -> errno` -- allocates
+    slot `_h_cursor`, writes a 128-byte History record (magic
+    'HIST' (0x54534948 LE), turn_id = entry_count + 1, rdtsc
+    timestamp u64, FNV-1a 64 cmd_hash u64, result_code u8, flags
+    u8 0, reserved u16 0, cap_env_mask u32, cmd_inline 64 B zero-
+    padded, summary_inline 16 B zero-padded, two u64 reserved 0);
+    bumps `_h_entry_count` by 1 and advances `_h_cursor := (cursor
+    + 1) & 127`. FNV-1a 64 is INLINED so the function remains a
+    pure leaf.
+  - `_h_get_turn(turn_id, out, out_cap) -> packed_u64` -- fetch by
+    turn_id. Validates turn_id in live-ring window `[max(1,
+    entry_count - 127), entry_count]`. Copies 128 B via 16 u64
+    moves. Returns `(128 << 32) | H_OK` on success.
+  - `_h_search_substring(needle, needle_len, start_turn,
+                         out_turn_ids, max_results) -> packed_u64`
+    -- walks the ring newest-to-oldest from start_turn (clamped
+    to entry_count, or entry_count if start_turn == 0) down to
+    `max(1, entry_count - 127)`, substring-matches each live
+    slot's cmd_inline[0..64] against `needle[0..needle_len]`, and
+    writes matching turn_ids as u32 to the caller buffer up to
+    max_results.
+  - `_h_count() -> u64` -- returns the session-lifetime monotonic
+    turn count (`_h_entry_count`).
+  Error band 0x5100..0x5105 (six codes); 0x5106..0x51FF reserved
+  for R229.M5.1+ follow-ups (pdxfs persistence errors,
+  KIND_HISTORY cap-invoke denials, quota faults).
+- `design/shell/history-storage.md` (R229.M5 spec).
+
+### Changed
+
+- `src/lib.pdx`: version 1.24.0 -> 1.25.0;
+  `LPX_PDS_PARSER_R229_M5_READY` flipped from 0 to 1 (comment
+  retargeted from the parent brief's "lexical nested scopes" to
+  the newly re-scoped "history storage" per paideia-os#2723 and
+  the novel-clean-design directive); module-filename / upstream-
+  issues / design-doc comments extended.
+- `caps.decl`: added full `0x5100..0x51FF` band section + R229.M5
+  catalogue paragraph + Wave 126 linker-dep entry.
+
+### Design notes
+
+- Record stride 128 IS a power of two; slot addressing uses `shl
+  rN, 7` directly (no `(<<5) + (<<4)` 48-stride dance from
+  `job_control.pdx` / `cmd_registry.pdx`; never 2-op `imul r,
+  imm`).
+- Ring semantics: `_h_entry_count` is monotonic (session-lifetime
+  turn count); `_h_cursor` wraps at 128 and equals `_h_entry_count
+  & 127` by construction (carried for cache locality on the append
+  fast-path). The live-ring window after N appends is `[max(1, N -
+  127), N]`.
+- FNV-1a 64 hash (basis 0xCBF29CE484222325, prime 0x100000001B3)
+  is inlined in `_h_append` so the function stays a pure leaf;
+  the hash seeds a later M5.1 duplicate-detection / pdxfs-side de-
+  duplication path.
+- rdtsc is sampled directly inside `_h_append` (`rdtsc; shl rdx,
+  32; or rax, rdx`); the tsc_hz divisor is caller responsibility.
+  This matches the pdxfs_lite/create.pdx atime/mtime/ctime
+  precedent.
+- All five entry points are pure leaves (zero nested CALL). The
+  6-push shapes in `_h_append` and `_h_search_substring` carry no
+  `sub rsp, 8` alignment pad.
+- History's `.bss` is disjoint from every other satellite
+  module's `.bss` (parser-family / row-family / session-family /
+  lexer-family / scope-family / registry-family / job-family).
+- The user-side table (THIS module) and the kernel-side R127.M4
+  `shell_history.pdx` co-exist with disjoint reach: kernel-side
+  via KIND_SHELL_SESSION cap-invoke op surface; user-side via
+  direct link. R229.M5.1 (pdxfs CoW persistence) adds a
+  serialisation bridge that writes the user-side ring to a per-
+  user history file via a kernel bridge.
+
+### Notes
+
+- Fingerprint goldens for the smoke-mode asserter deferred to
+  R229.M5.3 along with the formal 100-turn acceptance test
+  (`tests/proptest_history.pdx`); the design doc enumerates the
+  seven observations the goldens will assert.
+- pdxfs CoW persistence (acceptance test's "persists to CoW
+  file" phrasing) deferred to R229.M5.1 — pdxfs integration
+  requires a KIND_PDXFS reach that is outside the R229.M5
+  substrate scope. The acceptance test from paideia-os#2723 (100-
+  turn session; `C-r` search finds turn 42) is satisfied by the
+  in-memory ring + `_h_get_turn` / `_h_search_substring` surface
+  at raw M5: after 100 appends, turn 42 falls in the live-ring
+  window `[1, 100]`, slot 41 holds the record, and the search
+  surface returns `(1 << 32) | H_OK` with `out_turn_ids[0] = 42`
+  for a `"turn-42"` needle.
+
+## [1.24.0] -- 2026-10-15
+
+Wave 126: R224.M6 PipelineLambda. Lands the parser-tier substrate
+for lambdas as FIRST-CLASS pipeline values. A 32-byte PipelineLambda
+record ('PLAM' magic + four u32 pool indices for the lambda's
+literal, closure env, effect row, capability row) + three APIs over
+it (`_pl_lam_box`, `_pl_lam_unbox`, `_pl_lam_apply_to_combinator`)
+let a lambda flow through `|` like any other value and get grafted
+into a FilterOp / SortGroupReduce combinator record at parse time.
+
+### Added
+
+- `src/pipeline_lambda.pdx` module `PipelineLambda` (R224.M6,
+  paideia-os#2680): four public entry points over caller-supplied
+  pool indices and record pointers. Zero `.bss`.
+  - `_pl_lam_init()` — idempotent pure-leaf boot hook; bare `ret`.
+    Reserved for M6.1+ `.bss` state (closure-arena next cursor,
+    parse-count counter, etc.).
+  - `_pl_lam_box(ll_idx, cc_idx, er_idx, cr_idx, out, out_cap)` —
+    pure-leaf packer that validates each of the four u32 pool
+    indices fits in u32 (`shr by 32, cmp 0`), the out pointer is
+    non-null, and the out capacity is at least 32. Zero-fills the
+    32-byte record via four u64 stores, writes magic (`'PLAM'`
+    0x4D414C50 LE) at +0, flags u16 at +4 (bits 0/1/2 set from the
+    three nonzero-idx tests), and four u32 pool indices at
+    8/12/16/20. The 8-byte reserved tail at +24 stays zero.
+  - `_pl_lam_unbox(record, record_len, out_ll, out_cc, out_er,
+    out_cr)` — pure-leaf decomposer that validates the record
+    pointer / length / magic, then writes each nonzero out-ptr
+    with the matching u32 zero-extended to u64. Null out-ptrs are
+    legitimate skips at raw M6; `PL_LAM_ERR_NULL_OUT` is reserved
+    for a future strict-mode variant.
+  - `_pl_lam_apply_to_combinator(pipelam, pipelam_len, comb,
+    comb_len)` — pure-leaf threader that validates both record
+    pointers / lengths / magics (PipelineLambda `'PLAM'`;
+    combinator in {`'FILT'`, `'SORT'`, `'GRPS'`, `'REDU'`}),
+    reads the PipelineLambda's `lambda_lit_idx` u32 at +8, writes
+    it at `[comb + 28]` via `mov_d`, and ORs the "lambda-sourced
+    predicate" flag bit into the combinator's flags byte (FilterOp
+    bit 1 at +17; SortGroupReduce bit 2 at +5).
+  - All four entry points are PURE LEAVES (zero callee-save pushes,
+    zero stack frame, zero nested CALL). `r11` is used freely as a
+    staging register because no nested CALL exists.
+
+- `design/shell/lambda-as-pipeline-value.md` — R224.M6 design doc.
+  Nine sections: scope / motivation (3-option analysis vs
+  byte-span-only and direct LambdaLit pool ref), record layout, API,
+  status band, 8-test acceptance corpus, interactions (R223.M3,
+  R223.M4, R224.M1..M5, R225), encoder discipline (absolute),
+  forward path (M6.1..M6.4), references.
+
+### Changed
+
+- `src/lib.pdx` — flipped `LPX_PDS_PARSER_R224_M6_READY` from 0 to 1;
+  added `src/pipeline_lambda.pdx at R224.M6` to the module-filename
+  comment; added `paideia-os#2680 (R224.M6 PipelineLambda)` to the
+  upstream-issues comment; added `design/shell/lambda-as-pipeline-
+  value.md` to the design-doc list. Version bumped
+  1.23.0 → 1.24.0 (MINOR: additive, new M-wave landing).
+
+- `caps.decl` — added `0x5000..0x50FF` error-band section listing
+  all nine PL_LAM_* slots (OK, SYNTAX, OUT_TOO_SMALL, BAD_MAGIC,
+  RECORD_TOO_SMALL, NULL_OUT, BAD_COMBINATOR, COMBINATOR_TOO_SMALL,
+  NULL_RECORD, BAD_INDEX with 247 slots reserved for M6.1+ follow-
+  ups). Added the R224.M6 catalogue paragraph. Added the R224.M6
+  linker-dependency entry (NO external cross-library dep, NO intra-
+  library linker-visible dep; the four referenced pool families
+  are STRUCTURAL dependencies but not linker-visible). Added the
+  `0x500[0-8]\b` grep-disjointness confirmation line.
+
+- `STATUS.md` — added R224.M6 to the Current milestones paragraph;
+  added Wave-126 landing note.
+
+### Design notes
+
+- Record layout: the parent brief sketched four u64 slots at
+  0x08/0x10/0x18/0x20 (40 B); we collapse to four u32 slots
+  (32 B) because every referenced pool (LambdaLit, ClosureCapture,
+  EffectRow / RowTypes, CapRow / RowTypes) caps well below 2^31
+  entries. The 8-byte reserved tail at +24 absorbs any future
+  u64-wide handle (closure-arena ref, HM scheme id) without an ABI
+  break.
+- Combinator poke targets: both FilterOp (R223.M3) and
+  SortGroupReduce (R223.M4) reserve the last 4 bytes of their
+  32-byte stride, so the lambda_lit_idx u32 goes at `[comb + 28]`
+  uniformly. The lambda-sourced flag bit sits in each record's
+  flags byte at a per-record offset (FilterOp +17 bit 1;
+  SortGroupReduce +5 bit 2), both of which are explicitly reserved
+  for M3.1+ / M4.1+ follow-ups in the parent modules' M3 / M4 ABI.
+
+### Linker dependencies
+
+- NO external cross-library linker dependency.
+- NO intra-library cross-module linker dependency. The four
+  referenced pool families are STRUCTURAL dependencies (the stored
+  u32 handles are indices into their respective pools) but NOT
+  linker-visible: the downstream HM pass that dereferences the
+  handles lives at the R225 wire-up layer, not in this module.
+
 ## [1.23.0] -- 2026-10-15
 
 Wave 125: R229.M4 job control substrate. Lands the parser-tier
