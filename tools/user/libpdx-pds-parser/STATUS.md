@@ -10,14 +10,17 @@
 - R226 (datalog umbrella, paideia-os#2490)
 - R229 (REPL evaluator umbrella, paideia-os#2493)
 **Current milestones:** R221.M1 (UTF-8 decoder + NFC normalizer) --
-landed. R222.M1 (SchemasSig parser) -- landed. R222.M2 (CommandSig
-parser) -- landed. R223.M1 (Pipeline stage parser) -- landed. R223.M2
-(RecordProjection: select/project FIELDS) -- landed. R224.M1 (LambdaLit
-grammar) -- landed. R224.M2 (ClosureCapture list parser) -- landed.
-R225.M1 (HM algorithm W core) -- landed. R225.M2 (RowTypes: Remy-style
-row polymorphism) -- landed. R226.M1 (Datalog parser) -- landed.
-R229.M2 (SessionEnv: session-scoped bindings) -- landed.
-**Version:** 1.12.0.
+landed. R221.M2 (GraphemeIter: TR#29 grapheme-cluster boundary
+iterator) -- landed. R222.M1 (SchemasSig parser) -- landed. R222.M2
+(CommandSig parser) -- landed. R222.M3 (FunctorInstance:
+instantiation materialization record) -- landed. R223.M1 (Pipeline
+stage parser) -- landed. R223.M2 (RecordProjection: select/project
+FIELDS) -- landed. R224.M1 (LambdaLit grammar) -- landed. R224.M2
+(ClosureCapture list parser) -- landed. R225.M1 (HM algorithm W
+core) -- landed. R225.M2 (RowTypes: Remy-style row polymorphism)
+-- landed. R226.M1 (Datalog parser) -- landed. R229.M2 (SessionEnv:
+session-scoped bindings) -- landed.
+**Version:** 1.13.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the

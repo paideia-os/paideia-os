@@ -4,6 +4,46 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] -- 2026-10-15
+
+Wave 118 parallel landing: R221.M2 (TR#29 grapheme cluster iterator)
++ R222.M3 (functor instantiation materialization record). R133.M3
+(kernel-side import graph traversal + cycle detection) also lands in
+the same wave; it has no parser-lib surface.
+
+### Added
+
+- `src/grapheme_iter.pdx` module `GraphemeIter` (R221.M2,
+  paideia-os#2652): TR#29 grapheme-cluster boundary iterator.
+  - `_gi_next_cluster(bytes, bytes_len, cursor_byte) -> (next_cursor, status)`
+  - `_gi_prev_cluster(bytes, bytes_len, cursor_byte) -> (prev_cursor, status)`
+  - `_gi_tokenize_args(bytes, bytes_len, out, out_cap) -> (n_tokens, status)`
+  - ASCII fast path (pure leaf); slow path routes through
+    libpdx-unicode-tables `_gc_next` for the Latin+emoji baseline.
+  - Error band 0x3800..0x3803 (INVALID_UTF8, OUT_TOO_SMALL,
+    TOO_MANY_TOKENS, BAD_CURSOR).
+- `src/functor_instance.pdx` module `FunctorInstance` (R222.M3,
+  paideia-os#2660): functor-instantiation materialization record.
+  - `_fi_instantiate(inv, inv_len, cs, cs_len, out, out_cap) -> (bytes_written, status)`
+  - `_fi_elaborate_args(mat, mat_len, cs_body, cs_len) -> status`
+  - 64B header (magic 'FINS') + 32B arg descriptors (up to 16 args).
+  - Error band 0x3900..0x3906.
+- `design/shell/grapheme-cluster-boundaries-tr29.md` (R221.M2 spec).
+- `design/shell/functor-instantiation.md` (R222.M3 spec).
+- `design/kernel/pds-import-graph.md` (R133.M3 spec, kernel-side).
+
+### Changed
+
+- `src/lib.pdx`: version 1.12.0 -> 1.13.0; `LPX_PDS_PARSER_M2_READY`,
+  `LPX_PDS_PARSER_R222_M3_READY` flipped to 1; module-filename list
+  and upstream-issues comment extended for the two new modules + the
+  two new design docs.
+- `caps.decl`: added full 0x3800..0x38FF (R221.M2) and
+  0x3900..0x39FF (R222.M3) band sections; added disjointness note
+  + grep-confirmation lines; added R221.M2 and R222.M3 linker-
+  dependency entries (R221.M2 depends on libpdx-unicode-tables
+  `_gc_next`; R222.M3 has no external deps).
+
 ## [1.12.0] -- 2026-10-14
 
 R229.M2 of the semantic-shell REPL evaluator umbrella (paideia-os#2493,
