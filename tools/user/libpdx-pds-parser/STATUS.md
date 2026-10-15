@@ -201,7 +201,7 @@ JSON-compatible with `line=0` byte-offset fallback until M7.2 wires
 the UTF-8-aware line/column resolver; zero `.bss`; error band
 0x5B00..0x5BFF (five slots used); 60-error acceptance corpus
 enumerated in `design/shell/diagnostic-reporting.md` §8) -- landed.
-**Version:** 1.36.0.
+**Version:** 1.38.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 **Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
 **Wave 126 landings:** R224.M6 PipelineLambda, R229.M5 History,
@@ -277,6 +277,30 @@ binding (span contains `=`; local balance; non-empty RHS); calls
 failure; error band 0x5C00..0x5CFF with nine LC_* slots;
 10-fixture acceptance corpus (5 well-typed + 5 ill-typed scripts)
 enumerated in `design/shell/typecheck-at-load.md` §7).
+**Wave 131 landings:** R229.M10 TurnFingerprint (parser-tier per-turn
+anti-fabrication fingerprint emitter + correlator implementing
+project invariant P9: every REPL turn emits
+`@fingerprint("turn.<id>.<result-hash>")` so the debugger can
+anchor every claimed result to an FNV-1a 64 hash of the actual
+emitted bytes; 64-byte TurnFingerprint record with magic 'TFPR' =
+0x52504654 LE at [+0], turn_id u32 at [+4], result_hash u64 at
+[+8], timestamp_us u64 at [+16] via rdtsc, rendered_tag u8[32] at
+[+24..+56] NUL-padded, reserved u64 at [+56]; four public entry
+points `_tf_init` / `_tf_emit` / `_tf_render_tag` / `_tf_correlate`
+over caller-supplied buffers; `_tf_init`, `_tf_render_tag`, and
+`_tf_correlate` are PURE LEAVES; `_tf_emit` is a 6-callee-save-push
+frame with ZERO nested CALL (FNV inlined; decimal + hex rendering
+unrolled) so no sub-rsp alignment pad is required; zero `.bss` at
+raw M10; three .rodata tables `_tf_pow10` / `_tf_hex_digits` /
+`_tf_prefix`; FNV-1a 64 byte-for-byte identical to the five
+parser-tier FNV precedents; error band 0x6000..0x60FF with ten
+TF_* slots (TF_OK, TF_ERR_BAD_OUT 0x6000, TF_ERR_OUT_TOO_SMALL
+0x6001, TF_ERR_BAD_RESULT 0x6002, TF_ERR_RESULT_TOO_LARGE 0x6003,
+TF_ERR_BAD_TURN_ID 0x6004, TF_ERR_BAD_RECORD 0x6005,
+TF_ERR_BAD_MAGIC 0x6006, TF_ERR_MISMATCH 0x6007, TF_ERR_BAD_LEN
+0x6008, TF_ERR_BAD_EXPECTED 0x6009); 500-turn smoke acceptance
+corpus enumerated in `design/shell/turn-fingerprint.md` §8 and
+deferred to R229.M10.5 golden landing).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -1662,6 +1686,83 @@ finalised; the line-editor primitive is the standing M6 commitment).
       goldens for the 7-fixture acceptance corpus (3 OK × 2
       kinds + 4 negative).
 
+### M10 -- Per-turn wire fingerprint (paideia-os#2728, landed)
+
+- [x] **R229.M10-001** -- `src/turn_fingerprint.pdx` module
+      `TurnFingerprint` landed: four public entry points
+      (`_tf_init`, `_tf_emit`, `_tf_render_tag`, `_tf_correlate`)
+      over caller-supplied buffers; zero `.bss` at raw M10. 64-byte
+      TurnFingerprint record with magic 'TFPR' = 0x52504654 LE at
+      [+0] (u32); turn_id u32 at [+4]; result_hash u64 (FNV-1a 64
+      of result bytes) at [+8]; timestamp_us u64 (raw rdtsc) at
+      [+16]; rendered_tag u8[32] at [+24..+56] (`turn.<id>.<hex>`
+      ASCII, NUL-padded); reserved u64 at [+56]. Record stride 64 is
+      a power of two (`shl idx, 6` addressing for a future multi-
+      turn ring). Three .rodata tables: `_tf_pow10` [u32;10] for
+      decimal rendering, `_tf_hex_digits` [u8;16] lowercase 0-9 a-f,
+      `_tf_prefix` [u8;16] carrying the 14-byte `@fingerprint("`
+      literal + 2 pad bytes; all @align(8). `_tf_init` is a bare
+      `ret` (no .bss state). `_tf_emit` is a 6-callee-save-push
+      frame (rbx=turn_id, rbp=result_ptr, r12=result_len, r13=out,
+      r14=out_cap, r15=hash) with ZERO nested CALL (FNV-1a 64
+      inlined byte-identical to _cmd_sig_fnv1a64 R222.M2 /
+      _fi_fnv1a64 R222.M3 / _cmdreg_fnv1a64 R222.M5 /
+      _ws_schema_hash R223.M5 / _h_append R229.M5; decimal
+      turn_id rendering via greedy-subtract over `_tf_pow10` LUT
+      with emit_flag for leading-zero suppression; 16-nibble
+      lowercase hex rendering via unrolled
+      `shr r, N; and r, 15; mov_b r, [_tf_hex_digits + r]`). No
+      sub-rsp alignment pad required because no nested CALL fires
+      (precedent: R229.M5 `_h_append`). `_tf_render_tag` emits
+      `@fingerprint("<inner>")` where <inner> is copied from
+      record[+24..+24+N] up to first NUL or offset 32; returns
+      `(bytes_written << 32) | TF_OK` on success. `_tf_correlate`
+      avoids a scratch stack buffer by verifying the wrapper
+      prefix/suffix on expected_tag and byte-comparing the inner
+      against record[+24..]; returns TF_OK on exact match,
+      TF_ERR_MISMATCH on any byte disagreement. TF_* status
+      taxonomy in 0x6000..0x6009 (band 0x6000..0x60FF with 246
+      slots reserved for M10.1+ follow-ups:
+      TF_ERR_BAD_ENV_MASK at M10.1 env-mask field validator;
+      TF_ERR_HASH_MISMATCH at M10.3 strict-mode hash-only
+      correlator; TF_ERR_TIMESTAMP_SKEW at M10.4 rdtsc-skew
+      sanity bound). The 0x6000..0x60FF carve-out sits directly
+      above the Wave 130 / 131 R227.M5 ModuleFunctor band
+      (0x5F00..0x5FFF) with no held reservations between them.
+- [x] **R229.M10-002** -- design doc landed:
+      `design/shell/turn-fingerprint.md`.
+- [ ] **R229.M10-003** -- 500-turn smoke-mode golden corpus
+      (`smoke/turn-fingerprint-m10.golden.txt`): deferred to
+      R229.M10.5 along with the full smoke-mode fingerprint
+      goldens. The acceptance assertion ("500-turn smoke session
+      emits 500 fingerprints; debugger correlates each with its
+      expected result") is satisfied by the raw M10 surface;
+      the design doc §8 enumerates the 12-fixture tier (3
+      positive + 9 negative) as the golden column.
+- [ ] **R229.M10.1** (deferred) -- env-mask field: an additional
+      u32 at `[record+0x38..+0x3C]` capturing the cap-row delta
+      between the READ and WRITE phases of the turn, so the
+      correlator can detect a mid-turn capability drift (a
+      privilege escalation that the standard result-hash does not
+      notice).
+- [ ] **R229.M10.2** (deferred) -- result-length field: an
+      additional u32 at `[record+0x3C..+0x40]` so an auditor can
+      cross-check the hash input without consulting the REPL's
+      own state.
+- [ ] **R229.M10.3** (deferred) -- strict-mode hash-only
+      correlator: a second
+      `_tf_correlate_strict(expected_tag, expected_len,
+      result_ptr, result_len)` that RECOMPUTES the FNV from the
+      result bytes and compares to the hash parsed out of
+      expected_tag's inner.
+- [ ] **R229.M10.4** (deferred) -- rdtsc-skew sanity bound:
+      `_tf_correlate_sequence(records_ptr, n_records)` rejects a
+      sequence where any record's `timestamp_us` precedes the
+      previous turn's `timestamp_us`.
+- [ ] **R229.M10.5** (deferred) -- 500-turn smoke golden corpus
+      under `smoke/turn-fingerprint-m10.golden.txt`; harness
+      lives at `tools/verify-fingerprint-coverage.sh`.
+
 ### R227.M3 -- Import resolution + module graph (paideia-os#2705, landed)
 
 - [x] **R227.M3-001** -- `src/import_resolve.pdx` module
@@ -1799,6 +1900,104 @@ finalised; the line-editor primitive is the standing M6 commitment).
       diag record's reserved u64 at [+120] for ordering within
       a load's chain.
 
+### R227.M5 -- Functor-typed script modules (paideia-os#2707, landed)
+
+- [x] **R227.M5-001** -- `src/module_functor.pdx` module
+      `ModuleFunctor` landed: four public entry points
+      (`_mf_init`, `_mf_parse_module`, `_mf_apply`,
+      `_mf_lookup_export`); ZERO `.bss` state at raw M5
+      (every record is caller-owned on all operational paths).
+      128-byte ModuleFunctor header with magic 'MFCT' =
+      0x5443464D LE u32 @ [+0]; n_exports u16 @ [+4]; n_cap_params
+      u16 @ [+6]; module_path_hash u64 @ [+8]; module_name_inline
+      [u8;16] @ [+16]; cap_param_mask [u8;32] @ [+32];
+      exports_offset u64 @ [+64] (= 128 at raw M5);
+      entries_offset u64 @ [+72] (= 128 + n_exports*32);
+      applied_flag u8 @ [+80]; applied_env_mask u64 @ [+88];
+      reserved u8[32] @ [+96]. Export table entry 32 bytes
+      exactly: name_hash u64 @ [+0]; name_inline [u8;16] @ [+8];
+      cmd_sig_ref u64 @ [+24] (0 at raw M5; M5.2 wires in
+      R222.M5 CmdRegistry). Stride power-of-two for `shl rN, 7`
+      (header) and `shl rN, 5` (export) addressing without
+      2-op imul-r-imm. `_mf_init` is bare `ret` (zero pushes);
+      `_mf_parse_module` 6-push PURE LEAF (FNV-1a 64 inlined;
+      primitive-cap-table scan inlined; no nested CALL) with
+      rbx=bytes_ptr, rbp=bytes_len, r12=out, r13=cursor,
+      r14=n_exports, r15=n_cap_params + r8 running cap_mask;
+      `_mf_apply` 5-push PURE LEAF with cap-mask covering check
+      via register-register AND (precedent cap_row.pdx L1208)
+      + one-op NOT (precedent battery_monitor.pdx L454) + TEST
+      +SHR 64-iteration bounded lowest-set-bit scan;
+      `_mf_lookup_export` 6-push PURE LEAF (FNV-1a 64 inlined;
+      no nested CALL) with linear-scan over the export table.
+      Walks `.pds` script body byte-by-byte, dispatching on '#'
+      (match `#capability "<name>"`) and 'p' (match
+      `pub let NAME`). Primitive-cap-table scan is a byte-
+      identical in-module duplicate of R224.M4 CapRow's
+      `_cr_primitive_init` (ten slots x 16 bytes: read / write /
+      exec / net / fs / cap_mint / cap_grant / kalloc / ipc /
+      trap). MF_* status taxonomy in 0x5F00..0x5F11 (band
+      0x5F00..0x5FFF with the full MF_OK (0),
+      MF_ERR_BAD_SCRIPT (0x5F00), MF_ERR_OUT_TOO_SMALL (0x5F01),
+      MF_ERR_BAD_RECORD (0x5F02), MF_ERR_TOO_MANY_EXPORTS
+      (0x5F03), MF_ERR_TOO_MANY_CAP_PARAMS (0x5F04),
+      MF_ERR_NAME_TOO_LONG (0x5F05), MF_ERR_UNKNOWN_CAP
+      (0x5F06), MF_ERR_SYNTAX (0x5F07), E1200_MISSING_CAP
+      (0x5F10), E1201_EXPORT_NOT_FOUND (0x5F11); the
+      E12xx-family diagnostic for functor-apply + export-lookup
+      faults). NO intra-library linker-visible FUNCTION dep at
+      raw M5; declared forward-path deps on R227.M3
+      ImportResolve (M5.3 ImportDirective pass-through; M5.4
+      import-apply bridge), R224.M4 CapRow (M5.1
+      `_cr_label_lookup` for primitive-table replacement + user
+      slots), R222.M5 CmdRegistry (M5.2 `_cmdreg_lookup` for
+      cmd_sig_ref population), R222.M3 FunctorInstance (M5.4
+      dispatch pipeline), R224.M5 LetScope (M5.6 nested-lambda
+      walker). NO external cross-library linker dep. NO intra-
+      library DATA linker reference at raw M5.
+- [x] **R227.M5-002** -- design doc landed:
+      `design/shell/module-as-functor.md`.
+- [ ] **R227.M5-003** -- 10-fixture acceptance corpus
+      (`tests/proptest_module_functor.pdx`): fixture 1 (fs cap
+      declared + apply with mask=0x10 -> OK), 2 (fs cap
+      declared + apply with mask=0 -> E1200 idx=4), 3 (no caps
+      + apply with mask=0 -> OK), 4 (fs+net caps + apply with
+      mask=0x18 -> OK), 5 (lookup existing export -> OK),
+      6 (lookup missing export -> E1201), 7 (unknown cap
+      "custom_cap" -> MF_ERR_UNKNOWN_CAP), 8 (33 exports ->
+      MF_ERR_TOO_MANY_EXPORTS), 9 (9 cap directives ->
+      MF_ERR_TOO_MANY_CAP_PARAMS), 10 (16+ byte cap name ->
+      MF_ERR_NAME_TOO_LONG). Deferred along with the broader
+      parser-tier property-test harness (R221.M9 landing); the
+      raw M5 surface satisfies every fixture by the four-entry-
+      point validation flows enumerated in the design doc §7.
+- [ ] **R227.M5.1** (deferred) -- Switch primitive-cap-table
+      scan to R224.M4 CapRow `_cr_label_lookup`; widens
+      recognition to slots 10..31 (user-declared caps).
+- [ ] **R227.M5.2** (deferred) -- Wire `pub let` export
+      elaboration to R222.M5 CmdRegistry `_cmdreg_lookup`;
+      cmd_sig_ref no longer zero.
+- [ ] **R227.M5.3** (deferred) -- module_path_hash +
+      module_name_inline populated from the enclosing
+      ImportDirective's `path_hash` + `name_inline` fields
+      (R227.M3).
+- [ ] **R227.M5.4** (deferred) -- Import-time apply dispatch:
+      `_ir_resolve_path` composes with `_mf_apply` at resolve
+      time so the caller's cap_env_mask gates every imported
+      export.
+- [ ] **R227.M5.5** (deferred) -- 256-bit cap mask: widen
+      cap_env_mask argument to a 32-byte pointer; apply
+      dispatch cross-walks the four u64 words.
+- [ ] **R227.M5.6** (deferred) -- Nested lambda / let-rec
+      exports via R224.M5 LetScope-aware walker.
+- [ ] **R227.M5.7** (deferred) -- Intra-module duplicate-
+      export scan (analogous to R227.M3's intra-source
+      duplicate-name scan via `_ir_build_graph`).
+- [ ] **R227.M5.8** (deferred) -- Unused-cap-param lint
+      (warn-level diagnostic when a `#capability` is declared
+      but no export references it; needs R224.M4 CapRow row-
+      flow pass).
+
 ## Error-band accounting
 
 | Band             | Range            | Milestone | Status |
@@ -1878,6 +2077,12 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | load_check-M4.1+ | 0x5C09..0x5CFF   | R227.M4.1+ | reserved |
 | renderer         | 0x5D00..0x5D08   | R229.M9   | landed |
 | renderer-M9.1+   | 0x5D09..0x5DFF   | R229.M9.1+ | reserved |
+| lsp_hover        | 0x5E00..0x5E06   | R225.M8   | landed |
+| lsp_hover-M8.1+  | 0x5E07..0x5EFF   | R225.M8.1+ | reserved |
+| turn_fingerprint | 0x6000..0x6009   | R229.M10  | landed |
+| turn_fingerprint-M10.1+ | 0x600A..0x60FF | R229.M10.1+ | reserved |
+| module_functor   | 0x5F00..0x5F11   | R227.M5   | landed |
+| module_functor-M5.1+ | 0x5F12..0x5FFF | R227.M5.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in
