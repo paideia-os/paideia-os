@@ -1,0 +1,1582 @@
+// src/line_editor.pdx -- libpdx-pds-parser.R229.M6 (paideia-os#2724)
+//
+// LineEditor: parser-tier emacs-mode line-editor substrate. Holds the
+// shell's in-progress edit line, the cluster-aware cursor, the kill
+// buffer backing C-y, and the meta-prefix latch backing M-f / M-b /
+// M-d. Entry point `_le_dispatch_key` executes exactly one keystroke
+// per call and mutates `.bss` state in place.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R229 is the REPL evaluator umbrella (paideia-os#2493; design doc
+// design/shell/repl-loop-scaffold.md). R229.M1 kernel-side landed the
+// PROMPT/READING/PARSED/EVAL/WRITING/IDLE state machine; R229.M2..M5
+// landed the SessionEnv binding map, TypeEnv scheme store, JobControl
+// table, and History ring respectively. R229.M6 (THIS module) lands
+// the per-keystroke edit substrate the TTY ISR drives: a 4096-byte
+// line buffer + 1024-byte kill buffer + two cursor scalars (byte +
+// cluster offsets) + a meta-prefix latch, plus the state machine
+// that maps every binding from design/terminal/editor-bindings.md §1
+// onto one of {move cursor, insert bytes, delete bytes, kill span,
+// yank, no-op, history-recall} primitive transitions.
+//
+// Position in the substrate graph:
+//
+//   TTY ISR -> _rl_tick (R229.M1) -> state := READING
+//        -> raw byte read into key_u32:
+//           low 8 bits = byte (0..0xFF)
+//        -> _le_dispatch_key(key_u32)
+//           - control char 0x01..0x1A (sans TAB/LF/CR) -> command binding
+//           - 0x1B (ESC)                                -> set meta_pending
+//           - 0x20..0x7E or 0x80..0xFF                  -> insert at cursor
+//           (meta_pending == 1 at entry: current byte is a M-prefixed
+//            key; dispatch M-f / M-b / M-d; clear meta_pending.)
+//        -> state := WRITING -> _rl_emit_prompt -> READING
+//
+// LineEditor is PARSER-TIER by geography (same satellite library as
+// SessionEnv, TypeEnv, HmCore, JobControl, History) but is NOT itself
+// a parser -- the module stores raw UTF-8 bytes between NFC decode
+// (R221.M1) at tokenise-time and never calls into the parser surface
+// at edit time. The cursor movements that span multi-byte clusters
+// delegate to R221.M2's _gi_next_cluster / _gi_prev_cluster so the
+// edit-time cursor sits ONLY on grapheme boundaries.
+//
+// Lives user-space because the shell runs user-space; the pool is
+// caller-process-local (singleton `.bss`, 4096 B line + 1024 B kill
+// + eight u64 scalars); the module touches no kernel KIND and
+// consumes no capability (caps.decl R229.M6 band note).
+//
+// Why LineEditor is distinct from R125.M* line-reader kernel-side:
+//   * R125 (if landed) would be the SHELL-session-level READLINE
+//     facade reach-controlled by KIND_SHELL_SESSION. R229.M6 is the
+//     USER-space working buffer whose state the kernel surface
+//     mirrors on `rl_emit_prompt` ticks.
+//   * The two layers co-exist: the user-side ring (THIS module) is
+//     the authoritative edit buffer within a session; the kernel-side
+//     persistence (R229.M6.1+) adds a serialisation hook that
+//     snapshots the line buffer onto a per-session scratch page via
+//     a KIND_SHELL_SESSION cap-invoke.
+//
+// Companion substrates driven at the same R229.M6 reach:
+//   * R221.M2 GraphemeIter (_gi_next_cluster / _gi_prev_cluster)
+//     drives C-f / C-b / C-d cluster-aware cursor math.
+//   * R229.M5 History (_h_search_substring / _h_get_turn)
+//     drives C-r reverse-i-search.
+//
+// =============================================================================
+// BINDINGS  --  design/terminal/editor-bindings.md §1
+// =============================================================================
+//
+//   C-a (0x01) -- beginning of line     : cursor_byte := 0;
+//                                         cursor_cluster := 0
+//   C-b (0x02) -- back char              : cursor := _gi_prev_cluster(...)
+//   C-d (0x04) -- delete char under cur. : delete bytes [cursor, next_cluster)
+//   C-e (0x05) -- end of line            : cursor_byte := buf_len
+//   C-f (0x06) -- forward char           : cursor := _gi_next_cluster(...)
+//   C-k (0x0B) -- kill to end of line    : kill := buf[cursor..buf_len);
+//                                         buf_len := cursor
+//   C-l (0x0C) -- clear screen (no edit) : no-op at the editor tier;
+//                                         the TTY driver owns the
+//                                         screen clear.
+//   C-r (0x12) -- reverse-i-search       : _h_search_substring over
+//                                         current buf as needle;
+//                                         on hit, replace buf with
+//                                         turn's cmd_inline.
+//   C-u (0x15) -- kill to beginning      : kill := buf[0..cursor);
+//                                         shift buf[cursor..buf_len)
+//                                         left to buf[0..]; buf_len
+//                                         -= cursor; cursor := 0
+//   C-w (0x17) -- kill word back         : find prev-word start;
+//                                         kill := buf[word_start,cursor);
+//                                         shift left; buf_len -=
+//                                         (cursor - word_start);
+//                                         cursor := word_start
+//   C-y (0x19) -- yank kill buffer       : insert kill_buf[0..kill_len)
+//                                         at cursor; cursor +=
+//                                         kill_len
+//   M-f        -- forward word           : advance cursor over the
+//                                         next whitespace-separated
+//                                         word (ASCII whitespace is
+//                                         SP / TAB / LF / CR).
+//   M-b        -- back word              : retreat cursor over the
+//                                         previous whitespace-
+//                                         separated word.
+//   M-d        -- delete word forward    : find word-end from cursor;
+//                                         kill := buf[cursor,word_end);
+//                                         shift left; buf_len -=
+//                                         (word_end - cursor).
+//
+// Any printable byte (0x20..0x7E) or non-ASCII byte (0x80..0xFF) that
+// is NOT the ESC byte and NOT a bound control byte is inserted at
+// `cursor_byte`. The `cursor_cluster` scalar is maintained best-
+// effort: single-byte ASCII inserts bump it by 1; multi-byte inserts
+// are rare and leave the cluster counter re-synchronisable by the
+// caller via an explicit _gi_count_clusters follow-up. The cursor
+// authority is `cursor_byte`; `cursor_cluster` is a hint for the
+// width-pass column renderer.
+//
+// =============================================================================
+// STATE
+// =============================================================================
+//
+// All state lives in this module's own `.bss`:
+//
+//   _le_buf              : [u8; 4096]  the current edit line
+//   _le_buf_len          : u64         valid bytes in _le_buf
+//   _le_cursor_byte      : u64         byte offset of cursor
+//   _le_cursor_cluster   : u64         grapheme-cluster offset (hint)
+//   _le_kill_buf         : [u8; 1024]  last killed span
+//   _le_kill_len         : u64         valid bytes in _le_kill_buf
+//   _le_meta_pending     : u64         1 iff last byte seen was ESC
+//                                      (0x1B); the next _le_dispatch_
+//                                      key call treats its byte as a
+//                                      M-prefixed binding.
+//   _le_last_search_turn : u64         most recent C-r hit (turn_id,
+//                                      0 if none); hint for a repeat
+//                                      C-r to continue the walk.
+//
+// Cold-boot: `.bss` zero-init gives every scalar 0. `_le_init` is a
+// defensive scrub (eight u64 stores = 64 B); the two byte pools are
+// NOT scrubbed because the invariants only read bytes in
+// [0..*_len).
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _le_init() -> ()
+//     Boot hook. Defensive scrub of the eight u64 scalars (64 B);
+//     byte pools rely on .bss zero-init.
+//
+//   _le_reset() -> ()
+//     Clear buffer + cursor (buf_len, cursor_byte, cursor_cluster,
+//     meta_pending, last_search_turn all := 0). Called by the REPL
+//     dispatch after a RET-commit so the next prompt starts clean.
+//
+//   _le_dispatch_key(key_u32) -> status
+//     Handles exactly one keystroke. Byte in the low 8 bits of
+//     key_u32; bits 8..31 reserved (0). Returns LE_OK on every
+//     successful binding (including no-op bindings); LE_META_PENDING
+//     when the byte was ESC and the module latched meta_pending;
+//     LE_ERR_BAD_KEY on an unrecognised control byte (0x00, 0x03,
+//     0x07..0x0A, 0x0E..0x11, 0x13..0x14, 0x16, 0x18, 0x1A, 0x1C..
+//     0x1F, 0x7F); LE_ERR_BUF_FULL / LE_ERR_UTF8 on edit-time
+//     faults.
+//
+//   _le_insert_bytes(ptr, len) -> status
+//     Insert `len` bytes from `ptr` at `cursor_byte`. Shifts
+//     buf[cursor..buf_len) right by `len` and copies from `ptr`.
+//     LE_OK on success; LE_ERR_BAD_PTR (ptr == 0 AND len > 0),
+//     LE_ERR_BAD_LEN (len == 0), LE_ERR_BUF_FULL (buf_len + len >
+//     4096).
+//
+//   _le_get_buffer(out, out_cap) -> packed_u64
+//     Copies buf[0..buf_len) into out. Returns (bytes_written <<
+//     32) | status. LE_OK on success; LE_ERR_BAD_PTR (out == 0),
+//     LE_ERR_OUT_TOO_SMALL (out_cap < buf_len).
+//
+// Register maps (SysV):
+//
+//   _le_init()                                              -> ()
+//   _le_reset()                                             -> ()
+//   _le_dispatch_key(rdi)                                   -> rax
+//   _le_insert_bytes(rdi, rsi)                              -> rax
+//   _le_get_buffer(rdi, rsi)                                -> rax
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE  --  0x5400..0x54FF
+// =============================================================================
+//
+// Line-editor packed-status range. Seven slots used at R229.M6:
+//
+//   LE_OK                   = 0
+//   LE_ERR_BUF_FULL         = 0x5400  (insert would push buf_len past
+//                                      LE_BUF_BYTES = 4096)
+//   LE_ERR_BAD_PTR          = 0x5401  (ptr/out == 0)
+//   LE_ERR_OUT_TOO_SMALL    = 0x5402  (_le_get_buffer: out_cap <
+//                                      buf_len)
+//   LE_ERR_BAD_KEY          = 0x5403  (_le_dispatch_key: unbound
+//                                      control byte)
+//   LE_ERR_UTF8             = 0x5404  (_gi_next_cluster /
+//                                      _gi_prev_cluster reported
+//                                      INVALID_UTF8 at the cursor)
+//   LE_ERR_BAD_LEN          = 0x5405  (_le_insert_bytes: len == 0,
+//                                      or _le_dispatch_key insert
+//                                      derived a 0-byte run from a
+//                                      0x80..0xFF high-bit byte run)
+//   LE_META_PENDING         = 0x5406  (ESC latched; next dispatch
+//                                      treats its byte as M-prefixed)
+//
+// Slots 0x5407..0x54FF reserved for R229.M6.1+ follow-ups
+// (LE_ERR_HISTORY_UNAVAILABLE on a C-r hit when History is empty,
+// LE_ERR_MULTILINE_NESTED on nested-multiline wire-up, etc.).
+//
+// Disjoint from every other parser-tier packed-status band
+// (0x27 utf8_nfc / 0x2A schemas_sig / 0x2B pipeline / 0x2C
+// lambda_lit / 0x2D hm_core / 0x2E datalog / 0x30 repl_loop
+// kernel-side / 0x33 command_sig / 0x34 record_projection /
+// 0x35 closure_capture / 0x36 row_types / 0x37 session_env /
+// 0x38 grapheme_iter / 0x39 functor_instance / 0x3C arg_flag_spec
+// / 0x3D type_env / 0x3E effect_row / 0x3F width_pass /
+// 0x40 utf8_nfc_m2 / 0x42 ctx_lexer / 0x43 cap_row / 0x44 ast
+// / 0x45 cmd_registry / 0x46 let_scope / 0x47 dispatch_mode /
+// 0x48 span_map / 0x49 effect_unify / 0x4A fuzz_harness /
+// 0x4C filter_op / 0x4D sort_group_reduce / 0x4E job_control /
+// 0x4F describe_sig / 0x50 pipeline_lambda / 0x51 history /
+// 0x54 THIS). Bands 0x52 / 0x53 remain reserved; R229.M6 skips
+// to 0x54 to keep the disjointness proof straightforward.
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R221.M2 (grapheme_iter.pdx) -- `_gi_next_cluster` /
+//     `_gi_prev_cluster` provide the TR#29-aware cursor-advance
+//     primitives C-b / C-f / C-d / M-d need. INVALID_UTF8 from the
+//     substrate surfaces as LE_ERR_UTF8 at this tier.
+//
+//   R229.M5 (history.pdx) -- `_h_search_substring` + `_h_get_turn`
+//     back C-r. On a hit, this module overwrites the line buffer
+//     with the matching turn's cmd_inline (64 B zero-padded) and
+//     snaps cursor to the new buf_len.
+//
+//   R229.M1 (repl_loop.pdx, kernel) -- drives per-cycle state;
+//     calls `_le_dispatch_key` for every byte read in the READING
+//     state; on RET-commit (byte 0x0A / 0x0D) calls `_le_get_buffer`
+//     to extract the line, calls `_h_append` to record it, then
+//     `_le_reset` to prepare the next prompt. The RET-commit itself
+//     is NOT a binding at THIS tier -- the REPL loop sees RET first
+//     and skips the editor dispatch for that byte.
+//
+//   R221.M3 (width_pass.pdx) -- renders the cursor column at prompt-
+//     redraw time by walking buf[0..cursor_byte) via `_wp_cols`.
+//     This module does NOT call into width_pass directly; the
+//     cursor_cluster scalar is a hint the renderer can use to skip
+//     the walk when the single-byte-insert fast path kept it
+//     synchronised with cursor_byte.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32; the low-
+//     byte mask `and rax, 0xFF` fits imm32 with bit 31 clear.
+//   - No 2-op `imul r, imm` -- no stride multiplies at this tier
+//     (buffers are byte-indexed; no record stride).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `LineEditor` matches `line_editor.pdx`.
+//   - Labels prefixed `le_` with per-function suffix (`le_ini_`,
+//     `le_rst_`, `le_disp_`, `le_ins_`, `le_gb_`, `le_shiftR_`,
+//     `le_shiftL_`). No bare `loop`, `if`, `let`, `fn`, `ret`, or
+//     `done` reserved-keyword labels; disjoint from `ss_` / `sh_` /
+//     `sj_` / `hf_` / `cr_` / `rl_` / `se_` / `te_` / `jc_` /
+//     `h_` kernel + sibling parser-tier namespaces.
+//   - All `cmp reg, imm` immediates (0, 1, 2, 4, 5, 6, 11, 12, 18,
+//     21, 23, 25, 27, 32, 64, 127, 128, 4096, 1024, 0x1B, 0x20,
+//     0x7E, 0x7F, 0x80, 0x3800, 0x5400..0x5406, 'f'=0x66, 'b'=0x62,
+//     'd'=0x64) fit imm32 with bit 31 clear so direct cmp-imm32
+//     is sign-safe. No MOVABS staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + disp]`.
+//   - Byte stores via `mov_b [dst + disp], reg`.
+//   - u64 stores via plain `mov [dst + disp], reg`.
+//   - `.bss` writes via `lea r11, [rip + sym]; mov [r11], reg`.
+//   - `_le_dispatch_key` has one 6-push callee-save frame + sub rsp
+//     8 pad giving rsp%16==0 at every nested CALL (entry rsp%16==8;
+//     48 B pushes + 8 B pad = 56 B; (8+56) mod 16 = 0). Nested
+//     CALLs: `_gi_next_cluster`, `_gi_prev_cluster`,
+//     `_h_search_substring`, `_h_get_turn` are all inside this
+//     frame. `_le_insert_bytes` and `_le_get_buffer` are pure
+//     leaves with zero pushes. `_le_init` and `_le_reset` are
+//     pure leaves.
+//   - r11 is NEVER held across a nested CALL -- values that survive
+//     go in r12..r15 or stack.
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R229.M6.1  Multi-line edit: a leading backslash before LF opens
+//              a continuation; the editor keeps the LF in buf and
+//              draws a continuation prompt on the next line.
+//   R229.M6.2  Syntax highlighting hook: a per-cluster colour attr
+//              array parallel to `_le_buf`, populated by the parser-
+//              tier lexer at tokenise-time.
+//   R229.M6.3  C-s forward-i-search (symmetric to C-r).
+//   R229.M6.4  Fingerprint goldens for the smoke-mode asserter:
+//              13 OK + 7 REJ tags, keyed to each binding in §1.
+//   R229.M6.5  Vi-mode state machine (adjacent band 0x5500..0x55FF).
+//
+// =============================================================================
+// Upstream: paideia-os#2493 (R229 REPL evaluator umbrella),
+// paideia-os#2724 (THIS ticket, R229.M6 Line editor emacs-mode),
+// paideia-os#2723 (R229.M5 History), paideia-os#2652 (R221.M2
+// GraphemeIter). Design docs: design/shell/line-editor-emacs.md,
+// design/terminal/editor-bindings.md §1.
+
+module LineEditor = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax; low 32 bits)
+  // ==========================================================================
+
+  pub let LE_OK                   : u64 = 0
+  pub let LE_ERR_BUF_FULL         : u64 = 0x5400
+  pub let LE_ERR_BAD_PTR          : u64 = 0x5401
+  pub let LE_ERR_OUT_TOO_SMALL    : u64 = 0x5402
+  pub let LE_ERR_BAD_KEY          : u64 = 0x5403
+  pub let LE_ERR_UTF8             : u64 = 0x5404
+  pub let LE_ERR_BAD_LEN          : u64 = 0x5405
+  pub let LE_META_PENDING         : u64 = 0x5406
+
+  // ==========================================================================
+  // SECTION 2 -- LAYOUT CONSTANTS
+  // ==========================================================================
+
+  pub let LE_BUF_BYTES            : u64 = 4096
+  pub let LE_KILL_BYTES           : u64 = 1024
+  pub let LE_HIST_INLINE_BYTES    : u64 = 64    // History cmd_inline window
+
+  // Key bytes for the emacs bindings.
+  pub let LE_KEY_CTRL_A           : u64 = 0x01
+  pub let LE_KEY_CTRL_B           : u64 = 0x02
+  pub let LE_KEY_CTRL_D           : u64 = 0x04
+  pub let LE_KEY_CTRL_E           : u64 = 0x05
+  pub let LE_KEY_CTRL_F           : u64 = 0x06
+  pub let LE_KEY_CTRL_K           : u64 = 0x0B
+  pub let LE_KEY_CTRL_L           : u64 = 0x0C
+  pub let LE_KEY_CTRL_R           : u64 = 0x12
+  pub let LE_KEY_CTRL_U           : u64 = 0x15
+  pub let LE_KEY_CTRL_W           : u64 = 0x17
+  pub let LE_KEY_CTRL_Y           : u64 = 0x19
+  pub let LE_KEY_ESC              : u64 = 0x1B
+  pub let LE_KEY_META_F           : u64 = 0x66  // 'f'
+  pub let LE_KEY_META_B           : u64 = 0x62  // 'b'
+  pub let LE_KEY_META_D           : u64 = 0x64  // 'd'
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _le_buf              : [u8; 4096] = uninit @align(8)
+  pub let mut _le_buf_len          : u64        = uninit @align(8)
+  pub let mut _le_cursor_byte      : u64        = uninit @align(8)
+  pub let mut _le_cursor_cluster   : u64        = uninit @align(8)
+  pub let mut _le_kill_buf         : [u8; 1024] = uninit @align(8)
+  pub let mut _le_kill_len         : u64        = uninit @align(8)
+  pub let mut _le_meta_pending     : u64        = uninit @align(8)
+  pub let mut _le_last_search_turn : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // _le_init() -> ()
+  //
+  //   Boot hook. Defensive scrub of the seven u64 scalars (56 B).
+  //   Byte pools (`_le_buf`, `_le_kill_buf`) are NOT scrubbed --
+  //   their invariants read only bytes in [0, *_len).
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed le_ini_.
+  // ==========================================================================
+  pub let _le_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M6 (#2724): defensive scrub of the seven u64 scalars (_le_buf_len, _le_cursor_byte, _le_cursor_cluster, _le_kill_len, _le_meta_pending, _le_last_search_turn). Byte pools (`_le_buf`, `_le_kill_buf`) are NOT scrubbed because `.bss` zero-init already satisfies the \"only read bytes in [0, *_len)\" invariant at cold boot. Pure leaf; zero pushes; no stack frame; no nested CALL. Each store is `lea r11, [rip + sym]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed le_ini_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _le_buf_len];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_kill_len];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_meta_pending];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_last_search_turn];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _le_reset() -> ()
+  //
+  //   Clear buffer + cursor state. Called by the REPL after a RET-
+  //   commit so the next prompt starts with a clean line. Does NOT
+  //   clear the kill buffer (yank should survive across lines, same
+  //   as GNU Readline / Emacs discipline).
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed le_rst_.
+  // ==========================================================================
+  pub let _le_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M6 (#2724): clear line buffer length + cursor scalars + meta-pending + last-search-turn after a RET-commit. Preserves kill buffer bytes across lines (yank survives per emacs/readline convention). Pure leaf; zero pushes; no stack frame; no nested CALL. Each store is `lea r11, [rip + sym]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed le_rst_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _le_buf_len];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_meta_pending];
+        mov [r11], rax;
+
+        lea r11, [rip + _le_last_search_turn];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _le_insert_bytes(ptr, len) -> status
+  //
+  //   rdi = ptr
+  //   rsi = len
+  //   rax = LE_OK / LE_ERR_BAD_PTR / LE_ERR_BAD_LEN / LE_ERR_BUF_FULL
+  //
+  //   Shifts buf[cursor..buf_len) right by `len` bytes and copies
+  //   [ptr, ptr+len) into buf[cursor..cursor+len). Bumps buf_len
+  //   and cursor_byte by `len`. cursor_cluster is NOT bumped here
+  //   -- callers that insert multi-byte sequences re-sync via an
+  //   explicit _gi_count_clusters call; single-byte ASCII inserts
+  //   routed through _le_dispatch_key bump cursor_cluster inline.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed le_ins_.
+  // ==========================================================================
+  pub let _le_insert_bytes : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M6 (#2724): insert `len` bytes from `ptr` at `_le_cursor_byte`. Pure leaf; zero pushes; no stack frame; no nested CALL (shifts and copies are inlined). Guards: len != 0 (LE_ERR_BAD_LEN); ptr != 0 (LE_ERR_BAD_PTR); _le_buf_len + len <= LE_BUF_BYTES (LE_ERR_BUF_FULL). Shift-right walk: let n = buf_len - cursor; copy buf[cursor + i] -> buf[cursor + len + i] for i = n-1 .. 0 (walk DOWN to avoid aliasing). Copy src bytes: buf[cursor + i] := ptr[i] for i = 0 .. len-1. Bump buf_len += len; cursor_byte += len. Byte loads via `xor rax, rax; mov_b rax, [base + idx]`; byte stores via `mov_b [base + idx], reg`. All cmp immediates (0, 4096, 0x5400, 0x5401, 0x5405) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed le_ins_.",
+      block: {
+        // ---- Guard: len > 0.
+        cmp rsi, 0;
+        je  le_ins_bad_len;
+
+        // ---- Guard: ptr != 0.
+        cmp rdi, 0;
+        je  le_ins_bad_ptr;
+
+        // ---- Load buf_len; check buf_len + len <= LE_BUF_BYTES.
+        lea r11, [rip + _le_buf_len];
+        mov rax, [r11];                  // rax = buf_len
+        mov rdx, rax;                    // rdx = buf_len (saved)
+        add rax, rsi;
+        cmp rax, 4096;                   // LE_BUF_BYTES
+        ja  le_ins_buf_full;
+
+        // ---- Load cursor_byte.
+        lea r11, [rip + _le_cursor_byte];
+        mov rcx, [r11];                  // rcx = cursor_byte
+
+        // ---- Compute n = buf_len - cursor_byte (tail length).
+        mov r8, rdx;                     // r8 = buf_len
+        sub r8, rcx;                     // r8 = tail_len
+
+        // ---- Shift-right loop: for i = tail_len-1 .. 0:
+        //        buf[cursor + len + i] := buf[cursor + i].
+        //      We walk DOWN. r9 is i; r10 is a scratch byte.
+        //      Precompute src_base = &_le_buf + cursor, dst_base =
+        //      src_base + len. Both bases are register values so no
+        //      [reg + reg + reg] 3-op addressing is needed.
+        lea r11, [rip + _le_buf];
+        add r11, rcx;                    // r11 = src_base = &buf[cursor]
+        mov r10, r11;                    // r10 = also src_base (we need
+                                         //       it after r11 is reused)
+        // We'll use r11 as scratch; recompute dst_base when needed.
+
+        mov r9, r8;                      // r9 = i = tail_len
+      le_ins_shift_r:
+        cmp r9, 0;
+        je  le_ins_shift_r_done;
+        sub r9, 1;                       // i -= 1 (walk DOWN)
+        // Load src[i].
+        xor rax, rax;
+        mov_b rax, [r10 + r9 * 1];       // rax = src_base[i]
+        // Compute dst[i] address: src_base + len + i; we have src_base
+        // in r10 and len in rsi. Reuse r11.
+        mov r11, r10;
+        add r11, rsi;                    // r11 = dst_base
+        mov_b [r11 + r9 * 1], rax;       // dst_base[i] := rax
+        jmp le_ins_shift_r;
+
+      le_ins_shift_r_done:
+
+        // ---- Copy src bytes: for i = 0 .. len-1:
+        //        buf[cursor + i] := ptr[i].
+        //      src_base in r10 (= &buf[cursor]).
+        xor r9, r9;                      // j = 0
+      le_ins_copy:
+        cmp r9, rsi;
+        jae le_ins_copy_done;
+        xor rax, rax;
+        mov_b rax, [rdi + r9 * 1];       // rax = ptr[j]
+        mov_b [r10 + r9 * 1], rax;       // buf[cursor + j] := rax
+        add r9, 1;
+        jmp le_ins_copy;
+
+      le_ins_copy_done:
+
+        // ---- Update buf_len += len, cursor_byte += len.
+        lea r11, [rip + _le_buf_len];
+        mov rax, [r11];
+        add rax, rsi;
+        mov [r11], rax;
+
+        lea r11, [rip + _le_cursor_byte];
+        mov rax, [r11];
+        add rax, rsi;
+        mov [r11], rax;
+
+        xor rax, rax;                    // LE_OK
+        ret;
+
+      le_ins_bad_len:
+        mov rax, 0x5405;                 // LE_ERR_BAD_LEN
+        ret;
+
+      le_ins_bad_ptr:
+        mov rax, 0x5401;                 // LE_ERR_BAD_PTR
+        ret;
+
+      le_ins_buf_full:
+        mov rax, 0x5400;                 // LE_ERR_BUF_FULL
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _le_get_buffer(out, out_cap) -> packed_u64
+  //
+  //   rdi = out
+  //   rsi = out_cap
+  //   rax = (bytes_written << 32) | status
+  //
+  //   Copies buf[0..buf_len) into out. On OK bytes_written == buf_len.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed le_gb_.
+  // ==========================================================================
+  pub let _le_get_buffer : (u64, u64) -> u64 !{mem} @{} =
+    fn (out: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M6 (#2724): copy buf[0..buf_len) into caller buffer. Pure leaf; zero pushes; no stack frame; no nested CALL. Guards: out != 0 (LE_ERR_BAD_PTR); out_cap >= buf_len (LE_ERR_OUT_TOO_SMALL). Byte-by-byte copy loop (buf_len <= 4096 so at most 4096 iters; the acceptance test's lines are typically < 256 B). Return (buf_len << 32) | LE_OK. Byte loads via `xor rax, rax; mov_b rax, [base + idx]`; byte stores via `mov_b [base + idx], reg`. All cmp immediates (0, 0x5401, 0x5402) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed le_gb_.",
+      block: {
+        // ---- Guard: out != 0.
+        cmp rdi, 0;
+        je  le_gb_bad_ptr;
+
+        // ---- Load buf_len.
+        lea r11, [rip + _le_buf_len];
+        mov rdx, [r11];                  // rdx = buf_len
+
+        // ---- Guard: out_cap >= buf_len.
+        cmp rsi, rdx;
+        jb  le_gb_oos;
+
+        // ---- Compute src_base = &_le_buf.
+        lea r11, [rip + _le_buf];        // r11 = src_base
+        mov rcx, r11;                    // rcx = src_base (stable)
+
+        // ---- Copy loop: for i = 0 .. buf_len-1: out[i] := buf[i].
+        xor r9, r9;
+      le_gb_copy:
+        cmp r9, rdx;
+        jae le_gb_done;
+        xor rax, rax;
+        mov_b rax, [rcx + r9 * 1];
+        mov_b [rdi + r9 * 1], rax;
+        add r9, 1;
+        jmp le_gb_copy;
+
+      le_gb_done:
+        // ---- Pack (buf_len << 32) | LE_OK.
+        mov rax, rdx;
+        shl rax, 32;
+        ret;
+
+      le_gb_bad_ptr:
+        mov rax, 0x5401;                 // LE_ERR_BAD_PTR
+        ret;
+
+      le_gb_oos:
+        mov rax, 0x5402;                 // LE_ERR_OUT_TOO_SMALL
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _le_dispatch_key(key_u32) -> status
+  //
+  //   rdi = key_u32 (low 8 bits used)
+  //   rax = LE_OK / LE_META_PENDING / LE_ERR_BAD_KEY / LE_ERR_BUF_FULL
+  //         / LE_ERR_UTF8 / LE_ERR_BAD_LEN
+  //
+  //   Handles exactly one keystroke. Each binding transition mutates
+  //   `.bss` state directly; the status in rax reports success or a
+  //   fault at the edit tier.
+  //
+  // Register plan (6-push + 8-byte align pad, nested-CALL frame):
+  //   rbx = key low byte (saved input)
+  //   rbp = kill_target_start (for C-u / C-w: start of kill span)
+  //   r12 = kill_target_end   (end of kill span, exclusive)
+  //   r13 = scratch_1 (loop cursors)
+  //   r14 = scratch_2 (buf base cache or inner cursor)
+  //   r15 = scratch_3 (cluster-boundary scratch across _gi_* CALLs)
+  // Nested CALLs: `_gi_next_cluster`, `_gi_prev_cluster`,
+  //               `_h_search_substring`, `_h_get_turn`.
+  //
+  // Labels prefixed le_disp_ (with per-binding suffixes).
+  // ==========================================================================
+  pub let _le_dispatch_key : (u64) -> u64 !{mem} @{} =
+    fn (key_u32: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M6 (#2724): dispatch one keystroke onto the emacs-mode binding table and mutate `.bss` state. 6 callee-save pushes (rbx=key_byte, rbp=kill_start, r12=kill_end, r13=scratch_1, r14=scratch_2, r15=scratch_3) + sub rsp 8 pad -> rsp%16==0 steady at every nested CALL (entry rsp%16==8, +48 pushes = %16==8, +8 pad -> %16==0). Nested CALLs: _gi_next_cluster (R221.M2), _gi_prev_cluster (R221.M2), _h_search_substring (R229.M5), _h_get_turn (R229.M5). Flow: extract low byte via `mov rax, rdi; and rax, 0xFF` (imm32-safe, bit 31 clear). Load _le_meta_pending; iff 1, clear it, dispatch M-f / M-b / M-d; else dispatch control-byte table; else dispatch ESC (set meta_pending, return LE_META_PENDING); else dispatch printable/non-ASCII byte via _le_insert_bytes (reuses `rdi, rsi` as (buf_cursor_addr, 1) across one caller-save pass -- here inlined to stay a single frame). Each binding handler is a labeled block that modifies `.bss` and jumps to le_disp_ok (LE_OK) or le_disp_err_* (status). All cmp immediates (0, 1, 2, 4, 5, 6, 11, 12, 18, 21, 23, 25, 27, 32, 64, 127, 128, 1024, 4096, 'b'=0x62, 'd'=0x64, 'f'=0x66, 0x1B, 0x20, 0x7E, 0x7F, 0x80, 0xFF, 0x3800, 0x5400..0x5406) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. Byte loads via `xor rax, rax; mov_b rax, [base + idx]`; byte stores via `mov_b [base + idx], reg`. r11 is caller-save and never held across a nested CALL (we re-lea every time). The six nested CALLs are to pure-leaf-returning sibling modules that do not touch LineEditor .bss. No test; no and-imm64 (0xFF, 0x7F fit imm8); no imul-r-imm; no multiline let. Labels prefixed le_disp_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                      // align pad for nested CALLs
+
+        // ---- Extract low byte of key.
+        mov rax, rdi;
+        and rax, 0xFF;                   // imm32-safe
+        mov rbx, rax;                    // rbx = key_byte
+
+        // ---- Check meta_pending latch.
+        lea r11, [rip + _le_meta_pending];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  le_disp_not_meta;
+
+        // Meta is latched; clear it and dispatch M-prefixed binding.
+        xor rax, rax;
+        lea r11, [rip + _le_meta_pending];
+        mov [r11], rax;
+
+        cmp rbx, 0x66;                   // 'f' -> M-f
+        je  le_disp_meta_f;
+        cmp rbx, 0x62;                   // 'b' -> M-b
+        je  le_disp_meta_b;
+        cmp rbx, 0x64;                   // 'd' -> M-d
+        je  le_disp_meta_d;
+        jmp le_disp_bad_key;
+
+      le_disp_not_meta:
+        // ---- Control-byte table.
+        cmp rbx, 0x01;                   // C-a
+        je  le_disp_ctrl_a;
+        cmp rbx, 0x02;                   // C-b
+        je  le_disp_ctrl_b;
+        cmp rbx, 0x04;                   // C-d
+        je  le_disp_ctrl_d;
+        cmp rbx, 0x05;                   // C-e
+        je  le_disp_ctrl_e;
+        cmp rbx, 0x06;                   // C-f
+        je  le_disp_ctrl_f;
+        cmp rbx, 0x0B;                   // C-k
+        je  le_disp_ctrl_k;
+        cmp rbx, 0x0C;                   // C-l (no-op at this tier)
+        je  le_disp_ok;
+        cmp rbx, 0x12;                   // C-r
+        je  le_disp_ctrl_r;
+        cmp rbx, 0x15;                   // C-u
+        je  le_disp_ctrl_u;
+        cmp rbx, 0x17;                   // C-w
+        je  le_disp_ctrl_w;
+        cmp rbx, 0x19;                   // C-y
+        je  le_disp_ctrl_y;
+        cmp rbx, 0x1B;                   // ESC -> latch meta_pending
+        je  le_disp_esc;
+
+        // ---- Insertion path: printable ASCII (0x20..0x7E) or
+        //      non-ASCII (0x80..0xFF). Else bad key.
+        cmp rbx, 0x20;
+        jb  le_disp_bad_key;
+        cmp rbx, 0x7F;                   // DEL: reject
+        je  le_disp_bad_key;
+        // All other 0x20..0x7E / 0x80..0xFF -> insert one byte.
+        jmp le_disp_insert_byte;
+
+        // -----------------------------------------------------------
+        // C-a: cursor_byte := 0; cursor_cluster := 0.
+        // -----------------------------------------------------------
+      le_disp_ctrl_a:
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-e: cursor_byte := buf_len. cursor_cluster re-synced
+        // best-effort by setting it to a sentinel the renderer
+        // reinterprets via _wp_cols (we leave the hint untouched;
+        // the renderer walks when cursor_cluster < cursor_byte-tr-
+        // boundary and skips when equal to the ASCII fast-path
+        // count).
+        // -----------------------------------------------------------
+      le_disp_ctrl_e:
+        lea r11, [rip + _le_buf_len];
+        mov rax, [r11];
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-f: cursor := _gi_next_cluster(buf, buf_len, cursor).
+        // -----------------------------------------------------------
+      le_disp_ctrl_f:
+        lea r11, [rip + _le_buf];
+        mov rdi, r11;
+        lea r11, [rip + _le_buf_len];
+        mov rsi, [r11];
+        lea r11, [rip + _le_cursor_byte];
+        mov rdx, [r11];
+        call _gi_next_cluster;
+        // rax = (next_cursor << 32) | status (0 OK, 1 EOF, 0x3800
+        // INVALID_UTF8). Mask status via mov + and 0xFFFFFFFF would
+        // alias the 0x3800 case (low byte 0x00 == OK); instead use
+        // a 32-bit compare after extracting.
+        mov r13, rax;                    // r13 = packed
+        mov r14, rax;
+        shl r14, 32;
+        shr r14, 32;                     // r14 = status (low 32)
+        cmp r14, 0x3800;
+        je  le_disp_utf8_err;
+        cmp r14, 0;
+        jne le_disp_ok;                  // EOF/BOF status 1: no movement
+        // OK or EOF (both leave cursor at a valid boundary).
+        // Extract next_cursor.
+        shr r13, 32;
+        // Write back.
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r13;
+        // Bump cursor_cluster by 1 (one cluster advanced).
+        lea r11, [rip + _le_cursor_cluster];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-b: cursor := _gi_prev_cluster(buf, buf_len, cursor).
+        // -----------------------------------------------------------
+      le_disp_ctrl_b:
+        lea r11, [rip + _le_buf];
+        mov rdi, r11;
+        lea r11, [rip + _le_buf_len];
+        mov rsi, [r11];
+        lea r11, [rip + _le_cursor_byte];
+        mov rdx, [r11];
+        call _gi_prev_cluster;
+        mov r13, rax;
+        mov r14, rax;
+        shl r14, 32;
+        shr r14, 32;
+        cmp r14, 0x3800;
+        je  le_disp_utf8_err;
+        cmp r14, 0;
+        jne le_disp_ok;                  // EOF/BOF status 1: no movement
+        // OK or BOF (both leave cursor at a valid boundary).
+        shr r13, 32;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r13;
+        // Decrement cursor_cluster (don't underflow below 0).
+        lea r11, [rip + _le_cursor_cluster];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  le_disp_ok;
+        sub rax, 1;
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-d: delete cluster at cursor.
+        //   next := _gi_next_cluster(buf, buf_len, cursor).
+        //   if cursor < buf_len: shift buf[next..buf_len) left to
+        //     buf[cursor..]; buf_len -= (next - cursor).
+        //   cursor_cluster unchanged (we're deleting the cluster
+        //     AT the cursor, so cluster-count-to-cursor is preserved
+        //     within numerical sanity for the renderer hint).
+        // -----------------------------------------------------------
+      le_disp_ctrl_d:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];                  // r15 = buf_len (saved)
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];                  // r14 = cursor (saved)
+        // At EOL (cursor == buf_len): no-op OK.
+        cmp r14, r15;
+        jae le_disp_ok;
+        // Call _gi_next_cluster to find deletion end.
+        lea r11, [rip + _le_buf];
+        mov rdi, r11;
+        mov rsi, r15;
+        mov rdx, r14;
+        call _gi_next_cluster;
+        mov r13, rax;
+        mov rax, r13;
+        shl rax, 32;
+        shr rax, 32;
+        cmp rax, 0x3800;
+        je  le_disp_utf8_err;
+        shr r13, 32;                     // r13 = next
+        // Shift-left loop: buf[cursor + i] := buf[next + i] for
+        // i = 0 .. buf_len - next - 1.
+        //    rbp = i; r12 = tail_count = buf_len - next.
+        //    rsi/rdi scratch for addresses.
+        lea r11, [rip + _le_buf];
+        mov r14, r11;                    // r14 = &buf (recomputed)
+        // Reload cursor from .bss (we had it before CALL).
+        lea r11, [rip + _le_cursor_byte];
+        mov rbp, [r11];                  // rbp = cursor
+        // tail_count = buf_len - next
+        mov r12, r15;
+        sub r12, r13;
+        // src_base = &buf + next; dst_base = &buf + cursor.
+        mov rsi, r14;
+        add rsi, r13;                    // rsi = src_base
+        mov rdi, r14;
+        add rdi, rbp;                    // rdi = dst_base
+        xor r14, r14;                    // r14 = i
+      le_disp_cd_shift:
+        cmp r14, r12;
+        jae le_disp_cd_shift_done;
+        xor rax, rax;
+        mov_b rax, [rsi + r14 * 1];
+        mov_b [rdi + r14 * 1], rax;
+        add r14, 1;
+        jmp le_disp_cd_shift;
+      le_disp_cd_shift_done:
+        // buf_len -= (next - cursor).
+        mov rax, r13;
+        sub rax, rbp;                    // rax = deleted_len
+        lea r11, [rip + _le_buf_len];
+        mov rdx, [r11];
+        sub rdx, rax;
+        mov [r11], rdx;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-k: kill := buf[cursor..buf_len); buf_len := cursor.
+        // -----------------------------------------------------------
+      le_disp_ctrl_k:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];                  // r15 = buf_len
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];                  // r14 = cursor
+        // kill_len = buf_len - cursor; clamp to LE_KILL_BYTES.
+        mov r13, r15;
+        sub r13, r14;                    // r13 = kill_len
+        cmp r13, 1024;                   // LE_KILL_BYTES
+        jbe le_disp_ck_len_ok;
+        mov r13, 1024;
+      le_disp_ck_len_ok:
+        // Copy buf[cursor..cursor+kill_len) -> kill_buf[0..kill_len).
+        lea r11, [rip + _le_buf];
+        mov rsi, r11;
+        add rsi, r14;                    // rsi = src_base
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;                    // rdi = kill_dst
+        xor rbp, rbp;                    // j = 0
+      le_disp_ck_copy:
+        cmp rbp, r13;
+        jae le_disp_ck_copy_done;
+        xor rax, rax;
+        mov_b rax, [rsi + rbp * 1];
+        mov_b [rdi + rbp * 1], rax;
+        add rbp, 1;
+        jmp le_disp_ck_copy;
+      le_disp_ck_copy_done:
+        // Store kill_len, truncate buf_len to cursor.
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r13;
+        lea r11, [rip + _le_buf_len];
+        mov [r11], r14;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-u: kill := buf[0..cursor); shift buf[cursor..buf_len)
+        //      left to buf[0..]; buf_len -= cursor; cursor := 0.
+        // -----------------------------------------------------------
+      le_disp_ctrl_u:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];                  // r15 = buf_len
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];                  // r14 = cursor
+        // kill_len = min(cursor, LE_KILL_BYTES).
+        mov r13, r14;
+        cmp r13, 1024;
+        jbe le_disp_cu_len_ok;
+        mov r13, 1024;
+      le_disp_cu_len_ok:
+        // Copy buf[0..kill_len) -> kill_buf.
+        lea r11, [rip + _le_buf];
+        mov rsi, r11;                    // rsi = src = &buf
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;                    // rdi = kill_dst
+        xor rbp, rbp;
+      le_disp_cu_kill_copy:
+        cmp rbp, r13;
+        jae le_disp_cu_kill_done;
+        xor rax, rax;
+        mov_b rax, [rsi + rbp * 1];
+        mov_b [rdi + rbp * 1], rax;
+        add rbp, 1;
+        jmp le_disp_cu_kill_copy;
+      le_disp_cu_kill_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r13;
+        // Shift buf[cursor..buf_len) left to buf[0..buf_len-cursor).
+        //    r12 = tail_count = buf_len - cursor.
+        mov r12, r15;
+        sub r12, r14;
+        lea r11, [rip + _le_buf];
+        mov rsi, r11;
+        add rsi, r14;                    // rsi = src = &buf[cursor]
+        mov rdi, r11;                    // rdi = dst = &buf
+        xor rbp, rbp;
+      le_disp_cu_shift:
+        cmp rbp, r12;
+        jae le_disp_cu_shift_done;
+        xor rax, rax;
+        mov_b rax, [rsi + rbp * 1];
+        mov_b [rdi + rbp * 1], rax;
+        add rbp, 1;
+        jmp le_disp_cu_shift;
+      le_disp_cu_shift_done:
+        // buf_len -= cursor; cursor := 0; cursor_cluster := 0.
+        mov rax, r15;
+        sub rax, r14;
+        lea r11, [rip + _le_buf_len];
+        mov [r11], rax;
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-w: kill previous ASCII-whitespace-delimited word.
+        //   Walk left from cursor:
+        //     - skip trailing whitespace bytes (SP/TAB/LF/CR);
+        //     - skip non-whitespace bytes until the next whitespace
+        //       or buf start.
+        //   word_start = resulting position.
+        //   kill := buf[word_start..cursor); shift left; buf_len -=
+        //   (cursor - word_start); cursor := word_start.
+        //   M6 uses byte-level ASCII whitespace definition; multi-
+        //   byte-cluster-aware word-boundary refinement lands at
+        //   M6.5.
+        // -----------------------------------------------------------
+      le_disp_ctrl_w:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];                  // r15 = buf_len
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];                  // r14 = cursor
+        // At BOL: no-op.
+        cmp r14, 0;
+        je  le_disp_ok;
+        lea r11, [rip + _le_buf];
+        mov r13, r11;                    // r13 = &buf
+        mov rbp, r14;                    // rbp = scan cursor (word_end
+                                         //       initially == cursor)
+        // Phase 1: skip trailing whitespace while rbp > 0.
+      le_disp_cw_phase1:
+        cmp rbp, 0;
+        je  le_disp_cw_phase_done;
+        mov r12, rbp;
+        sub r12, 1;                      // index of byte-left-of-rbp
+        xor rax, rax;
+        mov_b rax, [r13 + r12 * 1];
+        // whitespace: SP (0x20), TAB (0x09), LF (0x0A), CR (0x0D).
+        cmp rax, 0x20;
+        je  le_disp_cw_phase1_step;
+        cmp rax, 0x09;
+        je  le_disp_cw_phase1_step;
+        cmp rax, 0x0A;
+        je  le_disp_cw_phase1_step;
+        cmp rax, 0x0D;
+        je  le_disp_cw_phase1_step;
+        // Non-whitespace found; enter phase 2.
+        jmp le_disp_cw_phase2;
+      le_disp_cw_phase1_step:
+        mov rbp, r12;
+        jmp le_disp_cw_phase1;
+
+      le_disp_cw_phase2:
+        // Phase 2: skip non-whitespace while rbp > 0.
+      le_disp_cw_phase2_top:
+        cmp rbp, 0;
+        je  le_disp_cw_phase_done;
+        mov r12, rbp;
+        sub r12, 1;
+        xor rax, rax;
+        mov_b rax, [r13 + r12 * 1];
+        cmp rax, 0x20;
+        je  le_disp_cw_phase_done;
+        cmp rax, 0x09;
+        je  le_disp_cw_phase_done;
+        cmp rax, 0x0A;
+        je  le_disp_cw_phase_done;
+        cmp rax, 0x0D;
+        je  le_disp_cw_phase_done;
+        mov rbp, r12;
+        jmp le_disp_cw_phase2_top;
+
+      le_disp_cw_phase_done:
+        // rbp = word_start. kill_len = cursor - word_start.
+        mov r12, r14;
+        sub r12, rbp;                    // r12 = kill_len
+        // At zero-length word (whitespace-only region before cursor):
+        // treat as whole-WS kill. Clamp kill_len to LE_KILL_BYTES.
+        cmp r12, 1024;
+        jbe le_disp_cw_len_ok;
+        mov r12, 1024;
+      le_disp_cw_len_ok:
+        // Copy buf[word_start..word_start+kill_len) -> kill_buf.
+        mov rsi, r13;
+        add rsi, rbp;                    // rsi = &buf[word_start]
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;
+        xor rax, rax;                    // rax = j
+      le_disp_cw_kill_copy:
+        cmp rax, r12;
+        jae le_disp_cw_kill_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp le_disp_cw_kill_copy;
+      le_disp_cw_kill_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r12;
+        // Shift buf[cursor..buf_len) left to buf[word_start..].
+        //    tail_count = buf_len - cursor.
+        mov rcx, r15;
+        sub rcx, r14;                    // rcx = tail_count
+        mov rsi, r13;
+        add rsi, r14;                    // rsi = src = &buf[cursor]
+        mov rdi, r13;
+        add rdi, rbp;                    // rdi = dst = &buf[word_start]
+        xor rax, rax;
+      le_disp_cw_shift:
+        cmp rax, rcx;
+        jae le_disp_cw_shift_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp le_disp_cw_shift;
+      le_disp_cw_shift_done:
+        // buf_len -= (cursor - word_start); cursor := word_start.
+        mov rax, r14;
+        sub rax, rbp;                    // rax = deleted_len
+        lea r11, [rip + _le_buf_len];
+        mov rdx, [r11];
+        sub rdx, rax;
+        mov [r11], rdx;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], rbp;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-y: insert kill_buf[0..kill_len) at cursor.
+        //      Shift-right identical to _le_insert_bytes.
+        // -----------------------------------------------------------
+      le_disp_ctrl_y:
+        lea r11, [rip + _le_kill_len];
+        mov r15, [r11];                  // r15 = kill_len
+        cmp r15, 0;
+        je  le_disp_ok;                  // empty kill: no-op
+        lea r11, [rip + _le_buf_len];
+        mov r14, [r11];                  // r14 = buf_len
+        // Guard: buf_len + kill_len <= LE_BUF_BYTES.
+        mov rax, r14;
+        add rax, r15;
+        cmp rax, 4096;
+        ja  le_disp_buf_full;
+        lea r11, [rip + _le_cursor_byte];
+        mov r13, [r11];                  // r13 = cursor
+        // Shift buf[cursor..buf_len) right by kill_len.
+        //    tail_count = buf_len - cursor.
+        //    walk DOWN i from tail_count-1 .. 0.
+        mov rcx, r14;
+        sub rcx, r13;                    // rcx = tail_count
+        lea r11, [rip + _le_buf];
+        mov rsi, r11;
+        add rsi, r13;                    // rsi = src_base = &buf[cursor]
+        mov rdi, rsi;
+        add rdi, r15;                    // rdi = dst_base = src + k_len
+        mov rbp, rcx;                    // rbp = i
+      le_disp_cy_shift:
+        cmp rbp, 0;
+        je  le_disp_cy_shift_done;
+        sub rbp, 1;
+        xor rax, rax;
+        mov_b rax, [rsi + rbp * 1];
+        mov_b [rdi + rbp * 1], rax;
+        jmp le_disp_cy_shift;
+      le_disp_cy_shift_done:
+        // Copy kill_buf[0..kill_len) -> buf[cursor..cursor+kill_len).
+        lea r11, [rip + _le_kill_buf];
+        mov rsi, r11;                    // rsi = kill_src
+        // rdi still points at src_base = &buf[cursor] (NO -- we
+        // overwrote it with dst_base). Recompute:
+        lea r11, [rip + _le_buf];
+        mov rdi, r11;
+        add rdi, r13;                    // rdi = &buf[cursor]
+        xor rax, rax;
+      le_disp_cy_copy:
+        cmp rax, r15;
+        jae le_disp_cy_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp le_disp_cy_copy;
+      le_disp_cy_copy_done:
+        // buf_len += kill_len; cursor += kill_len.
+        lea r11, [rip + _le_buf_len];
+        mov rax, [r11];
+        add rax, r15;
+        mov [r11], rax;
+        lea r11, [rip + _le_cursor_byte];
+        mov rax, [r11];
+        add rax, r15;
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // C-r: reverse-i-search.
+        //   needle := buf[0..buf_len);
+        //   call _h_search_substring(needle, buf_len, 0,
+        //                            &_le_last_search_turn, 1).
+        //   On a hit, overwrite buf with the matched turn's cmd_inline
+        //   (64 B window) and snap cursor_byte to the new buf_len.
+        //   On no-hit or empty needle: no-op OK.
+        //
+        //   Reuses `_le_last_search_turn` scalar as the out_turn_ids
+        //   buffer -- _h_search_substring writes u32s and we have 8
+        //   bytes available (ample for one entry).
+        // -----------------------------------------------------------
+      le_disp_ctrl_r:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];                  // r15 = needle_len
+        // Guard: needle must be non-empty and <= 64 (H_ERR_BAD_NEEDLE
+        // if 0 or > 64; we skip the search quietly on an empty line).
+        cmp r15, 0;
+        je  le_disp_ok;
+        cmp r15, 64;
+        ja  le_disp_ok;
+        // Clear last_search_turn slot (will receive u32 at [+0]).
+        xor rax, rax;
+        lea r11, [rip + _le_last_search_turn];
+        mov [r11], rax;
+        // Call _h_search_substring(needle, needle_len, 0, out, 1).
+        lea r11, [rip + _le_buf];
+        mov rdi, r11;                    // needle
+        mov rsi, r15;                    // needle_len
+        xor rdx, rdx;                    // start_turn = 0 (newest-first)
+        lea r11, [rip + _le_last_search_turn];
+        mov rcx, r11;                    // out_turn_ids
+        mov r8, 1;                       // max_results
+        call _h_search_substring;
+        // rax = (result_count << 32) | status.
+        // Extract result_count.
+        mov r13, rax;
+        shr r13, 32;                     // r13 = result_count
+        cmp r13, 0;
+        je  le_disp_ok;                  // no hits: silent OK
+        // Read matched turn_id (u32 at _le_last_search_turn).
+        lea r11, [rip + _le_last_search_turn];
+        xor rax, rax;
+        mov_d rax, [r11 + 0];            // rax = turn_id (u32 zero-ext)
+        mov r14, rax;                    // r14 = turn_id
+        // Stage a 128-byte scratch into the start of _le_buf itself:
+        // we'll overwrite the buffer post-call. Reuse the SECOND
+        // half of _le_kill_buf (bytes 896..1024) as a 128-byte
+        // scratch for the History record copy -- it fits (128 <=
+        // 1024 - 896 = 128 exact). We WRITE kill_len to 0 first so
+        // the kill is not corrupted (we're reclaiming scratch).
+        xor rax, rax;
+        lea r11, [rip + _le_kill_len];
+        mov [r11], rax;
+        // scratch_addr = &_le_kill_buf + 896.
+        lea r11, [rip + _le_kill_buf];
+        mov r15, r11;
+        add r15, 896;                    // r15 = scratch_addr
+        // Call _h_get_turn(turn_id, scratch, 128).
+        mov rdi, r14;
+        mov rsi, r15;
+        mov rdx, 128;
+        call _h_get_turn;
+        mov r13, rax;
+        shl r13, 32;
+        shr r13, 32;                     // r13 = status (low 32)
+        cmp r13, 0;
+        jne le_disp_ok;                  // non-OK: silent OK (bad turn)
+        // Extract 64-byte cmd_inline from [scratch + 32] (H_OFF_CMD_
+        // INLINE). Walk forward until first zero byte (short cmds
+        // zero-pad), capping at 64. Then overwrite _le_buf with it.
+        // Use r13 (not rbp) as the cmd_inline pointer so the memory
+        // operand `[r13 + idx * 1]` encodes without the rbp-base
+        // disp-forcing ModR/M special case.
+        mov r13, r15;
+        add r13, 32;                     // r13 = &cmd_inline[0]
+        xor r12, r12;                    // r12 = len
+      le_disp_cr_len:
+        cmp r12, 64;
+        jae le_disp_cr_len_done;
+        xor rax, rax;
+        mov_b rax, [r13 + r12 * 1];
+        cmp rax, 0;
+        je  le_disp_cr_len_done;
+        add r12, 1;
+        jmp le_disp_cr_len;
+      le_disp_cr_len_done:
+        // Copy cmd_inline[0..r12) -> _le_buf[0..r12).
+        lea r11, [rip + _le_buf];
+        mov rdi, r11;
+        xor rax, rax;
+      le_disp_cr_copy:
+        cmp rax, r12;
+        jae le_disp_cr_copy_done;
+        xor rdx, rdx;
+        mov_b rdx, [r13 + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp le_disp_cr_copy;
+      le_disp_cr_copy_done:
+        // Update buf_len, cursor_byte, cursor_cluster.
+        lea r11, [rip + _le_buf_len];
+        mov [r11], r12;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r12;
+        xor rax, rax;
+        lea r11, [rip + _le_cursor_cluster];
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // M-f: forward word.
+        //   From cursor, skip whitespace clusters, then skip non-
+        //   whitespace clusters. ASCII whitespace is SP/TAB/LF/CR.
+        //   M6 uses byte-level ASCII fast path; refinement to full
+        //   cluster-aware word boundaries lands at M6.5.
+        // -----------------------------------------------------------
+      le_disp_meta_f:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];
+        lea r11, [rip + _le_buf];
+        mov r13, r11;
+        // Phase 1: skip whitespace while r14 < r15.
+      le_disp_mf_phase1:
+        cmp r14, r15;
+        jae le_disp_mf_done;
+        xor rax, rax;
+        mov_b rax, [r13 + r14 * 1];
+        cmp rax, 0x20;
+        je  le_disp_mf_phase1_step;
+        cmp rax, 0x09;
+        je  le_disp_mf_phase1_step;
+        cmp rax, 0x0A;
+        je  le_disp_mf_phase1_step;
+        cmp rax, 0x0D;
+        je  le_disp_mf_phase1_step;
+        jmp le_disp_mf_phase2;
+      le_disp_mf_phase1_step:
+        add r14, 1;
+        jmp le_disp_mf_phase1;
+      le_disp_mf_phase2:
+        // Phase 2: skip non-whitespace while r14 < r15.
+        cmp r14, r15;
+        jae le_disp_mf_done;
+        xor rax, rax;
+        mov_b rax, [r13 + r14 * 1];
+        cmp rax, 0x20;
+        je  le_disp_mf_done;
+        cmp rax, 0x09;
+        je  le_disp_mf_done;
+        cmp rax, 0x0A;
+        je  le_disp_mf_done;
+        cmp rax, 0x0D;
+        je  le_disp_mf_done;
+        add r14, 1;
+        jmp le_disp_mf_phase2;
+      le_disp_mf_done:
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r14;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // M-b: back word. Walk left from cursor:
+        //   skip trailing whitespace;
+        //   skip non-whitespace.
+        //   The resulting position is the start of the previous word.
+        // -----------------------------------------------------------
+      le_disp_meta_b:
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];
+        lea r11, [rip + _le_buf];
+        mov r13, r11;
+      le_disp_mb_phase1:
+        cmp r14, 0;
+        je  le_disp_mb_done;
+        mov r12, r14;
+        sub r12, 1;
+        xor rax, rax;
+        mov_b rax, [r13 + r12 * 1];
+        cmp rax, 0x20;
+        je  le_disp_mb_phase1_step;
+        cmp rax, 0x09;
+        je  le_disp_mb_phase1_step;
+        cmp rax, 0x0A;
+        je  le_disp_mb_phase1_step;
+        cmp rax, 0x0D;
+        je  le_disp_mb_phase1_step;
+        jmp le_disp_mb_phase2;
+      le_disp_mb_phase1_step:
+        mov r14, r12;
+        jmp le_disp_mb_phase1;
+      le_disp_mb_phase2:
+        cmp r14, 0;
+        je  le_disp_mb_done;
+        mov r12, r14;
+        sub r12, 1;
+        xor rax, rax;
+        mov_b rax, [r13 + r12 * 1];
+        cmp rax, 0x20;
+        je  le_disp_mb_done;
+        cmp rax, 0x09;
+        je  le_disp_mb_done;
+        cmp rax, 0x0A;
+        je  le_disp_mb_done;
+        cmp rax, 0x0D;
+        je  le_disp_mb_done;
+        mov r14, r12;
+        jmp le_disp_mb_phase2;
+      le_disp_mb_done:
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r14;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // M-d: delete word forward.
+        //   Find word_end via M-f-style scan from cursor;
+        //   kill := buf[cursor..word_end);
+        //   shift left; buf_len -= (word_end - cursor).
+        // -----------------------------------------------------------
+      le_disp_meta_d:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];
+        lea r11, [rip + _le_buf];
+        mov r13, r11;
+        mov rbp, r14;                    // rbp = scan cursor (word_end
+                                         //       candidate)
+        // Phase 1: skip whitespace.
+      le_disp_md_phase1:
+        cmp rbp, r15;
+        jae le_disp_md_done_scan;
+        xor rax, rax;
+        mov_b rax, [r13 + rbp * 1];
+        cmp rax, 0x20;
+        je  le_disp_md_phase1_step;
+        cmp rax, 0x09;
+        je  le_disp_md_phase1_step;
+        cmp rax, 0x0A;
+        je  le_disp_md_phase1_step;
+        cmp rax, 0x0D;
+        je  le_disp_md_phase1_step;
+        jmp le_disp_md_phase2;
+      le_disp_md_phase1_step:
+        add rbp, 1;
+        jmp le_disp_md_phase1;
+      le_disp_md_phase2:
+        cmp rbp, r15;
+        jae le_disp_md_done_scan;
+        xor rax, rax;
+        mov_b rax, [r13 + rbp * 1];
+        cmp rax, 0x20;
+        je  le_disp_md_done_scan;
+        cmp rax, 0x09;
+        je  le_disp_md_done_scan;
+        cmp rax, 0x0A;
+        je  le_disp_md_done_scan;
+        cmp rax, 0x0D;
+        je  le_disp_md_done_scan;
+        add rbp, 1;
+        jmp le_disp_md_phase2;
+      le_disp_md_done_scan:
+        // rbp = word_end. kill_len = rbp - cursor.
+        mov r12, rbp;
+        sub r12, r14;                    // r12 = kill_len
+        cmp r12, 0;
+        je  le_disp_ok;                  // nothing to delete
+        // Clamp kill_len to LE_KILL_BYTES.
+        cmp r12, 1024;
+        jbe le_disp_md_len_ok;
+        mov r12, 1024;
+      le_disp_md_len_ok:
+        // Copy buf[cursor..cursor+kill_len) -> kill_buf.
+        mov rsi, r13;
+        add rsi, r14;                    // rsi = &buf[cursor]
+        lea r11, [rip + _le_kill_buf];
+        mov rdi, r11;
+        xor rax, rax;
+      le_disp_md_kill_copy:
+        cmp rax, r12;
+        jae le_disp_md_kill_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp le_disp_md_kill_copy;
+      le_disp_md_kill_done:
+        lea r11, [rip + _le_kill_len];
+        mov [r11], r12;
+        // Shift buf[word_end..buf_len) left to buf[cursor..].
+        //   tail_count = buf_len - word_end.
+        mov rcx, r15;
+        sub rcx, rbp;                    // rcx = tail_count
+        mov rsi, r13;
+        add rsi, rbp;                    // rsi = &buf[word_end]
+        mov rdi, r13;
+        add rdi, r14;                    // rdi = &buf[cursor]
+        xor rax, rax;
+      le_disp_md_shift:
+        cmp rax, rcx;
+        jae le_disp_md_shift_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi + rax * 1];
+        mov_b [rdi + rax * 1], rdx;
+        add rax, 1;
+        jmp le_disp_md_shift;
+      le_disp_md_shift_done:
+        // buf_len -= (word_end - cursor).
+        mov rax, rbp;
+        sub rax, r14;
+        lea r11, [rip + _le_buf_len];
+        mov rdx, [r11];
+        sub rdx, rax;
+        mov [r11], rdx;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // ESC: latch meta_pending = 1; return LE_META_PENDING.
+        // -----------------------------------------------------------
+      le_disp_esc:
+        mov rax, 1;
+        lea r11, [rip + _le_meta_pending];
+        mov [r11], rax;
+        mov rax, 0x5406;                 // LE_META_PENDING
+        jmp le_disp_epilogue;
+
+        // -----------------------------------------------------------
+        // Printable / non-ASCII byte: insert one byte at cursor.
+        // Buffer-full guard; shift-right by 1; store rbx at cursor.
+        // Bump buf_len, cursor_byte, cursor_cluster.
+        // -----------------------------------------------------------
+      le_disp_insert_byte:
+        lea r11, [rip + _le_buf_len];
+        mov r15, [r11];                  // r15 = buf_len
+        cmp r15, 4096;
+        jae le_disp_buf_full;
+        lea r11, [rip + _le_cursor_byte];
+        mov r14, [r11];                  // r14 = cursor
+        lea r11, [rip + _le_buf];
+        mov r13, r11;                    // r13 = &buf
+        // Shift-right walk DOWN: for i = buf_len-1 .. cursor:
+        //   buf[i+1] := buf[i].
+        //   r12 = i.
+        mov r12, r15;
+      le_disp_ib_shift:
+        cmp r12, r14;
+        jbe le_disp_ib_shift_done;
+        sub r12, 1;
+        xor rax, rax;
+        mov_b rax, [r13 + r12 * 1];
+        mov rbp, r12;
+        add rbp, 1;
+        mov_b [r13 + rbp * 1], rax;
+        jmp le_disp_ib_shift;
+      le_disp_ib_shift_done:
+        // Store the inserted byte at buf[cursor].
+        mov_b [r13 + r14 * 1], rbx;
+        // buf_len += 1; cursor_byte += 1.
+        add r15, 1;
+        lea r11, [rip + _le_buf_len];
+        mov [r11], r15;
+        add r14, 1;
+        lea r11, [rip + _le_cursor_byte];
+        mov [r11], r14;
+        // cursor_cluster += 1 iff the inserted byte was ASCII
+        // (< 0x80); multi-byte continuations do NOT advance the
+        // cluster hint. rbx holds the raw byte.
+        cmp rbx, 0x80;
+        jae le_disp_ok;
+        lea r11, [rip + _le_cursor_cluster];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp le_disp_ok;
+
+        // -----------------------------------------------------------
+        // Shared epilogues.
+        // -----------------------------------------------------------
+      le_disp_ok:
+        xor rax, rax;                    // LE_OK
+        jmp le_disp_epilogue;
+
+      le_disp_bad_key:
+        mov rax, 0x5403;                 // LE_ERR_BAD_KEY
+        jmp le_disp_epilogue;
+
+      le_disp_buf_full:
+        mov rax, 0x5400;                 // LE_ERR_BUF_FULL
+        jmp le_disp_epilogue;
+
+      le_disp_utf8_err:
+        mov rax, 0x5404;                 // LE_ERR_UTF8
+        jmp le_disp_epilogue;
+
+      le_disp_epilogue:
+        add rsp, 8;                      // undo align pad
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

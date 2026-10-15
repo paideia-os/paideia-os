@@ -4,6 +4,464 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.0] -- 2026-10-15
+
+Wave 127: R223.M5 WireSink. Lands the parser-tier Cap'n Proto-ish
+wire-format sink that serializes typed shell records to a byte
+stream for process- or host-boundary transit, and deserializes the
+inverse. The SERIALIZATION half of the acceptance pipeline
+`find . @remote | sort by size` from paideia-os#2670; the TRANSPORT
+half (TCP + ChaCha20-Poly1305) is the OSARCH substrate under
+`svc/remote_record_wire.pdx` (R137.M4). Sibling arm of Wave 127
+closing out the R223.M5 slot; layers additively on the
+`0x5200..0x52FF` carve-out disjoint from R229.M6 (0x5400..0x54FF),
+R229.M5 (0x5100..0x51FF), R224.M6 (0x5000..0x50FF), and R222.M8
+(0x4F00..0x4FFF).
+
+### Added
+
+- `src/wire_sink.pdx` module `WireSink` (R223.M5, paideia-os#2670):
+  four public entry points over caller-supplied buffers. Zero `.bss`.
+  - `_ws_init()` -- bare `ret`. M5 holds NO .bss state (every wire
+    frame is caller-owned on both the serialize and deserialize
+    paths; the schema hash is a pure byte walk over a caller-
+    supplied name buffer). Kept for parallelism with the parser-
+    family init-hook convention (`_ds_init` R222.M8, `_dm_init`
+    R222.M6, `_cmdreg_init` R222.M5) so a later landing that adds
+    .bss (per-connection sequence counters, a schema_tag intern
+    table, a per-session serialization-fault counter) does not
+    break the API.
+  - `_ws_serialize_record(record_ptr, record_len, schema_tag, out,
+    out_cap)` -- pure-leaf framer. Validates record_ptr != 0,
+    record_len <= WS_RECORD_MAX (1024), out != 0, out_cap >= 32 +
+    ceil(record_len/8)*8. Zero-fills the required bytes via a u64
+    stepping loop (step by 8). Stamps magic 'WSNK' (0x4B4E5357 LE)
+    u32 at [+0]; version u16 lo byte 1 at [+4] (hi byte zero via
+    zero-fill); flags u16 at [+6..+8] (zero via zero-fill);
+    seg_word_count u32 at [+8] = 1 + data_words; segment_id u32 at
+    [+12] = schema_tag; record_len u32 at [+16]; reserved u32 at
+    [+20..+24] (zero via zero-fill); Cap'n Proto struct_pointer u64
+    at [+24] with data_words in bits 32..47 (shl rax, 32 pack).
+    Copies record_len bytes from record_ptr to [out + 32]. Returns
+    packed_u64 = (frame_bytes << 32) | WS_OK on success.
+  - `_ws_deserialize_record(wire, wire_len, out, out_cap)` --
+    pure-leaf unframer. Validates wire != 0, wire_len >= 32, out
+    != 0; magic 'WSNK' at [+0]; version 1 at [+4..+6];
+    seg_word_count in [1..129] at [+8] consistent with record_len
+    at [+16]; struct_pointer u64 at [+24] with low 32 bits == 0
+    (kind=0, offset=0), bits 48..63 == 0 (ptr_words=0), bits
+    32..47 == data_words_expected; wire_len >= 32 +
+    data_words_expected * 8; out_cap >= record_len. Copies
+    record_len bytes from [wire + 32] to out. Returns packed_u64 =
+    (record_len << 32) | WS_OK on success.
+  - `_ws_schema_hash(name_ptr, name_len)` -- pure-leaf FNV-1a 64
+    byte-for-byte identical to R222.M2 `_cmd_sig_fnv1a64`, R222.M3
+    `_fi_fnv1a64`, R222.M5 `_cmdreg_fnv1a64`, R229.M5 inlined FNV
+    in `_h_append` (offset basis 0xCBF29CE484222325, prime
+    0x100000001B3). A zero-length input returns the offset basis
+    unchanged (standard FNV behaviour). The caller truncates the
+    u64 to u32 to derive a `schema_tag`.
+  - All four entry points are PURE LEAVES (zero callee-save
+    pushes, zero stack frame, zero nested CALL). `r11` is used
+    freely as a staging register because no nested CALL exists.
+  Error band `0x5200..0x5207` (eight codes used): WS_OK (0),
+  WS_ERR_BAD_RECORD (0x5200), WS_ERR_RECORD_TOO_LARGE (0x5201),
+  WS_ERR_OUT_TOO_SMALL (0x5202), WS_ERR_BAD_FRAME (0x5203),
+  WS_ERR_BAD_MAGIC (0x5204), WS_ERR_BAD_VERSION (0x5205),
+  WS_ERR_BAD_SEG_HEADER (0x5206), WS_ERR_BAD_STRUCT_PTR (0x5207);
+  `0x5208..0x52FF` reserved for R223.M5.1+ follow-ups.
+
+- `design/shell/wire-format-capnproto.md` -- R223.M5 design doc.
+  Thirteen sections: scope / why this exists, wire frame layout
+  (field-by-field rationale, struct pointer sub-field layout, why
+  32-byte prelude), public API (per entry-point register map +
+  flow), status band (0x5200..0x52FF), encoder discipline (absolute),
+  register-liveness per entry, lazy-init non-applicability,
+  acceptance (4-fixture round-trip; negative cases; cross-host
+  round-trip deferred to R137.M4 wire-up), consumer pattern (two-
+  layer sandwich with R137.M4 ChaCha20-Poly1305 framer), "where
+  this is NOT" boundary, file footprint, forward path (M5.1..M5.5),
+  related docs cross-ref.
+
+### Changed
+
+- `src/lib.pdx` -- flipped `LPX_PDS_PARSER_R223_M5_READY` from 0 to 1
+  with the comment updated from the parent brief's "flag/positional
+  partition" (prior scope) to "wire-format sink (WireSink):
+  Cap'n Proto-ish serialization for cross-boundary records" (current
+  re-scoped surface per paideia-os#2670 and the novel-clean-design
+  directive); added `src/wire_sink.pdx at R223.M5` to the module-
+  filename comment; added `paideia-os#2670 (R223.M5 WireSink)` to
+  the upstream-issues comment; added `design/shell/wire-format-
+  capnproto.md` to the design-doc list; top-of-file provenance line
+  bumped from `R229.M6 + R223.M6 (paideia-os#2724, paideia-os#2671,
+  Wave 127)` to `R223.M5 (paideia-os#2670, Wave 127)`. Version
+  bumped 1.27.0 -> 1.28.0 (MINOR: additive, new M-wave landing).
+
+- `caps.decl` -- added `0x5200..0x52FF` error-band section listing
+  all eight WS_* slots (OK, BAD_RECORD, RECORD_TOO_LARGE,
+  OUT_TOO_SMALL, BAD_FRAME, BAD_MAGIC, BAD_VERSION, BAD_SEG_HEADER,
+  BAD_STRUCT_PTR) with 248 slots reserved for M5.1+ follow-ups.
+  Added the R223.M5 catalogue paragraph (WireSink primitives
+  summary, 32-byte prelude + variable payload wire shape, four-
+  entry-point API, pure-leaf discipline). Added the R223.M5 linker-
+  dependency entry (NO external cross-library dep, NO intra-library
+  linker-visible dep; FNV offset basis + prime replicated locally
+  as module constants; structural dependency on SchemasSig at M5.1
+  but still no linker-visible dependency because body-byte buffers
+  flow in as opaque caller-managed pointers). Added the
+  `0x520[0-7]\b` grep-disjointness confirmation line.
+
+### Design notes
+
+- Wire frame layout matches the parent brief's "segment header +
+  list of struct pointers + inline data" verbatim, plus a pdx
+  magic + version + record_len prelude for frame validation and
+  byte-exact round-trip precision. The brief's "8B segment header
+  (word count u32, segment id u32)" lives at [+8..+16]; the brief's
+  "8B struct pointer tag per field" at [+24..+32] (single top-level
+  struct pointer at raw M5; per-field pointers land at M5.1 once
+  SchemasSig can report per-field types at serialize time).
+- Magic 'WSNK' = 0x4B4E5357 LE reads as "WSNK" in a hex-dump
+  sequential scan per the Wave 125 SortGroupReduce magic-
+  reconciliation lesson. Version u16 = 1 locks the M5 commitment
+  surface; a wire-format change bumps the field and the
+  deserializer rejects stale frames with WS_ERR_BAD_VERSION.
+- Byte-for-byte reproducibility. The zero-fill prelude in
+  `_ws_serialize_record` guarantees deterministic layout across
+  the reserved regions (`flags` u16, `reserved` u32) and the
+  padded payload tail. Two independent serialisations of the same
+  (record_ptr, record_len, schema_tag) triple produce byte-
+  identical frames -- the fingerprint-round-trip invariant from
+  the brief's acceptance line.
+- Status band disjointness. 0x5200..0x52FF carves a non-adjacent
+  kilo-step past Wave 126's 0x5100..0x51FF (R229.M5 History),
+  0x5000..0x50FF (R224.M6 PipelineLambda), and 0x4F00..0x4FFF
+  (R222.M8 DescribeSig), and past Wave 127's 0x5400..0x54FF
+  (R229.M6 LineEditor). The four prior R223 submodule bands
+  (0x2B00 Pipeline, 0x3400 RecordProjection, 0x4C00 FilterOp,
+  0x4D00 SortGroupReduce) remain error-disjoint so a downstream
+  dispatcher's compound error path can distinguish wire-sink faults
+  from every other R223 submodule fault.
+- Pure-leaf discipline. All four entry points are PURE LEAVES --
+  zero callee-save pushes, zero stack frame, zero nested CALL --
+  because the module holds no `.bss` at M5 and the operations are
+  all flat byte reads/writes over caller-supplied buffers. The r11
+  clobber contract never activates because no CALL fires.
+
+### Linker dependencies
+
+- NO external cross-library linker dependency. The transport half
+  (R137.M4 `svc/remote_record_wire.pdx`) consumes/produces the
+  frames this module emits/accepts; the two halves live in disjoint
+  linker namespaces (kernel-side OSARCH half vs user-space satellite
+  half) and share no state.
+- NO intra-library cross-module linker dependency. The FNV-1a 64
+  constants (offset basis 0xCBF29CE484222325, prime 0x100000001B3)
+  are replicated as local module constants so the hash validates
+  the input without a cross-module linker dep on command_sig.pdx
+  -- the same disjoint-leaf precedent as the parser-family's
+  `_cmd_sig_fnv1a64` / `_fi_fnv1a64` / `_cmdreg_fnv1a64` quartet.
+- R223.M5.1+ (per-field struct pointers via SchemasSig fold) will
+  introduce a one-way intra-library STRUCTURAL dependency on
+  R222.M1 SchemasSig but STILL no linker-visible dependency: the
+  SchemasSig body buffer is handed in as an opaque caller-managed
+  pointer.
+
+### Notes
+
+- 4-fixture round-trip (per the design doc §8.1-8.3) anchors the
+  raw M5 acceptance. The cross-host round-trip from the acceptance
+  pipeline `find . @remote | sort by size` is deferred to the
+  R137.M4 TCP transport wire-up (sibling OSARCH half; paideia-
+  os#2636) since it needs a two-VM harness beyond the parser-tier
+  satellite's reach.
+- The M5.1 scope sketch (per the design doc §12 Forward path):
+  new entry point `_ws_serialize_record_typed(record_ptr,
+  record_len, schemas_sig_body, schemas_sig_len, schema_tag, out,
+  out_cap)` threads R222.M1 SchemasSig per-field type codes in and
+  emits per-field struct pointers inside the data section. The
+  current landing locks the API shape so M5.1 is purely additive.
+- Open questions (per the design doc §12 Forward path): WS-O1
+  whether `flags` bit 0 (far-ptr multi-segment) belongs at M5.2 or
+  later; WS-O2 whether capability tunnelling (`flags` bit 1) rides
+  on the same `_ws_serialize_record` entry point or splits to a
+  dedicated `_ws_serialize_record_with_caps` surface; WS-O3 the
+  exact zero-copy / scatter-gather deserialize API pending the
+  per-schema arena landing at R229+.
+
+## [1.27.0] -- 2026-10-15
+
+Wave 127: R229.M6 LineEditor. Lands the parser-tier emacs-mode line
+editor substrate backing all 13 bindings from
+`design/terminal/editor-bindings.md` §1 (C-a / C-b / C-d / C-e /
+C-f / C-k / C-l / C-r / C-u / C-w / C-y, M-f / M-b / M-d). 4096-byte
+line buffer + 1024-byte kill buffer + six u64 scalars in a singleton
+`.bss`; five public entry points over the pool; two intra-library
+linker deps on R221.M2 GraphemeIter and R229.M5 History.
+
+### Added
+
+- `src/line_editor.pdx` module `LineEditor` (R229.M6,
+  paideia-os#2724): five public entry points over singleton
+  `.bss` (5192 B pool + 48 B scalars).
+  - `_le_init()` — pure-leaf defensive scrub of the six u64
+    scalars (`_le_buf_len`, `_le_cursor_byte`, `_le_cursor_cluster`,
+    `_le_kill_len`, `_le_meta_pending`, `_le_last_search_turn`).
+    Byte pools (`_le_buf`, `_le_kill_buf`) rely on `.bss` zero-init
+    to satisfy the "read only [0, *_len)" invariant.
+  - `_le_reset()` — pure-leaf clear of line + cursor + meta +
+    search scalars after a RET-commit. Preserves `_le_kill_buf` +
+    `_le_kill_len` across lines per emacs/readline convention so
+    C-y works into a fresh prompt.
+  - `_le_dispatch_key(key_u32) -> status` — one-keystroke
+    dispatch. 6-callee-save-push + `sub rsp, 8` align pad giving
+    rsp%16==0 at every nested CALL (entry rsp%16==8; 48 B pushes +
+    8 B pad = 56 B; `(8+56) mod 16 == 0`). Byte value in low 8
+    bits of key_u32 switched over the 11 control bindings
+    (C-a..C-y), the ESC latch (0x1B), the 3 M-prefixed bindings
+    (M-f/M-b/M-d via `_le_meta_pending`), and the printable /
+    non-ASCII insert path (0x20..0x7E and 0x80..0xFF). Nested
+    CALLs into `_gi_next_cluster` / `_gi_prev_cluster` (R221.M2)
+    for cluster-aware cursor advance on C-b/C-f/C-d, and into
+    `_h_search_substring` / `_h_get_turn` (R229.M5) for C-r
+    reverse-i-search. ASCII-whitespace fast path for M-f/M-b/M-d
+    / C-w word boundaries at raw M6 (SP/TAB/LF/CR; refinement to
+    TR#29-cluster-aware word boundaries lands at M6.6).
+  - `_le_insert_bytes(ptr, len) -> status` — pure-leaf insert
+    at `_le_cursor_byte`. Shift-right walk-DOWN of
+    `buf[cursor..buf_len)` to `buf[cursor+len..]` to avoid
+    aliasing; byte-copy from `ptr`; bumps `buf_len += len` and
+    `cursor_byte += len`. LE_ERR_BAD_LEN on len==0; LE_ERR_BAD_PTR
+    on ptr==0; LE_ERR_BUF_FULL on `buf_len + len > 4096`.
+  - `_le_get_buffer(out, out_cap) -> packed_u64` — pure-leaf
+    copy of `buf[0..buf_len)` to `out`. Returns
+    `(buf_len << 32) | LE_OK` on success; LE_ERR_BAD_PTR on
+    out==0; LE_ERR_OUT_TOO_SMALL on `out_cap < buf_len`.
+  Four of the five entry points are PURE LEAVES (zero callee-save
+  pushes, zero stack frame, zero nested CALL); `_le_dispatch_key`
+  is the sole 6-push frame with four nested CALL targets. r11 is
+  never held across a nested CALL — every `.bss` access re-stages
+  via `lea r11, [rip + sym]`. Error band `0x5400..0x54FF`
+  (seven codes used: LE_OK (0), LE_ERR_BUF_FULL (0x5400),
+  LE_ERR_BAD_PTR (0x5401), LE_ERR_OUT_TOO_SMALL (0x5402),
+  LE_ERR_BAD_KEY (0x5403), LE_ERR_UTF8 (0x5404), LE_ERR_BAD_LEN
+  (0x5405), LE_META_PENDING (0x5406)); `0x5407..0x54FF` reserved
+  for R229.M6.1+ follow-ups.
+
+- `design/shell/line-editor-emacs.md` — R229.M6 design doc.
+  Twelve sections: scope, module shape (public API + static state +
+  status taxonomy), dispatch state machine, per-binding register
+  plan, correctness invariants, C-r (reverse-i-search) flow,
+  acceptance, paideia-as encoder discipline, forward path
+  (M6.1..M6.7), "where this is NOT" boundary, file footprint,
+  related docs cross-ref.
+
+### Changed
+
+- `src/lib.pdx` — flipped `LPX_PDS_PARSER_R229_M6_READY` from 0 to 1
+  (its label changed from the deferred "persistent per-user env"
+  to the landed "line editor: emacs-mode bindings"); added
+  `src/line_editor.pdx at R229.M6` to the module-filename comment;
+  added `paideia-os#2724 (R229.M6 LineEditor)` to the upstream list;
+  added `design/shell/line-editor-emacs.md` to the design-docs
+  cross-ref; bumped `LPX_PDS_PARSER_VERSION_MINOR` from 26 to 27.
+
+- `caps.decl` — added the R229.M6 LineEditor catalogue paragraph
+  under the R229 wave section (two intra-library linker deps:
+  R221.M2 GraphemeIter for cluster-aware cursor advance, R229.M5
+  History for C-r reverse-i-search); added the follow-up roadmap
+  paragraph (M6.1..M6.7); added the error-band section
+  `0x5400..0x54FF (R229.M6, line_editor)` with the seven landed
+  codes and the reserved-slot discipline for M6.1+ follow-ups;
+  added the catalogue paragraph documenting the five entry points'
+  frame shape, nested-CALL discipline, cursor invariants, and
+  `.bss` disjointness from every sibling satellite's state.
+
+- `STATUS.md` — flipped the R229.M6 milestone row from "Blocked by
+  M5 + pdxfs user profile schema" to landed; added the
+  `line_editor | 0x5400..0x5406 | R229.M6 | landed` + reserved-
+  slot entries to the error-band accounting table; bumped
+  `Version:` to 1.27.0.
+
+### R223.M6 — HostnameAnnot
+
+Sibling arm of Wave 127. Lands the parser-tier `@hostname`
+annotation recogniser that MAY prefix a pipeline stage. A 32-byte
+`HostAnnot` record identifies the target host (LOCAL, or REMOTE
+with a hashed hostname); `_ha_parse` walks a stage's leading bytes
+and emits one record; `_ha_check` type-checks a record against the
+current execution context's hostname. Parse-only landing: the
+encrypted-channel substrate half is a separate milestone that
+consumes the record emitted here.
+
+#### Added (R223.M6)
+
+- `src/hostname_annot.pdx` module `HostnameAnnot` (R223.M6,
+  paideia-os#2671): three public entry points over caller-supplied
+  buffers. Zero `.bss`.
+  - `_ha_init()` — bare `ret`. M6 holds NO .bss state (every
+    HostAnnot record is caller-owned on both the parse and check
+    paths; the check primitive operates as a pure FNV compare over
+    caller-supplied bytes). Kept for parallelism with the
+    DispatchMode (R222.M6) / CmdRegistry (R222.M5) / DescribeSig
+    (R222.M8) init-hook family so a later landing that adds .bss
+    does not break the API.
+  - `_ha_parse(bytes, bytes_len, out, out_cap)` — 6-push pure-leaf
+    parser (FNV-1a 64 inlined). Validates `out != 0`, `out_cap >=
+    HA_RECORD_BYTES (32)`. Zero-fills the 32-B record via four u64
+    stores. Fast path: empty input OR first byte != `'@'` (0x40)
+    emits the LOCAL record with `bytes_consumed = 0`. On `'@'`
+    seen: advances cursor past `'@'`, scans hostname run of bytes
+    in `[A-Za-z0-9.-]`; empty hostname (empty-@ idiom) falls to
+    LOCAL path; hostname > `HA_HOSTNAME_MAX (16)` →
+    `HA_ERR_HOSTNAME_TOO_LONG`; else emits REMOTE record: magic
+    `'HOST'` (`0x54534F48`) u32 at `[+0]`; flags u32 = 0 at
+    `[+4]`; hostname bytes copied to `[+16..+16+hostname_len)`
+    with zero-pad to `[+16..+32)`; FNV-1a 64 hash at `[+8]`.
+    Walks trailing WS in `{SP, TAB, LF, CR}`. Returns packed
+    `(bytes_consumed << 32) | HA_OK`.
+  - `_ha_check(record, host_ptr, host_len)` — 1-push pure-leaf
+    type-checker (FNV-1a 64 inlined). Validates `record != 0`,
+    magic `'HOST'` at `[record+0]`, `host_len > 0 => host_ptr !=
+    0`. Reads flags u32 at `[record+4]`; isolates IS_LOCAL bit via
+    `and rax, 1` (imm8). Dispatches: IS_LOCAL=1 returns `HA_OK`
+    iff `host_len==0`, else `HA_ERR_HOST_MISMATCH`; IS_LOCAL=0
+    (remote) computes FNV-1a 64 of `(host_ptr, host_len)` and
+    compares to record.hostname_hash u64 at `[record+8]`; match
+    → `HA_OK`, mismatch → `HA_ERR_HOST_MISMATCH`; empty host on
+    remote record → `HA_ERR_HOST_MISMATCH`.
+  - All three entry points are pure leaves (no nested CALL;
+    FNV-1a 64 inlined on both parsing paths). `r11` is used
+    freely as a staging register because no CALL exists.
+  Error band `0x5300..0x53FF` (seven codes used: HA_OK (0),
+  HA_ERR_SYNTAX (0x5300, reserved for M6.1 strict-mode),
+  HA_ERR_HOSTNAME_TOO_LONG (0x5301), HA_ERR_OUT_TOO_SMALL
+  (0x5302), HA_ERR_BAD_RECORD (0x5303), HA_ERR_HOST_MISMATCH
+  (0x5304), HA_ERR_BAD_HOST_PTR (0x5305)); `0x5306..0x53FF`
+  reserved for R223.M6.1+ follow-ups.
+
+- `design/shell/hostname-annotation.md` — R223.M6 design doc.
+  Fourteen sections: scope + motivation; grammar + why not
+  stricter + why empty-@; 32-byte record layout + magic byte
+  sequence + inline-rationale + FNV rationale; public API
+  (per entry-point register map + flow); status band
+  (0x5300..0x53FF + disjointness proof); encoder discipline
+  (absolute); register-liveness per entry; lazy-init
+  non-applicability; 8-test acceptance corpus (no @,
+  @hostname, @hostname.sub.domain, @lab-01, empty-@,
+  @ at EOI, 16-byte cap, 17-byte overflow); consumer pattern
+  (future pipeline-stage dispatcher sketch); "where this is
+  NOT" boundary; file footprint; forward path (M6.1..M6.5);
+  related docs cross-ref.
+
+#### Changed (R223.M6)
+
+- `src/lib.pdx` — flipped `LPX_PDS_PARSER_R223_M6_READY` from 0
+  to 1; the per-milestone comment updated from `canonical-form
+  renderer` (prior stale scope) to `@hostname annotation parse +
+  type (HostnameAnnot)` (current surface); extended the
+  module-filename list with `src/hostname_annot.pdx at R223.M6`;
+  added `paideia-os#2671 (R223.M6 HostnameAnnot)` to the
+  upstream-issues list; added
+  `design/shell/hostname-annotation.md` to the design-doc list;
+  extended the top-of-file provenance line to also list R223.M6.
+  Version shared with the parallel R229.M6 LineEditor sibling
+  arm (1.27.0) per parallel-wave discipline.
+
+- `caps.decl` — appended the `0x5300..0x53FF` error-band section
+  listing all seven HA_* slots at use plus the reserved
+  `0x5306..0x53FF` tail for M6.1+ follow-ups; appended the
+  R223.M6 catalogue paragraph (HostnameAnnot primitives summary,
+  32-byte wire shape, three-entry-point API, pure-leaf
+  discipline, zero `.bss` footprint); appended the R223.M6
+  linker-dep paragraph (zero external cross-library link dep;
+  zero intra-library linker-visible dep — FNV-1a 64 inlined in
+  both `_ha_parse` and `_ha_check`; structural dependency on
+  R223.M1 Pipeline is NOT linker-visible because the per-stage
+  byte slice is caller-managed).
+
+- `STATUS.md` — added the R223.M6 milestone-landing narrative;
+  extended Wave 127 landings to include `R223.M6 HostnameAnnot`.
+
+#### Design notes (R223.M6)
+
+- Record is 32 bytes exactly. The brief's early arithmetic that
+  included a reserved u64 tail would have come to 40B; the brief
+  itself resolved this to "32B — trim reserved u64", honoured here.
+  Stride is a power of two (indexing via `shl rN, 5`; no 2-op
+  `imul r, imm` pitfall).
+- Magic `'HOST'` little-endian = `0x54534F48` reads as the 4-byte
+  ASCII string `"HOST"` in a hex-dump sequential scan, per the
+  Wave 125 SortGroupReduce magic-reconciliation lesson
+  (byte-sequence readability over numeric prettiness). The magic
+  u32 fits in imm32 with bit 31 clear so direct `cmp reg, imm32`
+  is sign-extension-safe.
+- Grammar is deliberately CONSERVATIVE (ASCII LDH-plus up to
+  16 bytes). RFC 1123 permits more than this grammar accepts
+  (underscore in LDH-plus; percent-encoded unicode in IDN form).
+  The downstream transport computes the hash of the parsed bytes
+  BYTE-FOR-BYTE, so silent normalisation (lowercasing,
+  Punycode-encoding) would make a user who typed `Workstation`
+  and a daemon advertising `workstation` miss each other's hash.
+  Normalisation belongs at M6.5; raw M6 accepts the common 95%
+  case and defers.
+- Empty-@ idiom (`@|`, `@ `) emits a LOCAL record at raw M6. The
+  idiom is RESERVED for a future federation-override syntax; a
+  thread-local strict-federation toggle at M6.2 will return
+  `HA_ERR_SYNTAX` (`0x5300`) instead.
+- Pure-leaf discipline on all three entry points. `_ha_init` is a
+  bare `ret` (zero pushes); `_ha_parse` is a 6-push pure leaf with
+  FNV inlined (precedent `_h_append` R229.M5 6-push shape);
+  `_ha_check` is a 1-push pure leaf with FNV inlined. `r11` is
+  used freely as a staging register because no CALL exists.
+- Status band disjointness. `0x5300..0x53FF` sits between the
+  parallel R223.M5 band `0x5200..0x52FF` (flag/positional
+  partition) and the R229.M6 LineEditor band
+  `0x5400..0x54FF`. The six R223 submodule bands (0x2B00
+  Pipeline, 0x3400 RecordProjection, 0x4C00 FilterOp, 0x4D00
+  SortGroupReduce, 0x5200 FlagPositional, 0x5300 HostnameAnnot)
+  remain error-disjoint so a downstream dispatcher's compound
+  error path can distinguish each submodule's faults by a single
+  `shr r, 8; cmp r, 0x53` idiom.
+
+#### Linker dependencies (R223.M6)
+
+- NO external cross-library linker dependency.
+- NO intra-library cross-module linker dependency. FNV-1a 64 is
+  INLINED in both `_ha_parse` and `_ha_check` (the constants
+  `0xCBF29CE484222325` basis + `0x100000001B3` prime load via
+  MOVABS imm64; precedent `history.pdx` line 727-728) so no
+  cross-module call to a shared FNV helper is required. The
+  structural dependency on R223.M1 Pipeline (the stage's leading
+  bytes this module post-passes on) is NOT linker-visible: the
+  per-stage byte slice is handed in as caller-managed bytes.
+- R223.M6.1+ (long-hostname pointer-indirect mode) will introduce
+  a one-way STRUCTURAL dependency on a per-session long-hostname
+  arena (caller-managed; no cross-module linker dep). R223.M6.3+
+  (federation `@group:rule` syntax) is additive to the record's
+  flag u32 bits; no linker-visible dep. R223.M6.5+
+  (canonical-form normalisation) layers in-line over the hostname
+  bytes before hashing; no cross-module linker dep.
+
+#### Notes (R223.M6)
+
+- 8-test parse+check corpus (per the design doc §9) covers:
+  (1) no-@ plain stage; (2) `@hostname` with alphanumeric name;
+  (3) `@node.local` with dots; (4) `@lab-01` with dash and
+  digits; (5) `@` with no hostname (empty-@ idiom);
+  (6) `@` at EOI (empty-@ at end); (7) hostname at 16-byte cap;
+  (8) hostname exceeds 16-byte cap. Corpus folds into R221.M7
+  fuzz-harness once a `FUZZ_KIND_HOSTANNOT` target is added.
+- Open questions (per the design doc §13 Forward path): HA-O1
+  whether a per-session hostname intern table belongs at M6.4
+  (would turn `_ha_init` non-bare); HA-O2 whether the federation
+  fan-out syntax (`@group:*`, `@*`) should carry a kind field in
+  the record or a separate FederationPlan record; HA-O3 the
+  exact canonical-form normalisation order (lowercase + Punycode
+  + trailing-dot-strip) and whether raw-bytes mode stays
+  available for pin-on-wire daemons.
+
 ## [1.26.0] -- 2026-10-15
 
 Wave 126: R222.M8 DescribeSig. Lands the parser-tier serialization

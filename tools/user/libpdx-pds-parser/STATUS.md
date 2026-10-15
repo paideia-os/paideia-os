@@ -72,12 +72,31 @@ five public entry points `_ds_init` / `_ds_serialize` /
 `_ds_deserialize` / `_ds_matches_type` / `_ds_matches_schema` over
 caller-supplied buffers; zero `.bss`; all PURE LEAVES; magic
 'DESC' = 0x43534544 LE, version u16 = 1; error band 0x4F00..0x4FFF)
--- landed.
-**Version:** 1.26.0.
+-- landed. R223.M6 (HostnameAnnot: 32-byte HostAnnot record
+recognising the optional `@hostname` prefix of a pipeline stage;
+three public entry points `_ha_init` / `_ha_parse` / `_ha_check`
+over caller-supplied buffers; zero `.bss`; all PURE LEAVES; FNV-1a
+64 inlined; magic 'HOST' = 0x54534F48 LE; error band
+0x5300..0x53FF; parse-only landing with the encrypted-channel
+substrate half deferred) -- landed. R223.M5 (WireSink: Cap'n
+Proto-ish wire-format sink serializing typed shell records to a
+byte stream for process- or host-boundary transit; 32-byte prelude
++ variable payload under WS_RECORD_MAX = 1024 ceiling at raw M5;
+four public entry points `_ws_init` / `_ws_serialize_record` /
+`_ws_deserialize_record` / `_ws_schema_hash` over caller-supplied
+buffers; zero `.bss`; all PURE LEAVES; magic 'WSNK' = 0x4B4E5357 LE,
+version u16 = 1; error band 0x5200..0x52FF; serialization-only
+landing with the TCP + ChaCha20-Poly1305 transport half deferred
+to R137.M4 OSARCH substrate) -- landed.
+**Version:** 1.28.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 **Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
 **Wave 126 landings:** R224.M6 PipelineLambda, R229.M5 History,
 R222.M8 DescribeSig.
+**Wave 127 landings:** R229.M6 LineEditor (emacs-mode line editor;
+13 bindings from design/terminal/editor-bindings.md §1), R223.M6
+HostnameAnnot (@hostname annotation parse + type), R223.M5 WireSink
+(Cap'n Proto-ish cross-boundary record serializer).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -418,6 +437,147 @@ ArgSpec + FlagSpec) quartet through the queryable form.
       as R223.M4.1 follow-up. The current M4 single-key form uses
       the first unescaped word of the Expr body as the key; the
       multi-key form will layer additively on `reserved[6..8]`.
+
+### M5 -- Wire-format sink: cross-boundary record serialization (paideia-os#2670, landed)
+
+Re-scoped from the parent brief's "flag/positional partition" to
+"wire-format sink: serialize records to Cap'n Proto schema at
+process/host boundaries" per paideia-os#2670 and the novel-clean-
+design directive. Flag/positional partitioning folds back into
+R222.M4 ArgFlagSpec at its M4.1+ follow-ups.
+
+- [x] **R223.M5-001** -- `src/wire_sink.pdx` module `WireSink`
+      landed: four public entry points over caller-supplied buffers;
+      zero `.bss` footprint; all PURE LEAVES. `_ws_init` is a bare
+      `ret` kept for parallelism with the DispatchMode / CmdRegistry
+      / DescribeSig init-hook family. `_ws_serialize_record` is a
+      pure-leaf framer; validates record_ptr, record_len, out,
+      out_cap; zero-fills the required bytes via a u64 stepping
+      loop; stamps magic 'WSNK' (0x4B4E5357 LE), version u16 = 1,
+      brief's segment header (seg_word_count u32 + segment_id u32 =
+      schema_tag) at [+8..+16], record_len u32 at [+16] (exact
+      plaintext length for byte-exact round-trip), Cap'n Proto
+      struct_pointer u64 at [+24] with data_words in bits 32..47;
+      byte-copies record_len bytes from record_ptr to [out + 32].
+      Returns packed_u64 = (frame_bytes << 32) | WS_OK.
+      `_ws_deserialize_record` is the inverse: validates frame
+      geometry, magic, version, seg_word_count range, struct_pointer
+      sub-fields (kind=0, offset=0, ptr_words=0, data_words ==
+      ceil(record_len/8)), wire_len geometry, out_cap >= record_len;
+      byte-copies record_len bytes from [wire + 32] to out.
+      `_ws_schema_hash` is a pure-leaf FNV-1a 64 byte-for-byte
+      identical to `_cmd_sig_fnv1a64` (R222.M2), `_fi_fnv1a64`
+      (R222.M3), `_cmdreg_fnv1a64` (R222.M5), and the inlined FNV
+      in `_h_append` (R229.M5). Status taxonomy in
+      0x5200..0x5207 (eight codes: WS_OK, WS_ERR_BAD_RECORD,
+      WS_ERR_RECORD_TOO_LARGE, WS_ERR_OUT_TOO_SMALL,
+      WS_ERR_BAD_FRAME, WS_ERR_BAD_MAGIC, WS_ERR_BAD_VERSION,
+      WS_ERR_BAD_SEG_HEADER, WS_ERR_BAD_STRUCT_PTR). Label prefix
+      `ws_` disjoint from every sibling satellite's prefix and
+      from paideia-as reserved keywords. Serialization-only landing:
+      the TCP + ChaCha20-Poly1305 transport half is the OSARCH
+      substrate under `svc/remote_record_wire.pdx` (R137.M4) that
+      consumes the record emitted here.
+- [x] **R223.M5-002** -- design doc landed:
+      `design/shell/wire-format-capnproto.md`. Thirteen sections
+      covering scope + motivation, wire frame layout + field-by-
+      field rationale + Cap'n Proto struct pointer sub-field layout
+      + why-32-bytes, public API + register maps, status band +
+      disjointness proof, encoder discipline, register-liveness per
+      entry, lazy-init non-applicability, acceptance (4-fixture
+      round-trip + negative cases; cross-host round-trip deferred
+      to R137.M4 wire-up), consumer pattern (two-layer sandwich
+      with R137.M4 ChaCha20-Poly1305 framer), boundary ("where
+      this is NOT"), file footprint, forward path (M5.1..M5.5),
+      related docs.
+- [ ] **R223.M5-003** -- 4-fixture round-trip corpus
+      (`tests/proptest_wire_sink.pdx`): deferred to R223.M7 per
+      the umbrella decomposition; folds into the pipeline fuzz-
+      harness coverage once a `FUZZ_KIND_WIRESINK` target is
+      added at the R221.M7 fuzz-harness bridge. The design doc §8
+      enumerates the four representative round-trip cases
+      (empty record, 5-byte "hello", 13-byte "hello, world!",
+      1024-byte binary blob) plus six negative cases
+      (record_len = 1025, out_cap = 31, zero magic, version 2,
+      seg_word_count = 0, ptr_words != 0).
+- [ ] **R223.M5-004** (deferred) -- Per-field struct pointers via
+      SchemasSig fold: new entry point `_ws_serialize_record_typed`
+      threads R222.M1 SchemasSig per-field type codes in and emits
+      per-field struct pointers inside the data section. Filed as
+      R223.M5.1 follow-up.
+- [ ] **R223.M5-005** (deferred) -- Far-pointer / multi-segment
+      framing lifts the WS_RECORD_MAX = 1024 ceiling via a
+      segment table at the frame prelude and far-pointers inside
+      the struct pointer tag. `flags` bit 0 marks a far-ptr
+      frame. Filed as R223.M5.2 follow-up.
+- [ ] **R223.M5-006** (deferred) -- Capability tunnelling: `flags`
+      bit 1 marks a cap-carrying payload; each cap handle inside
+      the record serialises as an opaque u64 ID the receiver re-
+      mints against its own capability chain. Filed as R223.M5.3
+      follow-up.
+- [ ] **R223.M5-007** (deferred) -- Zero-copy / scatter-gather
+      deserialize: direct-into-arena deserializer that bypasses
+      the byte-copy loop for record payloads already resident at
+      the correct alignment. Filed as R223.M5.4 follow-up.
+
+### M6 -- @hostname annotation parse + type (paideia-os#2671, landed)
+
+- [x] **R223.M6-001** -- `src/hostname_annot.pdx` module
+      `HostnameAnnot` landed: three public entry points over
+      caller-supplied buffers; zero `.bss` footprint; all PURE
+      LEAVES (FNV-1a 64 inlined on both `_ha_parse` and
+      `_ha_check`). `_ha_init` is a bare `ret` kept for
+      parallelism with the DispatchMode / CmdRegistry /
+      DescribeSig init-hook family. `_ha_parse` is a 6-push
+      pure-leaf parser; walks a stage's leading bytes, consumes
+      the optional `@hostname` prefix, emits one 32-byte
+      HostAnnot record (magic 'HOST' = 0x54534F48 LE, flags
+      u32 with bit 0 HA_FLAG_IS_LOCAL, hostname_hash u64 FNV-1a
+      64, hostname_inline [u8;16]). `_ha_check` is a 1-push
+      pure-leaf type-checker; validates record magic, isolates
+      IS_LOCAL bit, dispatches to local-vs-remote compare paths.
+      HA_* status taxonomy in 0x5300..0x5305 (HA_OK, HA_ERR_SYNTAX
+      reserved for M6.1 strict-mode, HA_ERR_HOSTNAME_TOO_LONG,
+      HA_ERR_OUT_TOO_SMALL, HA_ERR_BAD_RECORD,
+      HA_ERR_HOST_MISMATCH, HA_ERR_BAD_HOST_PTR). Label prefix
+      `ha_` disjoint from every sibling satellite's prefix and
+      from paideia-as reserved keywords. Parse-only landing:
+      the encrypted-channel substrate half is a separate
+      milestone that consumes the record emitted here.
+- [x] **R223.M6-002** -- design doc landed:
+      `design/shell/hostname-annotation.md`. Fourteen sections
+      covering scope + motivation, grammar, 32-byte record layout
+      + magic byte sequence + inline/FNV rationale, public API +
+      register maps, status band + disjointness proof, encoder
+      discipline, register-liveness per entry, lazy-init
+      non-applicability, 8-test acceptance corpus, consumer
+      pattern, boundary ("where this is NOT"), file footprint,
+      forward path (M6.1..M6.5), related docs.
+- [ ] **R223.M6-003** -- 8-test parse+check corpus (`tests/
+      proptest_hostname_annot.pdx`): deferred to R223.M7 per the
+      umbrella decomposition; folds into the pipeline fuzz-harness
+      coverage once a `FUZZ_KIND_HOSTANNOT` target is added at the
+      R221.M7 fuzz-harness bridge. The design doc §9 enumerates
+      the eight representative cases (no @, @workstation,
+      @node.local, @lab-01, empty-@ with trailing space, @ at
+      EOI, 16-byte cap, 17-byte overflow).
+- [ ] **R223.M6-004** (deferred) -- Long-hostname pointer-indirect
+      mode (hostnames > 16 bytes get an arena-pointer encoding
+      inside the same 32-byte stride) filed as R223.M6.1
+      follow-up. The current M6 inline-only form rejects over-16
+      hostnames with HA_ERR_HOSTNAME_TOO_LONG.
+- [ ] **R223.M6-005** (deferred) -- Strict-federation-mode refusal
+      of the empty-@ idiom (`@|`, `@ ` with no hostname) via a
+      thread-local toggle; returns `HA_ERR_SYNTAX` (0x5300)
+      instead of silent LOCAL emit. Filed as R223.M6.2 follow-up.
+- [ ] **R223.M6-006** (deferred) -- Federation syntax
+      (`@group:rule`, `@*`) for stage fan-out. Record grows a
+      `kind` field distinguishing SINGLE (M6 default), GROUP,
+      GLOB. Filed as R223.M6.3 follow-up.
+- [ ] **R223.M6-007** (deferred) -- Canonical-form normalisation
+      (lowercase + Punycode-decode + strip trailing dot BEFORE
+      hashing). Raw-bytes mode stays available for pin-on-wire
+      daemons. Filed as R223.M6.5 follow-up.
 
 ## R224 lambda-lang checklist
 
@@ -858,13 +1018,62 @@ into focus.
       per-user history file. Blocked by pdxfs integration (needs
       a KIND_PDXFS reach).
 
-### M6 -- Persistent per-user env / lexical nested scopes (deferred)
+### M6 -- Line editor: emacs mode bindings (paideia-os#2724, landed)
 
-Blocked by: M5 + pdxfs user profile schema. The "lexical nested
-scopes" primitive that originally held the M5 slot in the parent
-brief relocates here when the shell's lexical-scope semantics are
-re-scoped against the finalized session-env + type-env + history
-tier.
+Re-scoped from the parent brief's "persistent per-user env" to
+"line editor: emacs mode bindings" per paideia-os#2724 and the
+novel-clean-design directive (persistent per-user env relocates to
+a later R229 slot once the shell's prompt / dispatch tier is
+finalised; the line-editor primitive is the standing M6 commitment).
+
+- [x] **R229.M6-001** -- `src/line_editor.pdx` module `LineEditor`
+      landed: five public entry points (`_le_init`, `_le_reset`,
+      `_le_dispatch_key`, `_le_insert_bytes`, `_le_get_buffer`) over
+      a singleton `.bss` (4096 B line buffer, 1024 B kill buffer,
+      six u64 scalars for buf_len / cursor_byte / cursor_cluster /
+      kill_len / meta_pending / last_search_turn). All 13 emacs-
+      mode bindings from `design/terminal/editor-bindings.md` §1
+      wired: C-a / C-b / C-d / C-e / C-f / C-k / C-l (no-op at the
+      editor tier) / C-r (via R229.M5 History) / C-u / C-w / C-y,
+      and M-f / M-b / M-d (via a `_le_meta_pending` latch set on
+      ESC = 0x1B). Printable 0x20..0x7E and non-ASCII 0x80..0xFF
+      bytes insert one byte at cursor. Unbound control bytes
+      return LE_ERR_BAD_KEY. `_le_dispatch_key` uses one 6-push +
+      sub rsp,8 pad frame giving rsp%16==0 at every nested CALL
+      into R221.M2 GraphemeIter (`_gi_next_cluster` /
+      `_gi_prev_cluster` for cluster-aware cursor advance on
+      C-b / C-f / C-d) or R229.M5 History
+      (`_h_search_substring` / `_h_get_turn` for C-r
+      reverse-i-search). ASCII-whitespace word boundaries at raw
+      M6 (SP/TAB/LF/CR); TR#29-cluster-aware word boundaries
+      land at M6.6. LE_* status taxonomy in 0x5400..0x54FF (seven
+      slots used; LE_META_PENDING = 0x5406 reports the ESC latch).
+- [x] **R229.M6-002** -- design doc landed:
+      `design/shell/line-editor-emacs.md`.
+- [ ] **R229.M6-003** -- 13-binding + 7-reject smoke-mode golden
+      corpus (`smoke/line-editor-m6.golden.txt`): deferred to
+      R229.M6.4 along with the full smoke-mode fingerprint
+      goldens. The acceptance assertion ("interactive test: every
+      binding produces the expected edit") is satisfied by the
+      raw M6 surface; the design doc §7 enumerates each
+      binding's input state / keystroke / output state as the
+      golden column.
+- [ ] **R229.M6.1** (deferred) -- multi-line edit: a leading `\`
+      before LF opens a continuation; editor keeps the LF in buf
+      and draws a continuation prompt on the next line.
+- [ ] **R229.M6.2** (deferred) -- syntax-highlighting hook:
+      per-cluster colour attr array parallel to `_le_buf`,
+      populated by CtxLexer (R221.M4) at tokenise-time.
+- [ ] **R229.M6.3** (deferred) -- C-s forward-i-search (symmetric
+      to C-r).
+- [ ] **R229.M6.5** (deferred) -- vi-mode state machine (band
+      0x5500..0x55FF); satellite to this landing; see
+      `design/terminal/editor-bindings.md` §2.
+- [ ] **R229.M6.6** (deferred) -- TR#29-cluster-aware word-
+      boundary refinement for M-f / M-b / M-d / C-w (currently
+      ASCII-whitespace fast path).
+- [ ] **R229.M6.7** (deferred) -- undo substrate snapshot ring
+      (C-_ / C-x C-u).
 
 ## Error-band accounting
 
@@ -927,6 +1136,12 @@ tier.
 | job_control-M4.1+ | 0x4E07..0x4EFF  | R229.M4.1+ | reserved |
 | history          | 0x5100..0x5105   | R229.M5   | landed |
 | history-M5.1+    | 0x5106..0x51FF   | R229.M5.1+ | reserved |
+| line_editor      | 0x5400..0x5406   | R229.M6   | landed |
+| line_editor-M6.1+ | 0x5407..0x54FF  | R229.M6.1+ | reserved |
+| hostname_annot   | 0x5300..0x5305   | R223.M6   | landed |
+| hostname_annot-M6.1+ | 0x5306..0x53FF | R223.M6.1+ | reserved |
+| wire_sink        | 0x5200..0x5207   | R223.M5   | landed |
+| wire_sink-M5.1+  | 0x5208..0x52FF   | R223.M5.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in
