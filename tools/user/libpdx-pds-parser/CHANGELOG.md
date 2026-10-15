@@ -4,6 +4,333 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] -- 2026-10-15
+
+Wave 121 joint landing: R221.M4 CtxLexer (paideia-os#2654) +
+R224.M4 CapRow (paideia-os#2678) land in parallel. Each softarch
+arm declared 1.18.0 as its per-primitive version per the
+parallel-CHANGELOG discipline; main consolidates both into this
+single stanza at wave close. The two arms touch disjoint `.bss`
+state (`_cl_*` vs `_cr_*`), disjoint error bands
+(`0x4200..0x42FF` vs `0x4300..0x43FF`), disjoint label prefixes
+(`cl_` vs `cr_`), and disjoint design docs — their only shared
+surfaces are the top-of-file lib.pdx manifest and this CHANGELOG.
+
+### R221.M4 -- CtxLexer
+
+R221.M4 of the parser-tier Unicode + lexer umbrella (paideia-os#2485,
+decomposed into paideia-os#2654 for this M4) -- CONTEXT-TRACKING
+LEXER: a single-pass byte walker over the NFC-normalised pds-lang
+surface that captures pipeline / datalog / lambda tier membership
+once at lex time, so every downstream pass walks a context-tagged
+token stream without re-deducing the enclosing tier.
+
+### Added
+
+- `src/ctx_lexer.pdx` module `CtxLexer` (R221.M4,
+  paideia-os#2654): six public entry points over a 16-level `.bss`
+  context stack.
+  - `_cl_init() -> ()` -- boot hook; zero-fills `_cl_stack` (16 B),
+    `_cl_depth` (u64), `_cl_last_kind` (u64). Pure leaf.
+  - `_cl_push_ctx(ctx) -> errno` -- validate `ctx <= 2`, bounds-check
+    depth, write stack byte + bump depth. `CL_ERR_BAD_CTX` on `ctx > 2`,
+    `CL_ERR_STACK_OVERFLOW` on `depth == 16`.
+  - `_cl_pop_ctx() -> (ctx<<32)|status` -- decrement depth, read
+    byte at pre-decrement top. `CL_ERR_STACK_UNDERFLOW` on empty.
+  - `_cl_current_ctx() -> ctx` -- `stack[depth-1]` iff `depth>0`,
+    else `CTX_PIPELINE`.
+  - `_cl_lex_token(bytes, len, cursor, out_tok) -> (new_cursor<<32)|status`
+    -- pure-leaf single-token lexer; emits one 16-byte Token record
+    tagged with current context, inlines stack-mutating side effects
+    on `{` (push BEFORE emit) and `}` (emit THEN pop).
+  - `_cl_tokenize(bytes, len, out, out_cap) -> (bytes_written<<32)|status`
+    -- walks the whole input, 5-push + 16-pad frame around one
+    nested CALL into `_cl_lex_token` per iteration. Full-u64 status
+    compare on nested rax via `shl 32; shr 32` (Wave 118 lesson,
+    avoids `and rN, imm64`).
+- 17-value TOK_* enum: `TOK_EOF (0)`, `TOK_IDENT (1)`, `TOK_NUMBER
+  (2)`, `TOK_STRING (3)`, `TOK_PIPE (4)`, `TOK_ARG_DELIM (5)`,
+  `TOK_LBRACE (6)`, `TOK_RBRACE (7)`, `TOK_LPAREN (8)`,
+  `TOK_RPAREN (9)`, `TOK_COMMA (10)`, `TOK_KW_DATALOG (11)`,
+  `TOK_ARROW (12)`, `TOK_COLON (13)`, `TOK_DOT (14)`,
+  `TOK_RULE_ARROW (15)`, `TOK_QUERY_ARROW (16)`.
+- 3-value CTX_* enum: `CTX_PIPELINE (0)`, `CTX_DATALOG (1)`,
+  `CTX_LAMBDA (2)`.
+- 16-byte Token record stride: kind u16, ctx u8, flags u8,
+  src_offset u32, src_length u32, payload u32. 16-byte stride =
+  `shl r,4` slot addressing (precedent: RowTypes TyNode).
+- Context-switch rule set:
+  - `{` with prev kind `TOK_KW_DATALOG` -> push `CTX_DATALOG`.
+  - `{` with lookahead (past SP/TAB, NOT past LF/CR) finding `|`
+    -> push `CTX_LAMBDA`.
+  - `{` otherwise -> push COPY of current context (brace-balancing
+    invariant: every `{` pushes something so every `}` has a
+    matching entry).
+  - `}` emits with ctx = pre-pop (inner) then pops. Unmatched `}` at
+    depth==0 -> `CL_ERR_UNMATCHED_BRACE`.
+  - `|` in CTX_PIPELINE -> `TOK_PIPE`; in CTX_LAMBDA ->
+    `TOK_ARG_DELIM`; in CTX_DATALOG -> `CL_ERR_PIPE_IN_DATALOG`.
+- M4 grammar scope: identifier `[A-Za-z_][A-Za-z0-9_]*` with the
+  one keyword `datalog` (7-byte compare); decimal number
+  `[0-9]+`; double-quoted string with `\"` / `\\` escapes;
+  single-char punctuators `.`, `(`, `)`, `,`, `{`, `}`;
+  two-byte lookaheads `->`, `:-`, `?-`; bare `:` emits
+  `TOK_COLON`. Any other byte (control, UTF-8 high byte,
+  misplaced punctuator including bare `-` or `?`) returns
+  `CL_ERR_SYNTAX` with new_cursor at the fault.
+- Error band `0x4200..0x42FF` (eight slots used: `CL_ERR_SYNTAX`
+  0x4200, `CL_ERR_STACK_OVERFLOW` 0x4201,
+  `CL_ERR_STACK_UNDERFLOW` 0x4202, `CL_ERR_UNMATCHED_BRACE`
+  0x4203, `CL_ERR_PIPE_IN_DATALOG` 0x4204,
+  `CL_ERR_UNTERMINATED_STRING` 0x4205, `CL_ERR_OUT_TOO_SMALL`
+  0x4206, `CL_ERR_BAD_CTX` 0x4207; 247 slots reserved for M4.1+).
+- `.bss` state: `_cl_stack : [u8; 16] @align(8)`,
+  `_cl_depth : u64 @align(8)`, `_cl_last_kind : u64 @align(8)`.
+  All stores via `lea r11, [rip + sym]; mov [r11+disp], reg`
+  (precedent: `_er_init`, `_se_init`).
+- Pure-leaf discipline:
+  - `_cl_init` / `_cl_push_ctx` / `_cl_pop_ctx` / `_cl_current_ctx`:
+    zero pushes; no stack frame; no nested CALL.
+  - `_cl_lex_token`: five callee-save pushes
+    (rbx/r12/r13/r14/r15); zero `sub rsp` because no nested CALL.
+    Stack-manipulation side effects on `{` and `}` are inlined via
+    direct `.bss` writes.
+  - `_cl_tokenize`: five callee-save pushes + `sub rsp, 16` for two
+    local slots (cursor_in, tok_count); ONE nested CALL per
+    iteration into `_cl_lex_token`. Entry rsp%16==8; prologue sum
+    40 + 16 = 56 B -> rsp%16==0 at the nested CALL (SysV).
+- Label prefix `cl_` with per-function suffix (`cl_ini_`,
+  `cl_pp_`, `cl_pp_po_`, `cl_cu_`, `cl_lt_`, `cl_tz_`); grep-
+  confirmed disjoint from `cc_` (R224.M2 ClosureCapture internal
+  helpers), `cs_` (R222.M2 CommandSig public entry points),
+  `clo_` (R224.M2 ClosureCapture internal helpers), and from
+  paideia-as reserved keywords (`loop`, `if`, `let`, `fn`,
+  `ret`, `done`).
+- `design/shell/ctx-tracking-lexer.md` (R221.M4 spec; 40-example
+  fixture enumerated at §10 covering five pipeline-only, ten
+  datalog-only, ten lambda-only, and ten nested / cross-context
+  cases including all seven error paths).
+
+### Changed
+
+- `src/lib.pdx`: version 1.17.0 -> 1.18.0;
+  `LPX_PDS_PARSER_M4_READY` flipped from 0 to 1; module-filename
+  and upstream-issues comment extended for the new module + the new
+  design doc.
+- `caps.decl`: added the full 0x4200..0x42FF band section (eight
+  slots used, 247 reserved for M4.1+), the R221.M4 landing
+  paragraph in the per-milestone catalogue (replacing the former
+  R221.M4 "pure byte-walker; no KIND" forward-reference comment),
+  the `0x420[0-7]\b` grep-disjointness confirmation line, the
+  R221.M4 linker-dependency entry (NO cross-library dep; NO intra-
+  library dep -- the lexer is fully self-contained at M4, using
+  only its own `.bss` state and the caller-supplied input / output
+  buffers), and the Wave 121 kilo-step disjointness note (R221.M4
+  at 0x4200..0x42FF past the R224.M3 EffectRow 0x4000..0x40FF
+  carve-out and the reserved R133.M6 kernel-parallel 0x4100..
+  0x41FF slot).
+- `STATUS.md`: R221.M4 moved from "deferred" to "landed"; the R221
+  M-table gains the M4 checklist; the error-band accounting table
+  gains the `ctx_lexer` + `ctx_lexer-M4.1+` rows and marks the
+  former `lexer` reservation at 0x2730..0x274F as superseded by
+  the kilo-step carve-out.
+
+### Design notes
+
+- Context model chosen so `{` and `}` tokens BOTH carry the INNER
+  context byte: `{` emits post-push (ctx = pushed) and `}` emits
+  pre-pop (ctx = being-closed). The brace tokens thus discriminate
+  a datalog-closing `}` from a lambda-closing `}` by a single byte
+  load, which is the shape R221.M5 AST and R225.M3+ typecheck will
+  dispatch on.
+- `datalog` is the only keyword at M4; the 7-byte compare is
+  inlined (no classifier table). R221.M5 may widen the keyword
+  set, but the ONE context-switch keyword at the lexer tier is
+  stable (lambda enters by `{|` lookahead, not by a keyword).
+- Lambda-detection lookahead is bounded by LF/CR OR non-SP/TAB
+  byte -- no explicit N-token ceiling needed because the practical
+  lambda header fits on one source line. The spec's "within N
+  tokens" phrase from the brief is realised as "any WS run on the
+  current line between `{` and the first non-WS byte".
+- Stack-overflow at depth==16 is a parser-grammar cap, not a lexer
+  limitation. Practical pds-lang nesting (lambda inside datalog
+  inside pipeline) reaches depth 3; the 16-level ceiling leaves
+  headroom for machine-generated input.
+- `_cl_lex_token` is a pure LEAF (no nested CALL) by design: inlining
+  the stack ops avoids five `_cl_*_ctx` call sites per token and
+  keeps register-liveness simple (r11 never clobbered mid-token;
+  r12..r15 preserved across the entire call).
+
+### Linker dependencies
+
+- NO cross-library linker dependency.
+- NO intra-library dependency -- the lexer is fully self-contained
+  at M4 and uses only its own `.bss` state and the caller-supplied
+  input / output buffers. (R221.M5 unified-AST landing will add an
+  intra-library consumer that READS Token records; this M4 landing
+  freezes the record ABI.)
+
+### R224.M4 -- CapRow
+
+R224.M4 of the lambda-lang umbrella (paideia-os#2488, decomposed
+into paideia-os#2678 for this M4) -- CAPABILITY-ROW TYPING: a
+parser-tier capability-row sub-grammar and an environment-mask
+covering check layered over R225.M2 Rémy row polymorphism, dual
+with R224.M3 EffectRow. Lambdas carry capability rows
+(`A -> B !{eff} @{read, write}`) that the type-checker checks
+against the invoking environment's capability mask; the missing-cap
+rejection anchor case (`_cr_check_env(parsed("@{read}"), 0)`)
+returns `CR_ERR_MISSING_CAP` packed with the offending label id
+-- the `E0820_MISSING_CAP` diagnostic family.
+
+#### Added
+
+- `src/cap_row.pdx` module `CapRow` (R224.M4, paideia-os#2678):
+  capability-row sub-grammar for the paideia-shell lambda surface,
+  following Q-A2 "substructural capability lattice". Seven public
+  entry points:
+  - `_cr_init() -> ()` -- lazy-populate the 32-slot label-intern
+     table (10 primitives + 22 user-declared slots) from the
+     160-byte static source table `_cr_primitive_init`. Idempotent
+     (count-non-zero short-circuit). Called from the entry of every
+     public API that reads the label table, per the Wave 120
+     lazy-init lesson from R224.M3 EffectRow.
+  - `_cr_label_lookup(ptr, len) -> packed_u64` -- linear scan over
+     `_cr_label_table[0..count)`; returns `(tag << 24) | idx` on
+     hit, `0xFFFFFFFF` on miss.
+  - `_cr_label_intern(ptr, len) -> packed_u64` -- lookup-then-
+     extend; allocates a user-declared slot (`tag = 1`) when the
+     table has room and the name fits in 12 bytes; returns
+     `0xFFFFFFFF` on table-full or over-long.
+  - `_cr_skip_ws(bytes, len, cursor) -> cursor` -- pure-leaf WS
+     walker over the WS class {0x20, 0x09, 0x0A, 0x0D}.
+  - `_cr_parse(bytes, len, out_row_ref) -> status` -- parses
+     `WS* @ WS* { LabelList? } ` and builds the resulting
+     RowTypes row via `_rt_row_empty` / `_rt_row_var` /
+     `_rt_row_extend`; writes the final pool_idx to
+     `*out_row_ref`. Returns `CR_OK` or `CR_ERR_SYNTAX` /
+     `CR_ERR_UNKNOWN_CAP` / `CR_ERR_POOL_FULL`.
+  - `_cr_check_env(required_row, env_mask) -> packed_u64` --
+     environment-mask covering check: for every ROW_EXT label in
+     `required_row` tests `(env_mask >> idx) & 1`. Bit clear ->
+     packs the offending label id in the high 32 bits and sets
+     low 32 to `CR_ERR_MISSING_CAP` (0x4303) -- the
+     `E0820_MISSING_CAP` diagnostic. Anchor acceptance:
+     `_cr_check_env(parsed("@{read}"), 0)` returns
+     `(0x00_000000 << 32) | 0x4303 = 0x00000000_00004303`.
+  - `_cr_render(row_ref, out, out_cap) -> packed_u64` -- round-
+     trips the row back to `@{L1, L2, ..., rho}` source syntax.
+     Returns `(bytes_written << 32) | status`.
+- Ten primitive capability labels at table slots 0..9: `read`
+  (idx 0), `write` (idx 1), `exec` (idx 2), `net` (idx 3), `fs`
+  (idx 4), `cap_mint` (idx 5), `cap_grant` (idx 6), `kalloc`
+  (idx 7), `ipc` (idx 8), `trap` (idx 9). Tag 0 = primitive,
+  1 = user-declared. Slot 9's name `trap` is identical in bytes to
+  R224.M3 EffectRow slot 4 `trap`; the two tables are per-module
+  (`_er_label_table` vs `_cr_label_table`) and the word is
+  contextually distinguished by the owning annotation sigil
+  (`!{trap}` vs `@{trap}`).
+- Pool encoding: a capability row IS a RowTypes row
+  (HM_KIND_TYROW = 4). The RowTypes `arg0` label-hash slot
+  carries a packed `(tag << 24) | idx` label id (same convention
+  as R224.M3 EffectRow); `arg1` field-type slot is 0 (cap labels
+  are nullary); `arg2` is the pool_idx of the rest-of-row.
+- Label-table layout: 32 slots x 16-byte stride = 512 B .bss. Per
+  slot: `[+0] len (u8), [+1] tag (u8), [+2..3] reserved (u16 zero),
+  [+4..15] name (u8[12] right-padded with zero)`.
+- Row-variable convention: identifiers whose first three bytes are
+  `'r','h','o'` are row-variable tails (same precedent as R224.M3;
+  none of the ten primitive capability labels starts with "rho").
+- Error band 0x4300..0x43FF (ten slots used: `CR_ERR_SYNTAX` 0x4300,
+  `CR_ERR_UNKNOWN_CAP` 0x4301, `CR_ERR_LABEL_TABLE_FULL` 0x4302,
+  `CR_ERR_MISSING_CAP` 0x4303, `CR_ERR_POOL_FULL` 0x4304,
+  `CR_ERR_OUT_TOO_SMALL` 0x4305, `CR_ERR_KIND_MISMATCH` 0x4306,
+  `CR_ERR_UNSATISFIABLE_ROW` 0x4307, `CR_ERR_INFLATED_ROW` 0x4308,
+  `CR_ERR_UNKNOWN_ROWVAR` 0x4309; 246 slots reserved for M4.1+).
+  Diagnostic-family mapping: `E0820_MISSING_CAP` = 0x4303,
+  `E0821_UNSATISFIABLE_ROW` = 0x4307,
+  `E0822_UNKNOWN_CAP` = 0x4301, `E0823_INFLATED_ROW` = 0x4308.
+- Two intra-library linker dependencies (R225.M2 RowTypes:
+  `_rt_row_empty`, `_rt_row_var`, `_rt_row_extend`, `_rt_find`;
+  R225.M1 HmCore `_hm_pool` .bss symbol for node-address
+  arithmetic on walked cursors). No cross-library dependency.
+  (CapRow does NOT call `_rt_row_select`; the env-mask covering
+  check is a direct bit test on the packed-id-extracted idx.)
+- `_cr_parse_scratch : [u8; 64]` dedicated module-local scratch
+  (16 u32 packed-label-id slots) -- deliberately disjoint from
+  R225.M1 `_hm_subst_table`, R225.M2's `[384..512)` restrict/
+  concat slice, AND R224.M3 `_er_parse_scratch` so effect-row and
+  capability-row parse can be invoked from the same shell turn.
+- Label prefix `cr_` with per-function suffix (`cr_ini_`,
+  `cr_look_`, `cr_int_`, `cr_sw_`, `cr_p_`, `cr_ce_`, `cr_r_`);
+  grep-confirmed disjoint from the parallel `cl_` (R221.M4
+  CtxLexer) and every sibling parser-tier module in this library.
+- `design/shell/capability-row-typing.md` (R224.M4 spec; 20-test
+  acceptance corpus enumerated at §7, 8-lambda adversarial anchor
+  at cases 11-18).
+
+#### Changed
+
+- `src/lib.pdx`: `LPX_PDS_PARSER_R224_M4_READY` flipped from 0 to 1
+  (version bump shared with the R221.M4 arm above); module-filename
+  comment extended with `src/cap_row.pdx at R224.M4`; upstream-
+  issues comment extended with `paideia-os#2678 (R224.M4 CapRow)`;
+  design-doc list extended with
+  `design/shell/capability-row-typing.md`.
+- `caps.decl`: added the full 0x4300..0x43FF band section (ten
+  slots used, 246 reserved for M4.1+), the R224.M4 landing
+  paragraph in the per-milestone catalogue (replacing the former
+  R224.M4+ forward-reference comment), the `0x430[0-9]\b` grep-
+  disjointness confirmation line, and the R224.M4 linker-
+  dependency entry (two intra-library deps on RowTypes four-symbol
+  surface + HmCore `_hm_pool`; no cross-library dep).
+- `STATUS.md`: R224.M4 moved from "deferred" to "landed"; the R224
+  wave checklist gains the M4 row; the error-band accounting table
+  gains the `cap_row` + `cap_row-M4.1+` rows.
+
+#### Design notes
+
+- Q-A2 "substructural capability lattice" chosen over Q-A2a
+  (effect+capability conflation; rejected because effects and
+  caps have opposite subtyping directions), Q-A2b (flat set
+  bitmask; rejected because it closes the open-row discipline),
+  and Q-A2c (nominal cap handles; rejected because the surface
+  syntax can't be hand-typed without kernel-minted handles).
+- The capability-row annotation sigil is `@` (0x40), disjoint
+  from R224.M3 EffectRow's `!` (0x21). A lambda type may carry
+  both annotations in either order (`!{io} @{read}` or
+  `@{read} !{io}`); the LambdaLit splice-point at M4.5 is where
+  the ordering convention is enforced.
+- Env-mask covering uses a reg+reg `and r, r` after a
+  `shl r, cl` to build the per-idx mask (shift-by-cl is encoder-
+  validated per `pdxfs/allocator.pdx`, `hda/widget_graph.pdx`,
+  `tb/trusted_device.pdx` precedent). This avoids any
+  `and rN, imm64` which is the pitfall-listed forbidden form.
+- Open-row tails at M4 are optimistically treated as `CR_OK`; a
+  dedicated M4.2 landing tightens the open-row discipline
+  (ROW_VAR tail against a closed env must bind the row-var to
+  the empty row before the covering check concludes OK).
+- Per-row-var naming is deferred to M4.3; every ROW_VAR renders
+  as a bare "rho" at M4.
+- Q-A2 substructural-lattice enforcement (linear caps cannot
+  repeat at a call site) is deferred to M4.7; raw M4 treats every
+  row-ext as a nominal label.
+- Wave 120 lazy-init lesson (R224.M3 EffectRow's debugger-patch
+  pattern) is replicated at every CapRow public API that reads
+  the label table: `_cr_label_lookup`, `_cr_label_intern`,
+  `_cr_parse`, `_cr_check_env`, and `_cr_render` all call
+  `_cr_init` idempotently at entry so a direct caller may invoke
+  the surface without a separate boot step.
+
+#### Linker dependencies
+
+- Intra-library: `_rt_row_empty`, `_rt_row_var`, `_rt_row_extend`,
+  `_rt_find` (R225.M2 RowTypes); `_hm_pool` .bss symbol (R225.M1
+  HmCore).
+- No external cross-library dependency.
+- All seven public entry points can be linked against the
+  RowTypes/HmCore objects that R225.M1/M2 already consume.
+
 ## [1.17.0] -- 2026-10-15
 
 R224.M3 of the lambda-lang umbrella (paideia-os#2488, decomposed

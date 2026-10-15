@@ -13,21 +13,24 @@
 landed. R221.M2 (GraphemeIter: TR#29 grapheme-cluster boundary
 iterator) -- landed. R221.M3 (WidthPass: TR#11 column classifier +
 cluster-aware column accumulator with locale-amb overlay) --
-landed. R222.M1 (SchemasSig parser) -- landed. R222.M2 (CommandSig
-parser) -- landed. R222.M3 (FunctorInstance: instantiation
-materialization record) -- landed. R222.M4 (ArgFlagSpec: HM-typed
-arg + flag descriptors and invocation checker) -- landed. R223.M1
-(Pipeline stage parser) -- landed. R223.M2 (RecordProjection:
-select/project FIELDS) -- landed. R224.M1 (LambdaLit grammar) --
-landed. R224.M2 (ClosureCapture list parser) -- landed. R224.M3
-(EffectRow: effect-polymorphic row sub-grammar + width-covariant
-subtype check per Q-A3) -- landed. R225.M1 (HM algorithm W core)
--- landed. R225.M2 (RowTypes: Remy-style row polymorphism) --
-landed. R226.M1 (Datalog parser) -- landed. R229.M2 (SessionEnv:
-session-scoped bindings) -- landed. R229.M3 (TypeEnv: type-
-environment threading = scheme store + specialisation cache) --
-landed.
-**Version:** 1.17.0.
+landed. R221.M4 (CtxLexer: context-tracking lexer over pipeline /
+datalog / lambda tiers) -- landed. R222.M1 (SchemasSig parser) --
+landed. R222.M2 (CommandSig parser) -- landed. R222.M3
+(FunctorInstance: instantiation materialization record) -- landed.
+R222.M4 (ArgFlagSpec: HM-typed arg + flag descriptors and
+invocation checker) -- landed. R223.M1 (Pipeline stage parser) --
+landed. R223.M2 (RecordProjection: select/project FIELDS) --
+landed. R224.M1 (LambdaLit grammar) -- landed. R224.M2
+(ClosureCapture list parser) -- landed. R224.M3 (EffectRow:
+effect-polymorphic row sub-grammar + width-covariant subtype check
+per Q-A3) -- landed. R224.M4 (CapRow: capability-row sub-grammar
+over Q-A2 substructural lattice + env-mask covering check with
+E0820-family diagnostic) -- landed. R225.M1 (HM algorithm W core) -- landed.
+R225.M2 (RowTypes: Remy-style row polymorphism) -- landed. R226.M1
+(Datalog parser) -- landed. R229.M2 (SessionEnv: session-scoped
+bindings) -- landed. R229.M3 (TypeEnv: type-environment threading
+= scheme store + specialisation cache) -- landed.
+**Version:** 1.18.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -80,9 +83,32 @@ is landed).
       representative OK/error cases and the TR#11 conformance
       slice.
 
-### M4 -- Context-tracking lexer (Pipeline / Datalog / Lambda) (deferred)
+### M4 -- Context-tracking lexer (paideia-os#2654, landed)
 
-Blocked by: M2, M3, and `paideia-as` stdlib R220.M3.
+- [x] **R221.M4-001** -- `src/ctx_lexer.pdx` module `CtxLexer`
+      landed: `_cl_init` boot hook, `_cl_push_ctx` / `_cl_pop_ctx` /
+      `_cl_current_ctx` pure-leaf stack primitives, `_cl_lex_token`
+      pure-leaf single-token lexer, `_cl_tokenize` whole-input
+      walker. 16-byte Token record (kind u16, ctx u8, flags u8,
+      src_offset u32, src_length u32, payload u32); 16-level
+      context stack in `.bss`; 17-value TOK_* enum covering the
+      three tier languages; CL_* status taxonomy in
+      0x4200..0x4207 (band 0x4200..0x42FF with 247 slots reserved
+      for M4.1+ follow-ups).
+- [x] **R221.M4-002** -- design doc landed:
+      `design/shell/ctx-tracking-lexer.md`. 40-example fixture
+      enumerated at §10 (five pipeline-only, ten datalog-only, ten
+      lambda-only, ten nested / cross-context including error
+      cases); the corpus will be goldened at R221.M7 parser fuzz.
+- [ ] **R221.M4-003** (deferred) -- `tests/proptest_ctx_lexer.pdx`
+      40-example fixture + fingerprint golden: filed as R221.M7
+      follow-up per the umbrella decomposition; the design doc §10
+      enumerates the parse-shape and error cases.
+- [ ] **R221.M4-004** (deferred) -- `_cl_init` wire-up in the
+      R229.M3-dispatch kernel-side REPL session boot alongside
+      `_se_init` and `_te_init_session`: filed as R221.M4.5
+      follow-up. The user-space parser-tier satellite does not know
+      its own boot position.
 
 ### M5 -- Unified AST sum type + node constructors (deferred)
 
@@ -293,9 +319,63 @@ rather than a semantic unlock.
       `_er_render`: filed as R224.M3.3 follow-up. Currently
       every `ROW_VAR` renders as bare `rho`.
 
-### M4 -- Capability-row typing (deferred)
+### M4 -- Capability-row typing (paideia-os#2678, landed)
 
-Blocked by: M3 + Q-A2 substructural lattice.
+- [x] **R224.M4-001** -- `src/cap_row.pdx` module `CapRow`
+      landed: `_cr_init` (lazy-populate primitive labels),
+      `_cr_label_lookup` + `_cr_label_intern` (32-slot intern
+      table), `_cr_skip_ws` (WS walker), `_cr_parse`
+      (`WS* @ WS* { LabelList? } ` grammar; builds a RowTypes
+      row via `_rt_row_empty` / `_rt_row_var` / `_rt_row_extend`),
+      `_cr_check_env` (env-mask covering check with packed-label-id
+      offending-cap diagnostic; `CR_ERR_MISSING_CAP` at 0x4303 is
+      the missing-cap rejection anchor and the `E0820_MISSING_CAP`
+      diagnostic), `_cr_render` (round-trip to
+      `@{L1, L2, ..., rho}` source syntax). CR_* status taxonomy
+      in 0x4300..0x4309 (band 0x4300..0x43FF with 246 slots
+      reserved for M4.1+ follow-ups).
+- [x] **R224.M4-002** -- design doc landed:
+      `design/shell/capability-row-typing.md`. 20-test corpus
+      enumerated at §7 (10 parse-shape, 10 env-check including the
+      8-lambda adversarial acceptance anchor; anchor cases 11-18
+      exercise `_cr_check_env({cap_i}, 0) == (packed_id_i << 32) |
+      0x4303` for i in {read, write, exec, net, fs, cap_mint,
+      cap_grant, kalloc}).
+- [x] **R224.M4-003** -- lib.pdx: version 1.17.0 -> 1.18.0 (shared
+      with the parallel R221.M4 CtxLexer landing of Wave 121);
+      `LPX_PDS_PARSER_R224_M4_READY` flipped to 1.
+- [x] **R224.M4-004** -- caps.decl: 0x4300..0x43FF band section +
+      per-milestone catalogue entry + grep-disjointness line +
+      linker-dependency entry.
+- [ ] **R224.M4-005** (deferred) -- `tests/proptest_cap_row.pdx`
+      20-test corpus + fingerprint golden: filed as R224.M4.9
+      follow-up. The design doc §7 enumerates the OK/error cases
+      so a late-landing test harness can golden them from the
+      spec.
+- [ ] **R224.M4-006** (deferred) -- LambdaLit integration pass
+      (`_ll_parse` consumes the optional `@{...}` suffix after
+      the arrow + ResultType, dual with M3.5): filed as R224.M4.5
+      follow-up. Currently the M4 parser is invoked standalone by
+      the downstream HM-type-check tier against a pre-isolated
+      byte slice.
+- [ ] **R224.M4-007** (deferred) -- `_cr_declare` user-declared-
+      capability intern surface: filed as R224.M4.6 follow-up.
+      Currently intern-miss on a non-primitive label returns
+      `CR_ERR_UNKNOWN_CAP`.
+- [ ] **R224.M4-008** (deferred) -- dedup check in `_cr_parse`
+      (`@{read, read}` returns SYNTAX): filed as R224.M4.1 follow-
+      up. Currently duplicates pass through parse and are caught
+      by R225.M2 Rémy unification as `RT_ERR_LABEL_DUP`.
+- [ ] **R224.M4-009** (deferred) -- Q-A2 substructural-lattice
+      enforcement (linear caps cannot repeat at a call site):
+      filed as R224.M4.7 follow-up. Currently every row-ext is
+      treated nominally.
+- [ ] **R224.M4-010** (deferred) -- kernel-side cap-mask bridge
+      (reads per-session cap table): filed as R224.M4.8 follow-up.
+      Currently the caller passes a precomputed `env_mask`.
+- [ ] **R224.M4-011** (deferred) -- per-row-var naming in
+      `_cr_render`: filed as R224.M4.3 follow-up. Currently every
+      `ROW_VAR` renders as bare `rho`.
 
 ### M5 -- Nested lambda + let-rec scoping (deferred)
 
@@ -474,7 +554,9 @@ Blocked by: M4 + pdxfs user profile schema.
 | grapheme_iter-M3+| 0x3804..0x38FF   | R221.M3+  | reserved |
 | width_pass       | 0x3F00..0x3F01   | R221.M3   | landed |
 | width_pass-M3.1+ | 0x3F02..0x3FFF   | R221.M3.1+ | reserved |
-| lexer            | 0x2730..0x274F   | R221.M4   | reserved |
+| ctx_lexer        | 0x4200..0x4207   | R221.M4   | landed |
+| ctx_lexer-M4.1+  | 0x4208..0x42FF   | R221.M4.1+ | reserved |
+| lexer-m1-rsv     | 0x2730..0x274F   | R221.M4-rsv | superseded by ctx_lexer |
 | ast              | 0x2750..0x275F   | R221.M5   | reserved |
 | span_map         | 0x2760..0x276F   | R221.M6   | reserved |
 | schemas_sig      | 0x2A00..0x2A03   | R222.M1   | landed |
@@ -492,6 +574,8 @@ Blocked by: M4 + pdxfs user profile schema.
 | closure_capture-M3+ | 0x3506..0x35FF | R224.M3+ | reserved |
 | effect_row       | 0x4000..0x4007   | R224.M3   | landed |
 | effect_row-M3.1+ | 0x4008..0x40FF   | R224.M3.1+ | reserved |
+| cap_row          | 0x4300..0x4309   | R224.M4   | landed |
+| cap_row-M4.1+    | 0x430A..0x43FF   | R224.M4.1+ | reserved |
 | hm_core          | 0x2D00..0x2D03   | R225.M1   | landed |
 | hm_core-M3+      | 0x2D04..0x2DFF   | R225.M3+  | reserved |
 | row_types        | 0x3600..0x3606   | R225.M2   | landed |
