@@ -4,6 +4,227 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] -- 2026-10-15
+
+R224.M3 of the lambda-lang umbrella (paideia-os#2488, decomposed
+into paideia-os#2677 for this M3) -- EFFECT POLYMORPHISM: a parser-
+tier effect-row sub-grammar and a width-covariant subtype check
+layered over R225.M2 Rémy row polymorphism. Lambdas carry effect
+rows (`A -> B !{io, mem, rho}`) that the type-checker tracks across
+invocations; the pure-argument rejection anchor case
+(`_er_check_subtype({io}, {})`) returns
+`ER_ERR_IMPURE_PASSED_PURE` packed with the offending label id.
+Lands in parallel with Wave 120's R221.M3 WidthPass (1.16.0 above)
+and the parallel R133.M5 kernel-side `pds_typecheck_gate` arm (no
+parser-lib surface).
+
+### Added
+
+- `src/effect_row.pdx` module `EffectRow` (R224.M3,
+  paideia-os#2677): effect-polymorphic row sub-grammar for the
+  paideia-shell lambda surface, following Q-A3 "all effects in
+  rows". Six public entry points:
+  - `_er_init() -> ()` -- lazy-populate the 32-slot label-intern
+     table (6 primitives + 26 user-declared slots) from the
+     96-byte static source table `_er_primitive_init`.
+     Idempotent (count-non-zero short-circuit).
+  - `_er_label_lookup(ptr, len) -> packed_u64` -- linear scan over
+     `_er_label_table[0..count)`; returns `(tag << 24) | idx` on
+     hit, `0xFFFFFFFF` on miss.
+  - `_er_label_intern(ptr, len) -> packed_u64` -- lookup-then-
+     extend; allocates a user-declared slot (`tag = 1`) when the
+     table has room and the name fits in 12 bytes; returns
+     `0xFFFFFFFF` on table-full or over-long.
+  - `_er_skip_ws(bytes, len, cursor) -> cursor` -- pure-leaf WS
+     walker over the WS class {0x20, 0x09, 0x0A, 0x0D}.
+  - `_er_parse(bytes, len, out_row_ref) -> status` -- parses
+     `WS* ! WS* { LabelList? } ` and builds the resulting
+     RowTypes row via `_rt_row_empty` / `_rt_row_var` /
+     `_rt_row_extend`; writes the final pool_idx to
+     `*out_row_ref`. Returns `ER_OK` or `ER_ERR_SYNTAX` /
+     `ER_ERR_UNKNOWN_LABEL` / `ER_ERR_POOL_FULL`.
+  - `_er_check_subtype(sub_row, sup_row) -> packed_u64` -- width-
+     covariant subtype: for every ROW_EXT label in `sub_row` demands
+     the label be present in `sup_row` via `_rt_row_select`.
+     Returns `ER_OK` on success; on failure packs the offending
+     label id in the high 32 bits and sets low 32 to
+     `ER_ERR_IMPURE_PASSED_PURE` (0x4003). Anchor acceptance:
+     `_er_check_subtype({io}, {})` returns
+     `(0x00_000000 << 32) | 0x4003`.
+  - `_er_render(row_ref, out, out_cap) -> packed_u64` -- round-
+     trips the row back to `!{L1, L2, ..., rho}` source syntax.
+     Returns `(bytes_written << 32) | status`.
+- Six primitive effect labels at table slots 0..5: `io` (idx 0),
+  `sysreg` (idx 1), `mem` (idx 2), `caps` (idx 3), `trap` (idx 4),
+  `allocates` (idx 5). Tag 0 = primitive, 1 = user-declared.
+- Pool encoding: an effect row IS a RowTypes row (HM_KIND_TYROW = 4).
+  The RowTypes `arg0` label-hash slot carries a packed
+  `(tag << 24) | idx` label id (24-bit idx with 32-slot cap; 8-bit
+  tag) rather than an FNV-1a 32 hash; the row-aware unifier
+  `_rt_row_unify` handles both interpretations verbatim because
+  label identity reduces to a 32-bit `cmp` on `arg0`. The RowTypes
+  `arg1` field-type slot is 0 (effect labels are nullary; two zero
+  pool_idx values match trivially at `_rt_row_unify`'s identity
+  check).
+- Label-table layout: 32 slots x 16-byte stride = 512 B .bss. Per
+  slot: `[+0] len (u8), [+1] tag (u8), [+2..3] reserved (u16 zero),
+  [+4..15] name (u8[12] right-padded with zero)`.
+- Row-variable convention: any identifier whose first three bytes
+  are `'r','h','o'` is a row-variable tail (no reserved-word
+  table). `rho`, `rho_1`, `rho_tail`, `rhotable` are all row-vars.
+- Error band 0x4000..0x40FF (eight slots used: ER_ERR_SYNTAX at
+  0x4000, UNKNOWN_LABEL 0x4001, LABEL_TABLE_FULL 0x4002,
+  IMPURE_PASSED_PURE 0x4003, POOL_FULL 0x4004, OUT_TOO_SMALL 0x4005,
+  KIND_MISMATCH 0x4006, UNKNOWN_ROWVAR 0x4007; 248 slots reserved
+  for M3.1+ follow-ups).
+- Two intra-library linker dependencies (R225.M2 RowTypes:
+  `_rt_row_empty`, `_rt_row_var`, `_rt_row_extend`, `_rt_find`,
+  `_rt_row_select`; R225.M1 HmCore `_hm_pool` .bss symbol for
+  node-address arithmetic on walked cursors). No cross-library
+  dependency.
+- `_er_parse_scratch : [u8; 64]` dedicated module-local scratch
+  (16 u32 packed-label-id slots) -- deliberately disjoint from
+  R225.M1 `_hm_subst_table` and R225.M2's `[384..512)` restrict/
+  concat slice so effect-row parse and record-row restrict/concat
+  can be reviewed and evolved independently.
+- Label prefix `er_` with per-function suffix (`er_ini_`,
+  `er_look_`, `er_int_`, `er_sw_`, `er_p_`, `er_cs_`, `er_r_`).
+- `design/shell/effect-polymorphism.md` (R224.M3 spec; 20-test
+  acceptance corpus enumerated at §7).
+
+### Changed
+
+- `src/lib.pdx`: version 1.16.0 -> 1.17.0;
+  `LPX_PDS_PARSER_R224_M3_READY` flipped from 0 to 1; module-
+  filename and upstream-issues comment extended for the new
+  module + the new design doc.
+- `caps.decl`: added the full 0x4000..0x40FF band section (eight
+  slots used, 248 reserved for M3.1+), the R224.M3 landing
+  paragraph in the per-milestone catalogue (replacing the former
+  R224.M3+ forward-reference comment), the `0x400[0-7]\b` grep-
+  disjointness confirmation line (with explicit notes on 0x4000
+  as the `OpenType ScriptList` canonical offset, AArch64 PA/MTE
+  instruction family bit, boot-trampoline base, and ACPI opcode
+  neighbourhood all sitting in disjoint semantic namespaces), the
+  Wave 120 kilo-step disjointness note (R224.M3 at 0x4000..0x40FF
+  on a new boundary past the R221.M3 WidthPass 0x3F00..0x3FFF
+  carve-out and the R133.M5 reserved 0x3E00..0x3EFF kernel slot),
+  and the R224.M3 linker-dependency entry (two intra-library deps
+  on RowTypes/HmCore; no cross-library dep).
+- `STATUS.md`: R224.M3 moved from "deferred" to "landed"; the
+  R224 wave checklist gains the M3 row; the error-band accounting
+  reconciled for the landed 0x4000..0x40FF carve-out plus the
+  reserved 0x4008..0x40FF tail.
+
+### Design notes
+
+- Q-A3 "all effects in rows" chosen over Q-A3a (intrinsic set;
+  closes the universe at compile time, breaks user-declared
+  effects at M3.6+), Q-A3b (monadic lift; HM-polymorphism-over-m
+  not available at M3, ergonomics break one-arrow-two-rows
+  symmetry), and Q-A3c (effect+capability conflation;
+  intentionally kept separate because R224.M4 lands a parallel
+  capability row on the same arrow).
+- Width-covariant subtyping is the correct direction because an
+  arrow's effect row describes what the function MAY DO; a
+  consumer that is willing to accept MORE effects can safely use
+  a function that performs FEWER. The producer (sub) is thus
+  obligated to be a subset of the consumer's permission (sup).
+- Open-row tails at M3 are optimistically subsumed; a dedicated
+  M3.2 landing tightens the open-row discipline (sub tail
+  ROW_VAR against a closed sup must bind the row-var to the
+  empty row before the subsume can conclude OK).
+- Per-row-var naming is deferred to M3.3; every ROW_VAR
+  renders as a bare "rho" at M3.
+- `_er_declare` user-declared-effect intern surface is deferred
+  to M3.6; raw M3 treats intern-miss on a non-primitive as
+  ER_ERR_UNKNOWN_LABEL.
+
+### Linker dependencies
+
+- Intra-library: `_rt_row_empty`, `_rt_row_var`, `_rt_row_extend`,
+  `_rt_find`, `_rt_row_select` (R225.M2 RowTypes); `_hm_pool`
+  .bss symbol (R225.M1 HmCore).
+- No external cross-library dependency.
+- All six public entry points can be linked against the
+  RowTypes/HmCore objects that R225.M1/M2 already consume.
+
+## [1.16.0] -- 2026-10-15
+
+R221.M3 of the parser-tier Unicode + lexer umbrella
+(paideia-os#2485, decomposed into paideia-os#2653 for this M3) --
+TR#11 WIDTH PASS: a parser-tier East-Asian-Width column classifier
+and cluster-aware column accumulator that drives cursor-advance and
+column-math for the pds-lang REPL line editor and the terminal grid
+renderer.
+
+### Added
+
+- `src/width_pass.pdx` module `WidthPass` (R221.M3,
+  paideia-os#2653): TR#11 column classifier + cluster-aware
+  accumulator over the R221.M2 TR#29 cluster graph and the
+  R131.M5 substrate `_width_char`.
+  - `_wp_char_width(cp) -> width_u64` -- delegates to substrate
+     `_width_char` for the primary classification; overlays an
+     18-range parser-tier A-class table in `.rodata` iff the
+     active locale amb state is 2 (East-Asian locale).
+  - `_wp_cluster_width(bytes, bytes_len) -> width_u64` -- decodes
+     the cluster's base cp via substrate `utf8_decode_cp` and
+     classifies via `_wp_char_width`. Combining marks after the
+     base are width-0 by substrate classification, so a cluster's
+     TR#11 width is its base's width per TR#11 §5.
+  - `_wp_cols(bytes, bytes_len) -> (cols << 32) | status` --
+     walks the input one TR#29 cluster at a time via R221.M2
+     `_gi_next_cluster` and sums per-cluster widths. Partial
+     accumulator is still meaningful on INVALID_UTF8.
+  - `_wp_locale_amb_width() -> u64` -- reads the `.bss` singleton
+     `_wp_locale_amb_state` (stored as `width - 1` so .bss
+     zero-init decodes to the Western-locale narrow default) and
+     returns `width` in {1, 2}.
+  - `_wp_set_locale_amb(width) -> status` -- validates the input
+     is in {1, 2} and writes `_wp_locale_amb_state := width - 1`.
+     Rejection returns `WP_ERR_BAD_LOCALE_WIDTH` (0x3F01).
+- 18-range A-class overlay table in `.rodata` (144 B aligned to 8)
+  covering Latin-1 Supplement, Latin Extended-A, spacing modifiers,
+  Greek + Coptic, Cyrillic, General Punctuation (coarse), Super /
+  subscripts, Letterlike Symbols, Number Forms, Arrows, Mathematical
+  Operators, Enclosed Alphanumerics, Box Drawing + Block Elements,
+  Geometric Shapes, Miscellaneous Symbols, Dingbats (coarse), and
+  Heavy-large-circle neighbourhood (U+2B55..U+2B59).
+- `.bss` singleton `_wp_locale_amb_state : u64` (aligned to 8).
+- Error band 0x3F00..0x3FFF (two slots used: WP_ERR_INVALID_UTF8
+  at 0x3F00 and WP_ERR_BAD_LOCALE_WIDTH at 0x3F01; 254 slots
+  reserved for M3.1+ follow-ups: locale-amb precise table,
+  Hangul-Jamo scalar handling, TR#14 line-break integration).
+- Three external linker symbols (`_width_char` and `utf8_decode_cp`
+  from libpdx-unicode-tables; `_gi_next_cluster` intra-library from
+  R221.M2). No new KIND surface; no new ambient capability.
+- Label prefix `wp_` with per-function suffix (`wp_cw_`, `wp_cl_`,
+  `wp_co_`, `wp_la_`, `wp_sl_`).
+- `design/shell/width-pass-tr11.md` (R221.M3 spec).
+
+### Changed
+
+- `src/lib.pdx`: version 1.15.0 -> 1.16.0;
+  `LPX_PDS_PARSER_M3_READY` flipped from 0 to 1; module-filename
+  and upstream-issues comment extended for the new module + the new
+  design doc.
+- `caps.decl`: added the full 0x3F00..0x3FFF band section (two
+  slots used, 254 reserved for M3.1+), the R221.M3 landing paragraph
+  in the per-milestone catalogue (replacing the forward-reference
+  comment), the `0x3F0[0-1]\b` grep-disjointness confirmation line
+  (with explicit notes on 0x3F8..0x3FF as COM1 I/O ports and
+  0x3F00..0x3FFF as the DW_AT_hi_user DWARF vendor-attribute bound
+  sitting in disjoint semantic namespaces), the R221.M3 linker-
+  dependency entry (`_width_char` + `utf8_decode_cp` cross-library;
+  `_gi_next_cluster` intra-library), and the Wave 119.5 kilo-step
+  disjointness note (R221.M3 at 0x3F00..0x3FFF; 0x3E00..0x3EFF
+  reserved for the parallel R133.M5 kernel arm).
+- `STATUS.md`: M3 moved from "deferred" to "landed"; error-band
+  accounting table reconciled for landed R221.M2 (0x3800..0x3803)
+  + R221.M3 (0x3F00..0x3F01) slots and the matching reserved
+  carve-outs.
+
 ## [1.15.0] -- 2026-10-15
 
 Wave 119 parallel landing: R222.M4 (ArgSpec + FlagSpec typing). Lands

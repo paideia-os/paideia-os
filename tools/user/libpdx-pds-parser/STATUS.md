@@ -11,19 +11,23 @@
 - R229 (REPL evaluator umbrella, paideia-os#2493)
 **Current milestones:** R221.M1 (UTF-8 decoder + NFC normalizer) --
 landed. R221.M2 (GraphemeIter: TR#29 grapheme-cluster boundary
-iterator) -- landed. R222.M1 (SchemasSig parser) -- landed. R222.M2
-(CommandSig parser) -- landed. R222.M3 (FunctorInstance:
-instantiation materialization record) -- landed. R222.M4
-(ArgFlagSpec: HM-typed arg + flag descriptors and invocation
-checker) -- landed. R223.M1 (Pipeline stage parser) -- landed.
-R223.M2 (RecordProjection: select/project FIELDS) -- landed.
-R224.M1 (LambdaLit grammar) -- landed. R224.M2 (ClosureCapture list
-parser) -- landed. R225.M1 (HM algorithm W core) -- landed. R225.M2
-(RowTypes: Remy-style row polymorphism) -- landed. R226.M1 (Datalog
-parser) -- landed. R229.M2 (SessionEnv: session-scoped bindings) --
-landed. R229.M3 (TypeEnv: type-environment threading = scheme store
-+ specialisation cache) -- landed.
-**Version:** 1.15.0.
+iterator) -- landed. R221.M3 (WidthPass: TR#11 column classifier +
+cluster-aware column accumulator with locale-amb overlay) --
+landed. R222.M1 (SchemasSig parser) -- landed. R222.M2 (CommandSig
+parser) -- landed. R222.M3 (FunctorInstance: instantiation
+materialization record) -- landed. R222.M4 (ArgFlagSpec: HM-typed
+arg + flag descriptors and invocation checker) -- landed. R223.M1
+(Pipeline stage parser) -- landed. R223.M2 (RecordProjection:
+select/project FIELDS) -- landed. R224.M1 (LambdaLit grammar) --
+landed. R224.M2 (ClosureCapture list parser) -- landed. R224.M3
+(EffectRow: effect-polymorphic row sub-grammar + width-covariant
+subtype check per Q-A3) -- landed. R225.M1 (HM algorithm W core)
+-- landed. R225.M2 (RowTypes: Remy-style row polymorphism) --
+landed. R226.M1 (Datalog parser) -- landed. R229.M2 (SessionEnv:
+session-scoped bindings) -- landed. R229.M3 (TypeEnv: type-
+environment threading = scheme store + specialisation cache) --
+landed.
+**Version:** 1.17.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -57,10 +61,24 @@ Blocked by: M1 (consumes `_u8n_decode_and_normalize`'s output
 buffer) + `libpdx-unicode-tables::grapheme._gc_next` (R131.M2, which
 is landed).
 
-### M3 -- TR#11 width table pass (deferred)
+### M3 -- TR#11 width table pass (paideia-os#2653, landed)
 
-Blocked by: M2 + `libpdx-unicode-tables::width._width_char` /
-`_width_str` (R131.M5, which is landed).
+- [x] **R221.M3-001** -- `src/width_pass.pdx` module `WidthPass`
+      landed: `_wp_char_width` (substrate delegate + A-class
+      overlay), `_wp_cluster_width` (base-cp decode + classify),
+      `_wp_cols` (TR#29-walk accumulator), `_wp_locale_amb_width`
+      and `_wp_set_locale_amb` locale-amb accessors. 18-range
+      A-class overlay table in `.rodata` (144 bytes aligned to 8).
+      WP_* status taxonomy in 0x3F00..0x3F01 (band 0x3F00..0x3FFF
+      with 254 slots reserved for M3.1+ follow-ups).
+- [x] **R221.M3-002** -- design doc landed:
+      `design/shell/width-pass-tr11.md`.
+- [ ] **R221.M3-003** -- 50-string visual test corpus +
+      TR#11 conformance vectors (`tests/proptest_width_pass.pdx`):
+      deferred to R221.M7 parser fuzz-corpus milestone per the
+      umbrella decomposition; the design doc §9 enumerates the
+      representative OK/error cases and the TR#11 conformance
+      slice.
 
 ### M4 -- Context-tracking lexer (Pipeline / Datalog / Lambda) (deferred)
 
@@ -222,14 +240,58 @@ because the parser-tier descriptor-emission ABI (frozen above) is
 sufficient for M3+ consumers; integration is a cosmetic unification
 rather than a semantic unlock.
 
-### M3 -- Effect polymorphism (deferred)
+### M3 -- Effect polymorphism (paideia-os#2677, landed)
 
-Blocked by: M1 + paideia-as R220.M8 (open-row effect inference).
-M3 subsumes the "expression body parser" sub-task (walks the opaque
-body bytes `_ll_parse` emitted against the Expr grammar) because the
-HM-pass at R225.M1+ needs the expression AST to seat effect-row
-seeds. The sub-task is NOT a separately-numbered milestone -- it is
-the parser half of M3 and lands with it.
+- [x] **R224.M3-001** -- `src/effect_row.pdx` module `EffectRow`
+      landed: `_er_init` (lazy-populate primitive labels),
+      `_er_label_lookup` + `_er_label_intern` (32-slot intern
+      table), `_er_skip_ws` (WS walker), `_er_parse`
+      (`WS* ! WS* { LabelList? } ` grammar; builds a RowTypes
+      row via `_rt_row_empty` / `_rt_row_var` / `_rt_row_extend`),
+      `_er_check_subtype` (width-covariant subtype check with
+      packed-label-id offending-label diagnostic;
+      `ER_ERR_IMPURE_PASSED_PURE` at 0x4003 is the pure-arg
+      rejection anchor), `_er_render` (round-trip to
+      `!{L1, L2, ..., rho}` source syntax). ER_* status taxonomy
+      in 0x4000..0x4007 (band 0x4000..0x40FF with 248 slots
+      reserved for M3.1+ follow-ups).
+- [x] **R224.M3-002** -- design doc landed:
+      `design/shell/effect-polymorphism.md`. 20-test corpus
+      enumerated at §7 (10 parse-shape, 10 subtype; anchor
+      acceptance case `{io} ⊆ {}` → ER_ERR_IMPURE_PASSED_PURE
+      with offending label 0 is case 13).
+- [x] **R224.M3-003** -- lib.pdx: version 1.16.0 -> 1.17.0;
+      `LPX_PDS_PARSER_R224_M3_READY` flipped to 1.
+- [x] **R224.M3-004** -- caps.decl: 0x4000..0x40FF band section +
+      per-milestone catalogue entry + grep-disjointness line +
+      linker-dependency entry.
+- [ ] **R224.M3-005** (deferred) -- `tests/proptest_effect_row.pdx`
+      20-test corpus + fingerprint golden: filed as R224.M3.9
+      follow-up. The design doc §7 enumerates the OK/error cases
+      so a late-landing test harness can golden them from the
+      spec.
+- [ ] **R224.M3-006** (deferred) -- LambdaLit integration pass
+      (`_ll_parse` consumes the optional `!{...}` suffix after
+      the arrow + ResultType): filed as R224.M3.5 follow-up.
+      Currently the M3 parser is invoked standalone by the
+      downstream HM-type-check tier against a pre-isolated byte
+      slice.
+- [ ] **R224.M3-007** (deferred) -- `_er_declare` user-declared-
+      effect intern surface: filed as R224.M3.6 follow-up.
+      Currently intern-miss on a non-primitive label returns
+      `ER_ERR_UNKNOWN_LABEL`.
+- [ ] **R224.M3-008** (deferred) -- dedup check in `_er_parse`
+      (`!{io, io}` returns SYNTAX): filed as R224.M3.1 follow-up.
+      Currently duplicates pass through parse and are caught by
+      R225.M2 Rémy unification as `RT_ERR_LABEL_DUP`.
+- [ ] **R224.M3-009** (deferred) -- tightened open-row subtype
+      discipline (open sub tail vs closed sup must bind the
+      row-var to empty before subsume concludes OK): filed as
+      R224.M3.2 follow-up. Currently open tails are
+      optimistically subsumed.
+- [ ] **R224.M3-010** (deferred) -- per-row-var naming in
+      `_er_render`: filed as R224.M3.3 follow-up. Currently
+      every `ROW_VAR` renders as bare `rho`.
 
 ### M4 -- Capability-row typing (deferred)
 
@@ -408,8 +470,10 @@ Blocked by: M4 + pdxfs user profile schema.
 | Band             | Range            | Milestone | Status |
 |------------------|------------------|-----------|--------|
 | utf8_nfc         | 0x2700..0x2702   | R221.M1   | landed |
-| grapheme_iter    | 0x2710..0x271F   | R221.M2   | reserved |
-| width_pass       | 0x2720..0x272F   | R221.M3   | reserved |
+| grapheme_iter    | 0x3800..0x3803   | R221.M2   | landed |
+| grapheme_iter-M3+| 0x3804..0x38FF   | R221.M3+  | reserved |
+| width_pass       | 0x3F00..0x3F01   | R221.M3   | landed |
+| width_pass-M3.1+ | 0x3F02..0x3FFF   | R221.M3.1+ | reserved |
 | lexer            | 0x2730..0x274F   | R221.M4   | reserved |
 | ast              | 0x2750..0x275F   | R221.M5   | reserved |
 | span_map         | 0x2760..0x276F   | R221.M6   | reserved |
@@ -426,6 +490,8 @@ Blocked by: M4 + pdxfs user profile schema.
 | lambda_lit-M2+   | 0x2C05..0x2CFF   | R224.M2+  | reserved |
 | closure_capture  | 0x3500..0x3505   | R224.M2   | landed |
 | closure_capture-M3+ | 0x3506..0x35FF | R224.M3+ | reserved |
+| effect_row       | 0x4000..0x4007   | R224.M3   | landed |
+| effect_row-M3.1+ | 0x4008..0x40FF   | R224.M3.1+ | reserved |
 | hm_core          | 0x2D00..0x2D03   | R225.M1   | landed |
 | hm_core-M3+      | 0x2D04..0x2DFF   | R225.M3+  | reserved |
 | row_types        | 0x3600..0x3606   | R225.M2   | landed |
