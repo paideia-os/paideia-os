@@ -4,6 +4,34 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.0] -- 2026-10-15
+
+Wave 124: R221.M7 parser fuzz harness + R223.M3 where/filter/by
+combinator parser. R222.M7 (legacy /bin/sh shim) deferred to a
+dedicated user-binary wave (scope lives in src/user/, not this
+satellite).
+
+### Added
+
+- `src/fuzz_harness.pdx` module `FuzzHarness` (R221.M7, paideia-os#2657):
+  single-entry `_fh_drive(bytes, len)` survivability harness feeding
+  the full parser pipeline (NFC → grapheme → ctx-lexer → pipeline /
+  datalog / lambda). Error band 0x4A00..0x4A01.
+- `src/filter_op.pdx` module `FilterOp` (R223.M3, paideia-os#2668):
+  parses `where { |it| body }`, `filter { |it| body }`, `by expr`
+  into 32B FilterOp record (magic 'FILT'); predicate stored as body
+  byte span (no _ll_parse call at M3). Error band 0x4C00..0x4C09.
+- `design/shell/parser-fuzz-corpus.md` (R221.M7 spec).
+- `design/shell/where-filter-op.md` (R223.M3 spec).
+
+### Changed
+
+- `src/lib.pdx`: version 1.21.0 → 1.22.0; `LPX_PDS_PARSER_M7_READY`
+  and `LPX_PDS_PARSER_R223_M3_READY` both flipped to 1; module-
+  filename / upstream-issues / design-doc comments extended.
+- `caps.decl`: added full 0x4A00..0x4AFF (R221.M7) and 0x4C00..0x4CFF
+  (R223.M3) band sections + Wave 124 linker-dep entries.
+
 ## [1.21.0] -- 2026-10-15
 
 Wave 123 R225.M4 arm: effect-row unification + rank-restricted

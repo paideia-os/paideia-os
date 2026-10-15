@@ -48,7 +48,8 @@ validator; three-entry surface `_eu_unify` / `_eu_check_rank` /
 (Datalog parser) -- landed. R229.M2 (SessionEnv: session-scoped
 bindings) -- landed. R229.M3 (TypeEnv: type-environment threading
 = scheme store + specialisation cache) -- landed.
-**Version:** 1.21.0.
+**Version:** 1.22.0.
+**Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
