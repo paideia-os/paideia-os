@@ -13,14 +13,17 @@
 landed. R221.M2 (GraphemeIter: TR#29 grapheme-cluster boundary
 iterator) -- landed. R222.M1 (SchemasSig parser) -- landed. R222.M2
 (CommandSig parser) -- landed. R222.M3 (FunctorInstance:
-instantiation materialization record) -- landed. R223.M1 (Pipeline
-stage parser) -- landed. R223.M2 (RecordProjection: select/project
-FIELDS) -- landed. R224.M1 (LambdaLit grammar) -- landed. R224.M2
-(ClosureCapture list parser) -- landed. R225.M1 (HM algorithm W
-core) -- landed. R225.M2 (RowTypes: Remy-style row polymorphism)
--- landed. R226.M1 (Datalog parser) -- landed. R229.M2 (SessionEnv:
-session-scoped bindings) -- landed.
-**Version:** 1.13.0.
+instantiation materialization record) -- landed. R222.M4
+(ArgFlagSpec: HM-typed arg + flag descriptors and invocation
+checker) -- landed. R223.M1 (Pipeline stage parser) -- landed.
+R223.M2 (RecordProjection: select/project FIELDS) -- landed.
+R224.M1 (LambdaLit grammar) -- landed. R224.M2 (ClosureCapture list
+parser) -- landed. R225.M1 (HM algorithm W core) -- landed. R225.M2
+(RowTypes: Remy-style row polymorphism) -- landed. R226.M1 (Datalog
+parser) -- landed. R229.M2 (SessionEnv: session-scoped bindings) --
+landed. R229.M3 (TypeEnv: type-environment threading = scheme store
++ specialisation cache) -- landed.
+**Version:** 1.15.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -76,6 +79,66 @@ table alongside the output bytes.
 ### M7 -- Fuzz corpus for parser + Unicode (deferred)
 
 Blocked by: M5. 24-hour AFL run gates landing.
+
+## R222 cmd-functor checklist
+
+### M1 -- SchemasSig body parser (paideia-os#2658, landed)
+
+- [x] `src/schemas_sig.pdx` module `SchemasSig` landed with
+      `_ss_parse_body` + `_ss_match_record` stub, 16-byte field
+      descriptor, SS_* status taxonomy in 0x2A00..0x2AFF.
+
+### M2 -- CommandSig body parser (paideia-os#2659, landed)
+
+- [x] `src/command_sig.pdx` module `CommandSig` landed with
+      `_cs_parse_body` + `_cmd_sig_fnv1a64` leaf, 128-byte header +
+      32-byte CapDecl, CS_* status taxonomy in 0x3300..0x33FF.
+
+### M3 -- FunctorInstance materialization record (paideia-os#2660, landed)
+
+- [x] `src/functor_instance.pdx` module `FunctorInstance` landed
+      with `_fi_instantiate` + `_fi_elaborate_args`, 64-byte header
+      + 32-byte ArgDesc stride, FI_* status taxonomy in
+      0x3900..0x39FF.
+
+### M4 -- ArgSpec + FlagSpec typing (paideia-os#2661, landed)
+
+- [x] **R222.M4-001** -- `src/arg_flag_spec.pdx` module
+      `ArgFlagSpec` landed: `_afs_parse_arg_spec_body` and
+      `_afs_parse_flag_spec_body` emit 32-byte ArgSpec / FlagSpec
+      records; `_afs_check_invocation` walks a FunctorInstance
+      materialization record (R222.M3) against the specs; AFS_*
+      status taxonomy in 0x3C00..0x3CFF. Three pure-leaf helpers
+      (`_afs_skip_ws`, `_afs_classify_type`, `_afs_parse_as_type`).
+- [x] **R222.M4-002** -- design doc landed:
+      `design/shell/arg-flag-spec-typing.md`.
+- [ ] **R222.M4-003** -- 20-test corpus of well-typed + ill-typed
+      invocations (`tests/proptest_arg_flag_spec.pdx`): deferred to
+      R222.M7 fuzz-corpus milestone per the umbrella; the design
+      doc §Acceptance enumerates the 10 well-typed + 10 ill-typed
+      representative cases.
+
+### M5 -- Registry client (deferred)
+
+Blocked by: M4 (consumes ArgSpec + FlagSpec records) + R222.M2
+(CommandSig) + R222.M1 (SchemasSig). Reads commands.toml, materialises
+the per-command spec quartet, hashes into the schema-registry
+fingerprint.
+
+### M6 -- commands.toml bind (deferred)
+
+Blocked by: M5. Adds the `= <literal>` default-value grammar to
+ArgSpec / FlagSpec.
+
+### M7 -- cmd-functor fuzz corpus (deferred)
+
+Blocked by: M4..M6 landed. 20-test parser corpus for each M in the
+R222 wave (SchemasSig / CommandSig / FunctorInstance / ArgFlagSpec).
+
+### M8 -- `describe <cmd>` serialization (deferred)
+
+Blocked by: M4 + M5. Round-trips the (CommandSig + SchemasSig +
+ArgSpec + FlagSpec) quartet through the queryable form.
 
 ## R223 pipeline-lang checklist
 
@@ -303,10 +366,30 @@ Lands at `src/kernel/core/shell/repl_loop.pdx`. Design doc:
       SessionEnv from a production path. The design doc §10
       enumerates the seven steps the golden will assert.
 
-### M3 -- REPL dispatch + full-scheme storage (deferred)
+### M3 -- Type-environment threading (paideia-os#2721, landed)
 
-Blocked by: M2 (SessionEnv substrate) + R225.M4 (effect-row
-unification) + R221.M4 (context-tracking lexer).
+- [x] **R229.M3-001** -- `src/type_env.pdx` module `TypeEnv` landed:
+      `_te_init_session` pure-leaf hook, `_te_insert_scheme` /
+      `_te_evict_scheme` 6-push pure-leaf scanners, `_te_specialize`
+      cache lookup + fallthrough to R225.M1 `_hm_instantiate` on
+      miss. 256-byte Scheme slot (kind u8, flags u8, reserved u16,
+      scheme_len u32, scheme_body u8[248]); 16-byte Cache entry
+      (valid u8, reserved u8[3], scheme_id u32, hash u32, body_ref
+      u32); 8-session x 16-scheme x 64-cache pool; TE_* status
+      taxonomy in 0x3D00..0x3D08.
+- [x] **R229.M3-002** -- design doc landed:
+      `design/shell/type-env-threading.md`.
+- [ ] **R229.M3-003** -- 15-turn polymorphic binding smoke-mode
+      golden (specialisation reuse assertion): deferred to the
+      kernel-side REPL dispatch layer (not R229.M3 of this library),
+      which is the first path that drives TypeEnv from production
+      input. The design doc enumerates the seven observations the
+      golden will assert.
+
+### M3-dispatch -- REPL dispatch wire-up (deferred, kernel-side)
+
+Blocked by: M3 (TypeEnv substrate -- THIS landing) + R225.M4
+(effect-row unification) + R221.M4 (context-tracking lexer).
 
 ### M4 -- Teardown cascade + exported bindings + hash index (deferred)
 
@@ -331,6 +414,10 @@ Blocked by: M4 + pdxfs user profile schema.
 | ast              | 0x2750..0x275F   | R221.M5   | reserved |
 | span_map         | 0x2760..0x276F   | R221.M6   | reserved |
 | schemas_sig      | 0x2A00..0x2A03   | R222.M1   | landed |
+| command_sig      | 0x3300..0x3303   | R222.M2   | landed |
+| functor_instance | 0x3900..0x3906   | R222.M3   | landed |
+| arg_flag_spec    | 0x3C00..0x3C0A   | R222.M4   | landed |
+| arg_flag_spec-M5+| 0x3C0B..0x3CFF   | R222.M5+  | reserved |
 | pipeline         | 0x2B00..0x2B04   | R223.M1   | landed |
 | pipeline-M3+     | 0x2B05..0x2BFF   | R223.M3+  | reserved |
 | record_projection | 0x3400..0x3402  | R223.M2   | landed |
@@ -347,6 +434,8 @@ Blocked by: M4 + pdxfs user profile schema.
 | datalog-M2+      | 0x2E05..0x2EFF   | R226.M2+  | reserved |
 | session_env      | 0x3700..0x3704   | R229.M2   | landed |
 | session_env-M3+  | 0x3705..0x37FF   | R229.M3+  | reserved |
+| type_env         | 0x3D00..0x3D08   | R229.M3   | landed |
+| type_env-M4+     | 0x3D09..0x3DFF   | R229.M4+  | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in

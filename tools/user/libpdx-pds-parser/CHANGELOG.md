@@ -4,6 +4,181 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] -- 2026-10-15
+
+Wave 119 parallel landing: R222.M4 (ArgSpec + FlagSpec typing). Lands
+alongside R229.M3 TypeEnv (1.14.0 above) and the parallel R133.M4
+kernel-side arm (no parser-lib surface).
+
+### Added
+
+- `src/arg_flag_spec.pdx` module `ArgFlagSpec` (R222.M4,
+  paideia-os#2661): HM-typed argument + flag descriptors +
+  invocation-time type-checker.
+  - `_afs_parse_arg_spec_body(bytes, bytes_len, out, out_cap)
+     -> (bytes_written << 32) | status` -- parses `arg : NAME : TYPE
+     [? ...]*` decls into 32-byte ArgSpec records (magic 'ARGS',
+     pos u16, flags u16 OPTIONAL/VARIADIC, type_code u8, name_len u8,
+     name_inline `[u8; 14]`, default_ref u64).
+  - `_afs_parse_flag_spec_body(bytes, bytes_len, out, out_cap)
+     -> (bytes_written << 32) | status` -- parses `flag : --LONG [,
+     -S] [: TYPE] [+]` decls into 32-byte FlagSpec records (magic
+     'FLAG', flags u16 TAKES_VALUE/REPEATABLE, short_char u8,
+     long_len u8, long_name `[u8; 14]`, type_code u8).
+  - `_afs_check_invocation(args_body, args_len, flags_body,
+     flags_len, invocation, inv_len) -> status` -- walks the
+     ArgDesc stream of a FunctorInstance (R222.M3) materialization
+     record against the ArgSpec + FlagSpec records, promoting
+     mismatches to packed-status diagnostics referenced to each
+     ArgDesc's `(ref_ptr, length)` source span.
+  - Pure-leaf helpers: `_afs_skip_ws`, `_afs_classify_type` (mirrors
+     R222.M1 SchemasSig byte-for-byte), `_afs_parse_as_type`
+     (per-type byte-run validator).
+  - Type codes AFS_TYPE_* (U64=1, I64=2, STR=3, HEX=4, HASH32=5,
+     TSC=6, PATH=8, PID=9) mirror SchemasSig SS_TYPE_* and
+     FunctorInstance FI_TYPE_* byte-for-byte.
+  - Error band 0x3C00..0x3C0A (11 slots: SYNTAX, UNKNOWN_TYPE,
+     TOO_MANY_ARGS, TOO_MANY_FLAGS, OUT_TOO_SMALL, BAD_INVOCATION,
+     TYPE_MISMATCH, MISSING_REQUIRED, UNKNOWN_FLAG, FLAG_NO_VALUE,
+     EXTRA_POS). Slots 0x3C0B..0x3CFF reserved for R222.M5+.
+- Record layout notes:
+  - Both records are strict 32 bytes (power-of-2 stride for
+    `shl rN, 5`). The brief's trailing `reserved[4]` on ArgSpec and
+    `reserved[11]` on FlagSpec would have overflowed the stated
+    32-byte total; this landing shrinks the FlagSpec trailer to
+    `reserved[9]` and drops the ArgSpec trailer entirely.
+  - HASH32 wire shape = `"0x" + exactly 16 hex digits` (64-bit
+    identity hash, matching FNV-1a 64 used elsewhere in R222).
+- Pure in-process; no KIND surface; no external linker dependency.
+- Label prefix `afs_` (grep-confirmed free of linker-visible symbol
+  collisions; libpdx-audit's audit_file_sink uses the same prefix for
+  FUNCTION-LOCAL labels, which do not cross the object-graph
+  boundary).
+- `design/shell/arg-flag-spec-typing.md` (R222.M4 spec).
+
+### Changed
+
+- `src/lib.pdx`: version 1.14.0 -> 1.15.0;
+  `LPX_PDS_PARSER_R222_M4_READY` flipped to 1; module-filename list
+  and upstream-issues comment extended for the new module + the new
+  design doc.
+- `caps.decl`: added the full 0x3C00..0x3CFF band section, the
+  R222.M4 landing paragraph to the per-milestone catalogue, the
+  `0x3C0[0-9A]\b` grep-disjointness confirmation line (with explicit
+  note that 0x3C00 as the fp16 bit pattern for 1.0 in scrgb /
+  hdr10_transform / scrgb_synth sits in a disjoint semantic
+  namespace), and the R222.M4 linker-dependency entry (NO external
+  linker deps; no cross-library dep; no cross-module CALL into
+  functor_instance.pdx -- the invocation record is consumed BY VALUE
+  through the caller-passed byte pointer).
+
+## [1.14.0] -- 2026-10-15
+
+R229.M3 of the semantic-shell REPL evaluator umbrella
+(paideia-os#2493, decomposed into paideia-os#2721 for this M3) --
+TYPE-ENVIRONMENT THREADING: a per-session scheme store keyed by
+`(session_id, scheme_id)` plus a memoised specialisation cache keyed
+by `(session_id, scheme_id, type_vector_hash)`. The piece R229.M2
+(SessionEnv) deferred: SessionEnv stores a u32 type_ref and leaves
+the interpretation to the REPL dispatch; for a POLYMORPHIC binding
+`let id = \x. x : forall a. a -> a`, the type_ref is now a TypeEnv
+scheme_id (SessionEnv scheme_kind = SE_SCHEME_BLOB = 2), and
+`_te_specialize` returns a cached monomorphic body on repeat uses
+within the same session.
+
+### Added
+
+- `src/type_env.pdx` module `TypeEnv` (R229.M3, paideia-os#2721):
+  session-scoped scheme store + specialisation cache.
+  - `_te_init_session(session_id) -> errno` -- zero the per-session
+    scheme row (4096 B), cache row (1024 B), and head row (8 B).
+  - `_te_insert_scheme(session_id, scheme_body, scheme_len,
+     out_scheme_id) -> errno` -- append-only insert at the session's
+    scheme_count; writes 1-based scheme_id via out pointer.
+  - `_te_specialize(session_id, scheme_id, type_vec_hash,
+     out_body_ref) -> errno` -- hit the 64-entry cache row on
+    `(valid, scheme_id, hash)` match; on miss, call
+    `_hm_instantiate` (R225.M1 cross-module) and cache the result at
+    cache_cursor (round-robin FIFO over 64 slots). Propagates
+    HM_ERR_* as TE_ERR_HM_* (0x3D05/0x3D06/0x3D07/0x3D08).
+  - `_te_evict_scheme(session_id, scheme_id) -> errno` -- tombstone
+    the scheme slot (kind := EMPTY) and invalidate every matching
+    cache entry (valid := 0); scheme_count is NOT decremented
+    (append-only, like SessionEnv).
+- Scheme slot layout (256 B stride, TE_SCHEME_SLOT_BYTES): kind u8,
+  flags u8, reserved u16, scheme_len u32, scheme_body u8[248].
+- Cache entry layout (16 B stride, TE_CACHE_ENTRY_BYTES): valid u8,
+  reserved u8[3], scheme_id u32, hash u32, body_ref u32.
+- Working-memory singleton `.bss` state:
+  - `_te_scheme_pool : [u8; 32768] @align(8)` -- 8 sessions x 4096 B.
+  - `_te_cache_pool  : [u8; 8192]  @align(8)` -- 8 sessions x 1024 B.
+  - `_te_head_table  : [u8; 64]    @align(8)` -- 8 x 8-byte head rows
+    (scheme_count u8 + cache_cursor u8 + reserved u8[6]).
+- Error band 0x3D00..0x3D08 (9 slots: TE_OK, TE_ERR_BAD_SESSION,
+  TE_ERR_BAD_SCHEME_ID, TE_ERR_NOT_FOUND, TE_ERR_TOO_MANY,
+  TE_ERR_BAD_LEN, TE_ERR_HM_POOL_FULL, TE_ERR_HM_MISMATCH,
+  TE_ERR_HM_OUT_TOO_SMALL, TE_ERR_HM_OCCURS). Slots 0x3D09..0x3DFF
+  reserved for R229.M4+.
+- `design/shell/type-env-threading.md` (R229.M3 spec).
+
+### Changed
+
+- `src/lib.pdx`: version 1.13.0 -> 1.14.0;
+  `LPX_PDS_PARSER_R229_M3_READY` flipped to 1; module-filename list
+  and upstream-issues comment extended for the new module + the new
+  design doc. (`LPX_PDS_PARSER_R229_M3_READY` semantics tightened:
+  originally labelled "REPL dispatch + full-scheme storage"; the
+  full-scheme storage half lands HERE as TypeEnv, with the dispatch
+  half deferred to the kernel-side REPL layer -- the lib flag now
+  reads "Type-environment threading (scheme store + specialisation
+  cache)".)
+- `caps.decl`: added the R229.M3 TypeEnv paragraph to the per-
+  milestone catalogue; added the full 0x3D00..0x3DFF band section;
+  added the `0x3D0[0-8]` grep-disjointness confirmation line; added
+  the R229.M3 linker-dependency note (NO external cross-library
+  dep; intra-library dep on hm_core.pdx `_hm_instantiate` only).
+- `STATUS.md`: version 1.13.0 -> 1.14.0; R229.M3 added to the
+  Current milestones paragraph; R229.M3 checklist filled out; the
+  Error-band accounting table gains a `type_env` row.
+
+### Design notes
+
+- SessionEnv's existing `scheme_kind == SE_SCHEME_BLOB (2)` tag is
+  now operational: the REPL dispatch at R229.M3+ allocates TypeEnv
+  scheme_ids and writes them into SessionEnv Binding records' u32
+  type_ref payload. On lookup, dispatch reads scheme_kind; if 2, it
+  calls `_te_specialize` to materialise a monomorphic body. On
+  unset, dispatch calls `_te_evict_scheme` BEFORE
+  `_se_unset_binding` so the cache is scrubbed first.
+- Specialisation cache is round-robin FIFO (64 entries per session,
+  one write cursor per session in head[sid*8+1]). A read-heavy
+  session where the same polymorphic binding is used repeatedly
+  with the same instantiations hits the cache; a session that
+  cycles through more than 64 distinct instantiations rotates the
+  oldest out. This is a conservative baseline; R229.M5+ may swap
+  for an LRU once the eviction cost is observed.
+- Scheme storage is append-only + tombstone-evict (no compaction at
+  M3): a session that evicts and re-inserts a scheme consumes two
+  scheme_id slots. 16 slots per session comfortably seats the
+  15-turn test from paideia-os#2721. Compaction is R229.M5+.
+- `_te_specialize` is the ONE nested-CALL function in TypeEnv; the
+  Wave-118 lesson (full-u64 cmp on CALL return) is honoured on the
+  `_hm_instantiate` status check, and the two post-CALL `.bss`
+  accesses reload `_te_head_table` + `_te_cache_pool` via fresh
+  `lea r11, [rip+sym]` because the nested CALL clobbers r11.
+
+### Notes
+
+- No new kernel KIND dependency.
+- `_te_insert_scheme` + `_te_evict_scheme` are pure-leaf scanners
+  (6-push callee-save frames, no `sub rsp` pad). `_te_specialize`
+  takes a `sub rsp, 8` for its body_idx local AND to align
+  rsp%16==0 at the nested `_hm_instantiate` CALL.
+- Fingerprint emission deferred to R229.M3-dispatch (same posture
+  as SessionEnv at R229.M2); the structured TE_* enum is the
+  observation point until a REPL-dispatch asserting-smoke-mode
+  golden lands.
+
 ## [1.13.0] -- 2026-10-15
 
 Wave 118 parallel landing: R221.M2 (TR#29 grapheme cluster iterator)

@@ -1,0 +1,1067 @@
+// src/type_env.pdx -- libpdx-pds-parser.R229.M3 (paideia-os#2721)
+//
+// TypeEnv: session-scoped type-scheme store + memoised specialisation
+// cache. The piece R229.M2 (SessionEnv) deferred: SessionEnv stores a
+// u32 type_ref per binding and leaves the interpretation to the REPL
+// dispatch at R229.M3+. For a MONOMORPHIC binding `let x : u64 = 42`,
+// the type_ref IS the HmCore pool index (SE_SCHEME_DIRECT, kind 1) and
+// no second lookup is needed. For a POLYMORPHIC binding `let id =
+// \x. x` whose principal type is `forall a. a -> a`, the one HmCore
+// pool index cannot carry the quantified-var set (HmCore nodes carry
+// no quantifier mark; only `_hm_instantiate` reads a scheme byte
+// stream). R229.M3 stores the scheme bytes HERE, keyed by a per-
+// session scheme_id, and layers a specialisation CACHE so that two
+// uses of `id` at identical monomorphic contexts in the same session
+// share one `_hm_instantiate` result.
+//
+// SessionEnv's scheme_kind field at [+2] discriminates: scheme_kind
+// = 1 (SE_SCHEME_DIRECT) -- type_ref is the HmCore pool_idx and
+// TypeEnv is NOT consulted; scheme_kind = 2 (SE_SCHEME_BLOB) --
+// type_ref is a TypeEnv scheme_id (1..TE_MAX_SCHEMES per session) and
+// the REPL dispatch calls `_te_specialize` to materialise a
+// monomorphic body.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R229 is the REPL evaluator umbrella (paideia-os#2493). R229.M1
+// landed the per-cycle state machine (kernel-side, src/kernel/core/
+// shell/repl_loop.pdx). R229.M2 landed the per-session binding map
+// (THIS satellite, src/session_env.pdx). R229.M3 (THIS module) lands
+// the type-environment-threading substrate: scheme storage keyed by
+// (session_id, scheme_id) + memoised instantiations keyed by
+// (session_id, scheme_id, type_vector_hash).
+//
+// Position in the substrate graph:
+//
+//   TTY ISR -> _rl_tick (R229.M1) -> state := PARSED
+//        -> _rl_dispatch (R229.M3+ -- not landed here) -- parses,
+//           infers, evaluates
+//              -> _se_insert_binding / _se_lookup_binding
+//                   (R229.M2, src/session_env.pdx)
+//              -> _te_insert_scheme / _te_specialize / _te_evict_scheme
+//                   (R229.M3, THIS module) for polymorphic bindings
+//              -> _hm_instantiate (R225.M1, src/hm_core.pdx) called by
+//                 _te_specialize on cache miss
+//        -> state := WRITING -> _rl_emit_prompt -> READING
+//
+// TypeEnv is PARSER-TIER by geography (same satellite library as
+// SessionEnv, HmCore, LambdaLit, Pipeline, etc.) but is NOT itself a
+// parser -- the module stores opaque scheme byte streams and hands
+// out pool indices via `_hm_instantiate`. The REPL dispatch at
+// R229.M3+ (not landed here) is where the two sides reify against
+// the kernel-touching tier.
+//
+// Lives user-space because the shell runs user-space; the pools are
+// caller-process-local (singleton .bss); the module touches no kernel
+// KIND and consumes no capability (caps.decl R229.M3 band note).
+//
+// =============================================================================
+// RECORD LAYOUT
+// =============================================================================
+//
+// Scheme slot (256 B, TE_SCHEME_SLOT_BYTES):
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      1   kind         u8  TE_SLOT_EMPTY (0) / TE_SLOT_ACTIVE (1)
+//     1      1   flags        u8  reserved; 0 at M3.
+//     2      2   reserved     u16 padding to align scheme_len at +4.
+//     4      4   scheme_len   u32 1..TE_SCHEME_PAYLOAD_MAX (248).
+//     8    248   scheme_body  u8[248] HmCore scheme wire format
+//                                     (header 8 B + bound_var_ids
+//                                     4 B each + body nodes 16 B each).
+//
+//   total: 256 B
+//
+// Per-session scheme row (TE_SCHEME_ROW_BYTES = 4096 B): 16 slots x
+// 256 B. Session row base = `_te_scheme_pool + sid * 4096` -- `shl r,
+// 12` (no 2-op `imul`).
+//
+// Specialisation cache entry (16 B, TE_CACHE_ENTRY_BYTES):
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      1   valid        u8  TE_CE_EMPTY (0) / TE_CE_ACTIVE (1)
+//     1      3   reserved     u8[3] padding to u32 alignment.
+//     4      4   scheme_id    u32 1..TE_MAX_SCHEMES.
+//     8      4   hash         u32 FNV-1a 32 (or caller-chosen) hash of
+//                                 the instantiation's monomorphic
+//                                 type-vector.
+//    12      4   body_ref     u32 HmCore _hm_pool index (1..127) of
+//                                 the memoised instantiation's root.
+//
+//   total: 16 B
+//
+// Per-session cache row (TE_CACHE_ROW_BYTES = 1024 B): 64 entries x
+// 16 B. Session row base = `_te_cache_pool + sid * 1024` -- `shl r,
+// 10`. Entry stride = `shl r, 4`.
+//
+// Head-table (TE_HEAD_TABLE_BYTES = 64 B): 8 sessions x 8 B/row. Per
+// session:
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      1   scheme_count u8  0..TE_MAX_SCHEMES (16). Append cursor
+//                                 (also the first-free slot index at
+//                                 insert time -- append-only; eviction
+//                                 does NOT compact).
+//     1      1   cache_cursor u8  0..TE_MAX_CACHE_ENTRIES (64). Round-
+//                                 robin write index into the cache row
+//                                 on insert; the scan is still linear
+//                                 across all 64 entries, so eviction
+//                                 is deterministic FIFO under full-row
+//                                 pressure.
+//     2      6   reserved     u8[6] padding.
+//
+// Head row base = `_te_head_table + sid * 8` -- `shl r, 3`.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _te_init_session(session_id) -> errno
+//     Attaches / resets the per-session scheme pool, cache row, and
+//     head row. Zeroes 4096 B scheme pool row (512 u64 stores),
+//     1024 B cache row (128 u64 stores), and writes 0 to
+//     _te_head_table[session_id] (one u64 store).
+//     TE_OK on success; TE_ERR_BAD_SESSION on session_id >= 8.
+//
+//   _te_insert_scheme(session_id, scheme_body, scheme_len,
+//                     out_scheme_id) -> errno
+//     Appends a scheme to the session's slot table at scheme_count.
+//     Validates scheme_len in [8..248] (header-at-least + fits payload).
+//     Writes scheme_id (1-based) via out_scheme_id.
+//     TE_OK on success; TE_ERR_BAD_SESSION / TE_ERR_BAD_LEN /
+//     TE_ERR_TOO_MANY on guards.
+//
+//   _te_specialize(session_id, scheme_id, type_vec_hash,
+//                  out_body_ref) -> errno
+//     Hit path: scans the 64-entry cache row for (valid == 1 AND
+//     stored scheme_id == rsi AND stored hash == rdx32); on match
+//     writes body_ref to [out_body_ref] and returns TE_OK.
+//     Miss path: resolves the scheme slot, validates kind == ACTIVE,
+//     calls `_hm_instantiate(scheme_body, scheme_len, &local_body_idx)`.
+//     On HM_OK: writes an entry into the cache at cache_cursor
+//     (round-robin FIFO over the 64 slots), bumps cache_cursor mod 64,
+//     writes body_ref to [out_body_ref], returns TE_OK.
+//     TE_OK on hit or on successful instantiate; TE_ERR_BAD_SESSION /
+//     TE_ERR_BAD_SCHEME_ID / TE_ERR_NOT_FOUND (slot is empty) /
+//     TE_ERR_HM_POOL_FULL / TE_ERR_HM_MISMATCH / TE_ERR_HM_OUT_TOO_SMALL
+//     on guards.
+//
+//   _te_evict_scheme(session_id, scheme_id) -> errno
+//     Marks the scheme slot kind := TE_SLOT_EMPTY (tombstone -- the
+//     scheme_count counter is NOT decremented, so subsequent
+//     _te_insert_scheme calls do NOT reuse this id). Walks all 64
+//     cache entries and invalidates every entry whose scheme_id
+//     matches (so a later _te_specialize miss cannot read a stale
+//     body_ref). TE_OK on hit; TE_ERR_NOT_FOUND on scheme_id > count
+//     or already-empty slot.
+//
+// Register maps (SysV):
+//
+//   _te_init_session(rdi)                                 -> rax
+//   _te_insert_scheme(rdi, rsi, rdx, rcx)                 -> rax
+//   _te_specialize(rdi, rsi, rdx, rcx)                    -> rax
+//   _te_evict_scheme(rdi, rsi)                            -> rax
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE  --  0x3D00..0x3DFF
+// =============================================================================
+//
+// Type-env packed-status range. Nine slots used at R229.M3:
+//
+//   TE_OK                   = 0
+//   TE_ERR_BAD_SESSION      = 0x3D00
+//   TE_ERR_BAD_SCHEME_ID    = 0x3D01
+//   TE_ERR_NOT_FOUND        = 0x3D02
+//   TE_ERR_TOO_MANY         = 0x3D03  (scheme_count == 16 on insert)
+//   TE_ERR_BAD_LEN          = 0x3D04  (scheme_len < 8 or > 248)
+//   TE_ERR_HM_POOL_FULL     = 0x3D05  (_hm_instantiate returned 0x2D02)
+//   TE_ERR_HM_MISMATCH      = 0x3D06  (_hm_instantiate returned 0x2D01)
+//   TE_ERR_HM_OUT_TOO_SMALL = 0x3D07  (_hm_instantiate returned 0x2D03)
+//   TE_ERR_HM_OCCURS        = 0x3D08  (_hm_instantiate returned 0x2D00
+//                                      -- won't happen on a well-formed
+//                                      scheme, reserved for future call
+//                                      sites that unify through here)
+//
+// Slots 0x3D09..0x3DFF reserved for R229.M4+ (TE_ERR_CROSS_SESSION on
+// an export-flag violation, TE_ERR_SCHEME_VERSION_MISMATCH on a
+// persisted-env load, etc.).
+//
+// Disjoint from every other parser-tier packed-status band:
+//   * utf8_nfc        0x2700..0x27FF   (R221.M1)
+//   * schemas_sig     0x2A00..0x2AFF   (R222.M1)
+//   * pipeline        0x2B00..0x2BFF   (R223.M1)
+//   * lambda_lit      0x2C00..0x2CFF   (R224.M1)
+//   * hm_core         0x2D00..0x2DFF   (R225.M1)
+//   * datalog         0x2E00..0x2EFF   (R226.M1)
+//   * repl_loop       0x3000..0x30FF   (R229.M1, kernel-side RL_*)
+//   * command_sig     0x3300..0x33FF   (R222.M2)
+//   * record_projection 0x3400..0x34FF (R223.M2)
+//   * closure_capture 0x3500..0x35FF   (R224.M2)
+//   * row_types       0x3600..0x36FF   (R225.M2)
+//   * session_env     0x3700..0x37FF   (R229.M2)
+//   * grapheme_iter   0x3800..0x38FF   (R221.M2)
+//   * functor_instance 0x3900..0x39FF  (R222.M3)
+//   * (R133.M3 import graph owns 0x3A00..0x3BFF kernel-side -- the
+//      0x3C00..0x3CFF slice is parallel-reserved for R222.M4 ArgSpec)
+//   * type_env        0x3D00..0x3DFF   (R229.M3, THIS)
+//
+// Grep confirmation at R229.M3 landing time:
+//
+//   grep -rE '0x3D0[0-8]\b' paideia-os/{src,tools,design,tests}
+//     -> no packed-status hits outside this file + caps.decl +
+//        design/shell/type-env-threading.md.
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R225.M1 (hm_core.pdx) -- TypeEnv CALLs `_hm_instantiate` on every
+//     cache miss. Scheme wire format MUST match _hm_instantiate's
+//     expectation (8 B header + 4 B/bound-var + 16 B/body-node). The
+//     HM_ERR_* return codes propagate through TypeEnv's TE_ERR_HM_*
+//     band so a downstream dispatcher's compound error path can
+//     discriminate "scheme malformed" from "pool exhausted" from
+//     "TypeEnv's own slot table full".
+//
+//   R229.M2 (session_env.pdx) -- the REPL dispatch at R229.M3+
+//     allocates TypeEnv scheme_ids and writes them into SessionEnv's
+//     32-byte Binding records as the type_ref u32 payload with
+//     scheme_kind = SE_SCHEME_BLOB (2). On `unset x`, the dispatch
+//     reads the Binding's scheme_kind + type_ref and, if scheme_kind
+//     == 2, calls `_te_evict_scheme(sid, type_ref)` BEFORE
+//     `_se_unset_binding` so the cache is scrubbed first.
+//
+//   R127.M1 (shell_session.pdx) -- session_id is validated by the
+//     caller against ss_row_in_use before reaching here; TypeEnv only
+//     range-checks against TE_MAX_SESSIONS (8).
+//
+//   R127.M6 (session teardown) -- R229.M4+ adds a cascade step that
+//     calls `_te_init_session(sid)` on destroy; M3 relies on sid-reuse's
+//     next `_te_init_session` to scrub any stale row.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32.
+//   - No 2-op `imul r, imm` -- session scheme-pool base uses
+//     `shl rN, 12` (* 4096), session cache-pool base uses
+//     `shl rN, 10` (* 1024), scheme-slot stride uses `shl rN, 8`
+//     (* 256), cache-entry stride uses `shl rN, 4` (* 16), head-
+//     table stride uses `shl rN, 3` (* 8).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `TypeEnv` matches `type_env.pdx`.
+//   - Labels prefixed `te_` (grep-disjoint from `ss_` / `sh_` /
+//     `sj_` / `hf_` / `cr_` / `rl_` kernel namespaces and the
+//     parser-tier `u8n_` / `pl_` / `rp_` / `ll_` / `cc_` / `hm_` /
+//     `rt_` / `dl_` / `sch_sig_` / `cmd_sig_` / `se_` / `fi_` /
+//     `gi_` namespaces). No bare `loop`, `if`, `let`, `fn`, `ret`,
+//     or `done` reserved-keyword labels.
+//   - All `cmp reg, imm` immediates (bands 0x3D00..0x3D08, caps 8,
+//     16, 64, 248, pool-cap sentinels) fit imm32 with bit 31 clear
+//     so direct `cmp reg, imm32` is sign-extension-safe. No MOVABS
+//     staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + idx*1]`.
+//   - Byte stores via `mov_b [dst + disp], reg`.
+//   - u32 stores via `mov_d [dst + disp], reg`.
+//   - u32 loads via `xor r, r; mov_d r, [base + disp]`
+//     (zero-extends per SDM Vol.1 3.4.1.1).
+//   - u64 stores via `mov [dst + disp], reg`.
+//   - `.bss` writes via `lea r11, [rip + sym]; mov [r11 + disp], reg`.
+//     r11 is caller-save and nested CALLs clobber it -- the one
+//     function that CALLs (_te_specialize via _hm_instantiate)
+//     reloads `_te_cache_pool` / `_te_head_table` via a fresh `lea`
+//     after each CALL. (feedback: register-liveness audit lesson
+//     Wave 118.)
+//   - Full-u64 status comparison on the CALL return from
+//     `_hm_instantiate` (`cmp rax, 0; jne ...`) -- NOT a low-byte-
+//     only check (feedback_pdx_encoder_pitfalls Wave 118 lesson: a
+//     packed-return with low byte 0 would false-positive the OK path).
+//   - `_te_init_session`, `_te_insert_scheme`, `_te_evict_scheme`
+//     are pure leaves (no nested CALL) and omit the `sub rsp` align
+//     pad. `_te_specialize` CALLs `_hm_instantiate` and so takes
+//     `sub rsp, 8` to seat the body_idx local AND align rsp%16==0
+//     at the CALL.
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R229.M4  Session teardown cascade step; cross-session exported
+//            schemes (flags bit 0); persisted scheme-id namespace.
+//   R229.M5  Lexical nested scopes -- a sub-row per nested lambda.
+//   R229.M6+ Persistent per-user scheme catalogue over pdxfs.
+//
+// =============================================================================
+// Upstream: paideia-os#2493 (R229 REPL evaluator umbrella),
+// paideia-os#2721 (THIS ticket, R229.M3 Type-environment threading),
+// paideia-os#2720 (R229.M2 SessionEnv), paideia-os#2682 (R225.M1
+// HmCore). Design doc: design/shell/type-env-threading.md.
+
+module TypeEnv = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax)
+  // ==========================================================================
+  //
+  // Small-value range 0x3D00..0x3DFF, reserved for R229.M3 type-env.
+  // Disjoint from every other parser-tier packed-status range in the
+  // paideia-os tree.
+  //
+  // Grep confirmation at R229.M3 landing time:
+  //   grep -rE '0x3D0[0-8]\b' paideia-os/{src,tools,design,tests}
+  //     -> no packed-status hits outside this file + caps.decl +
+  //        design/shell/type-env-threading.md.
+
+  pub let TE_OK                   : u64 = 0
+  pub let TE_ERR_BAD_SESSION      : u64 = 0x3D00
+  pub let TE_ERR_BAD_SCHEME_ID    : u64 = 0x3D01
+  pub let TE_ERR_NOT_FOUND        : u64 = 0x3D02
+  pub let TE_ERR_TOO_MANY         : u64 = 0x3D03
+  pub let TE_ERR_BAD_LEN          : u64 = 0x3D04
+  pub let TE_ERR_HM_POOL_FULL     : u64 = 0x3D05
+  pub let TE_ERR_HM_MISMATCH      : u64 = 0x3D06
+  pub let TE_ERR_HM_OUT_TOO_SMALL : u64 = 0x3D07
+  pub let TE_ERR_HM_OCCURS        : u64 = 0x3D08
+
+  // ==========================================================================
+  // SECTION 2 -- LAYOUT CONSTANTS
+  // ==========================================================================
+
+  pub let TE_MAX_SESSIONS       : u64 = 8      // sid * 4096 is shl 12
+  pub let TE_MAX_SCHEMES        : u64 = 16     // per-session scheme slots
+  pub let TE_MAX_CACHE_ENTRIES  : u64 = 64     // per-session cache slots
+  pub let TE_SCHEME_SLOT_BYTES  : u64 = 256    // slot stride (shl 8)
+  pub let TE_SCHEME_PAYLOAD_MAX : u64 = 248    // body cap per slot
+  pub let TE_SCHEME_HDR_MIN     : u64 = 8      // hm scheme header bytes
+  pub let TE_SCHEME_ROW_BYTES   : u64 = 4096   // 16 slots x 256 bytes
+  pub let TE_SCHEME_POOL_BYTES  : u64 = 32768  // 8 sessions x 4096
+  pub let TE_CACHE_ENTRY_BYTES  : u64 = 16     // entry stride (shl 4)
+  pub let TE_CACHE_ROW_BYTES    : u64 = 1024   // 64 entries x 16 bytes
+  pub let TE_CACHE_POOL_BYTES   : u64 = 8192   // 8 sessions x 1024
+  pub let TE_HEAD_TABLE_BYTES   : u64 = 64     // 8 x 8-byte head row
+
+  // Scheme slot kind (byte at [slot + 0]).
+  pub let TE_SLOT_EMPTY  : u64 = 0
+  pub let TE_SLOT_ACTIVE : u64 = 1
+
+  // Cache entry validity (byte at [entry + 0]).
+  pub let TE_CE_EMPTY  : u64 = 0
+  pub let TE_CE_ACTIVE : u64 = 1
+
+  // Scheme slot offsets.
+  pub let TE_SCH_OFF_KIND    : u64 = 0
+  pub let TE_SCH_OFF_FLAGS   : u64 = 1
+  pub let TE_SCH_OFF_LEN     : u64 = 4
+  pub let TE_SCH_OFF_PAYLOAD : u64 = 8
+
+  // Cache entry offsets.
+  pub let TE_CE_OFF_VALID     : u64 = 0
+  pub let TE_CE_OFF_SCHEME_ID : u64 = 4
+  pub let TE_CE_OFF_HASH      : u64 = 8
+  pub let TE_CE_OFF_BODY_REF  : u64 = 12
+
+  // Head-table per-session byte offsets.
+  pub let TE_HD_OFF_SCHEME_COUNT : u64 = 0
+  pub let TE_HD_OFF_CACHE_CURSOR : u64 = 1
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _te_scheme_pool : [u8; 32768] = uninit @align(8)
+  pub let mut _te_cache_pool  : [u8; 8192]  = uninit @align(8)
+  pub let mut _te_head_table  : [u8; 64]    = uninit @align(8)
+
+  // ==========================================================================
+  // _te_init_session(session_id) -> errno
+  //
+  //   rdi = session_id
+  //   rax = TE_OK (0) on success; TE_ERR_BAD_SESSION (0x3D00) if
+  //         session_id >= TE_MAX_SESSIONS (8).
+  //
+  //   Zeroes the per-session scheme row (4096 B = 512 u64 stores),
+  //   per-session cache row (1024 B = 128 u64 stores), and head row
+  //   (8 B = 1 u64 store).
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed te_is_.
+  // ==========================================================================
+  pub let _te_init_session : (u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M3 (#2721): zero the per-session scheme row (4096 B / 512 u64), cache row (1024 B / 128 u64), and head row (8 B). Pure leaf; zero pushes; no stack frame; no nested CALL. Validate rdi < 8 else return TE_ERR_BAD_SESSION (0x3D00). Compute scheme_row = &_te_scheme_pool + sid * 4096 via `shl r, 12`; cache_row = &_te_cache_pool + sid * 1024 via `shl r, 10`; head = &_te_head_table + sid * 8 via `shl r, 3`. All immediates (0, 8, 10, 12, 128, 512, 4096, 0x3D00) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed te_is_.",
+      block: {
+        // Session-id bounds check.
+        cmp rdi, 8;                            // TE_MAX_SESSIONS
+        jae te_is_bad_sid;
+
+        // ---- Zero the scheme row (512 u64 stores at &_te_scheme_pool + sid*4096).
+        mov r10, rdi;
+        shl r10, 12;                           // sid * 4096
+        lea r11, [rip + _te_scheme_pool];
+        add r10, r11;                          // r10 = scheme_row_addr
+
+        xor rax, rax;                          // zero source
+        xor rcx, rcx;                          // i = 0
+
+      te_is_sz_loop:
+        cmp rcx, 512;                          // 4096 / 8 = 512 qwords
+        jae te_is_sz_done;
+        mov r9, rcx;
+        shl r9, 3;                             // i * 8
+        mov [r10 + r9], rax;
+        add rcx, 1;
+        jmp te_is_sz_loop;
+
+      te_is_sz_done:
+        // ---- Zero the cache row (128 u64 stores at &_te_cache_pool + sid*1024).
+        mov r10, rdi;
+        shl r10, 10;                           // sid * 1024
+        lea r11, [rip + _te_cache_pool];
+        add r10, r11;                          // r10 = cache_row_addr
+
+        xor rcx, rcx;                          // i = 0
+
+      te_is_cz_loop:
+        cmp rcx, 128;                          // 1024 / 8 = 128 qwords
+        jae te_is_cz_done;
+        mov r9, rcx;
+        shl r9, 3;
+        mov [r10 + r9], rax;
+        add rcx, 1;
+        jmp te_is_cz_loop;
+
+      te_is_cz_done:
+        // ---- Zero the head row (1 u64 at &_te_head_table + sid*8).
+        lea r11, [rip + _te_head_table];
+        mov r9, rdi;
+        shl r9, 3;                             // sid * 8
+        mov [r11 + r9], rax;                   // rax still = 0
+
+        // Return TE_OK.
+        xor rax, rax;
+        ret;
+
+      te_is_bad_sid:
+        mov rax, 0x3D00;                       // TE_ERR_BAD_SESSION
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _te_insert_scheme(session_id, scheme_body, scheme_len,
+  //                   out_scheme_id) -> errno
+  //
+  //   rdi = session_id
+  //   rsi = scheme_body ptr
+  //   rdx = scheme_len     (TE_SCHEME_HDR_MIN (8) .. TE_SCHEME_PAYLOAD_MAX (248))
+  //   rcx = out_scheme_id  (u64*; receives 1-based slot index)
+  //   rax = TE_OK / TE_ERR_BAD_SESSION / TE_ERR_BAD_LEN / TE_ERR_TOO_MANY
+  //
+  //   Append-only insert at the session's scheme_count index. On
+  //   TE_OK, writes scheme_count + 1 to *out_scheme_id and bumps
+  //   scheme_count. Does NOT reuse evicted slots (those remain
+  //   kind == EMPTY but still occupy their scheme_id position).
+  //
+  // Register plan (5-push, pure-leaf):
+  //   rbx = session_id    (preserved for head-table reload)
+  //   rbp = scheme_count  (loaded; also the slot index to write)
+  //   r12 = scheme_body   (preserved across the byte copy)
+  //   r13 = scheme_len    (preserved across the byte copy)
+  //   r14 = slot_addr     (scratch; also payload base at +8)
+  //   r15 = out_scheme_id (preserved for the writeback)
+  //
+  // Pure leaf -- no nested CALL -- so NO sub-rsp align pad. 6 pushes
+  // = 48 B; entry rsp%16==8; after pushes rsp%16==8; the function
+  // calls nothing so this is fine (ret pops to a %16==8 alignment,
+  // matching the caller's incoming alignment).
+  //
+  // Labels prefixed te_ins_.
+  // ==========================================================================
+  pub let _te_insert_scheme : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) (scheme_body: u64) (scheme_len: u64)
+       (out_scheme_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M3 (#2721): append-only scheme insert. 6 callee-save pushes (rbx=session_id, rbp=scheme_count, r12=scheme_body, r13=scheme_len, r14=slot_addr, r15=out_scheme_id); pure leaf with no nested CALL so no sub-rsp pad. Validate: rdi < 8 (TE_ERR_BAD_SESSION), rdx >= 8 && rdx <= 248 (TE_ERR_BAD_LEN). Load scheme_count byte from _te_head_table[sid*8+0]; if count >= 16 return TE_ERR_TOO_MANY. Compute slot_addr = &_te_scheme_pool + sid*4096 + count*256 via `shl r, 12` + `shl r, 8`. Write slot header: kind=1 u8 at +0, flags=0 u8 at +1, scheme_len u32 at +4. Precompute payload base rsi := slot_addr + 8 to sidestep the mov_b [reg+reg+off], reg encoder gap. Byte-copy scheme_body[0..scheme_len] to payload area. Write out_scheme_id = count + 1 (u64). Bump scheme_count byte in head table. All immediates (0, 1, 8, 16, 248, 256, 4096, status codes 0x3D00/0x3D03/0x3D04) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed te_ins_.",
+      block: {
+        // ---- Prologue (6 callee-save pushes; no stack pad: pure leaf).
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Guard: session_id < TE_MAX_SESSIONS (8).
+        cmp rdi, 8;
+        jae te_ins_bad_sid;
+
+        // ---- Guard: scheme_len >= TE_SCHEME_HDR_MIN (8).
+        cmp rdx, 8;
+        jb  te_ins_bad_len;
+        // ---- Guard: scheme_len <= TE_SCHEME_PAYLOAD_MAX (248).
+        cmp rdx, 248;
+        ja  te_ins_bad_len;
+
+        // Preserve registers across address arithmetic.
+        mov rbx, rdi;                          // rbx = session_id
+        mov r12, rsi;                          // r12 = scheme_body
+        mov r13, rdx;                          // r13 = scheme_len
+        mov r15, rcx;                          // r15 = out_scheme_id
+
+        // ---- Load scheme_count byte from _te_head_table[sid*8 + 0].
+        lea r11, [rip + _te_head_table];
+        mov r10, rbx;
+        shl r10, 3;                            // sid * 8
+        xor rax, rax;
+        mov_b rax, [r11 + r10 + 0];            // TE_HD_OFF_SCHEME_COUNT = 0
+        mov rbp, rax;                          // rbp = scheme_count
+
+        // ---- Guard: scheme_count < TE_MAX_SCHEMES (16).
+        cmp rbp, 16;
+        jae te_ins_too_many;
+
+        // ---- Compute slot_addr = &_te_scheme_pool + sid*4096 + count*256.
+        mov r10, rbx;
+        shl r10, 12;                           // sid * 4096
+        lea r11, [rip + _te_scheme_pool];
+        add r10, r11;                          // r10 = row_addr
+        mov r9, rbp;
+        shl r9, 8;                             // count * 256
+        add r10, r9;                           // r10 = slot_addr
+        mov r14, r10;                          // r14 = slot_addr
+
+        // ---- Write header: kind=1 u8 at [+0].
+        mov rax, 1;                            // TE_SLOT_ACTIVE
+        mov_b [r14 + 0], rax;                  // TE_SCH_OFF_KIND = 0
+
+        // ---- flags=0 u8 at [+1].
+        xor rax, rax;
+        mov_b [r14 + 1], rax;                  // TE_SCH_OFF_FLAGS = 1
+
+        // ---- reserved u16 at [+2] = 0 via two mov_b.
+        mov_b [r14 + 2], rax;
+        mov_b [r14 + 3], rax;
+
+        // ---- scheme_len u32 at [+4].
+        mov_d [r14 + 4], r13;                  // TE_SCH_OFF_LEN = 4
+
+        // ---- Precompute payload base in rsi (sidestep mov_b
+        //      [reg+reg+off], reg encoder gap -- SessionEnv L547 and
+        //      record_projection name-copy precedent).
+        mov rsi, r14;
+        add rsi, 8;                            // TE_SCH_OFF_PAYLOAD
+
+        // ---- Byte-copy scheme_body[0..scheme_len] into payload area.
+        xor r10, r10;                          // j = 0
+
+      te_ins_cp_byte:
+        cmp r10, r13;
+        jae te_ins_cp_done;
+        xor rax, rax;
+        mov_b rax, [r12 + r10 * 1];            // load src byte
+        mov_b [rsi + r10 * 1], rax;            // store dst byte
+        add r10, 1;
+        jmp te_ins_cp_byte;
+
+      te_ins_cp_done:
+        // ---- Write out_scheme_id = scheme_count + 1 (1-based).
+        mov rax, rbp;
+        add rax, 1;
+        mov [r15 + 0], rax;                    // u64 store
+
+        // ---- Bump scheme_count byte: head[sid*8 + 0] := count + 1.
+        lea r11, [rip + _te_head_table];
+        mov r10, rbx;
+        shl r10, 3;
+        mov_b [r11 + r10 + 0], rax;
+
+        // ---- Return TE_OK.
+        xor rax, rax;                          // TE_OK = 0
+        jmp te_ins_epilogue;
+
+      te_ins_bad_sid:
+        mov rax, 0x3D00;                       // TE_ERR_BAD_SESSION
+        jmp te_ins_epilogue;
+
+      te_ins_bad_len:
+        mov rax, 0x3D04;                       // TE_ERR_BAD_LEN
+        jmp te_ins_epilogue;
+
+      te_ins_too_many:
+        mov rax, 0x3D03;                       // TE_ERR_TOO_MANY
+        jmp te_ins_epilogue;
+
+      te_ins_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _te_specialize(session_id, scheme_id, type_vec_hash,
+  //                out_body_ref) -> errno
+  //
+  //   rdi = session_id
+  //   rsi = scheme_id       (1..TE_MAX_SCHEMES)
+  //   rdx = type_vec_hash   (u32 payload; stored at cache entry [+8])
+  //   rcx = out_body_ref    (u64*; receives pool_idx)
+  //   rax = TE_OK / TE_ERR_BAD_SESSION / TE_ERR_BAD_SCHEME_ID /
+  //         TE_ERR_NOT_FOUND / TE_ERR_HM_* on instantiate failure
+  //
+  //   HIT path: scans the 64-entry cache row for (valid == ACTIVE AND
+  //   scheme_id == rsi AND hash == rdx32) and returns the stored
+  //   body_ref.
+  //
+  //   MISS path: resolves the scheme slot, calls `_hm_instantiate`,
+  //   caches the result at cache_cursor (round-robin FIFO).
+  //
+  // Register plan (6-push, 1 scratch slot):
+  //   rbx = session_id (preserved across the CALL)
+  //   rbp = scheme_id  (preserved across the CALL)
+  //   r12 = type_vec_hash (low 32 bits; preserved)
+  //   r13 = out_body_ref ptr (preserved for the writeback)
+  //   r14 = cache_row_base (reloaded after CALL since r11-based LEAs
+  //                         are clobbered by nested _hm_instantiate)
+  //   r15 = scratch (slot_addr during miss resolve; entry_addr during
+  //                  cache scan; cache insert destination afterwards)
+  //
+  // Prologue: 6 pushes (48 B) + sub rsp, 8 (1 slot). Entry rsp%16==8;
+  // 48 B pushes leave rsp%16==8; sub 8 brings rsp%16==0 at the
+  // nested CALL to _hm_instantiate.
+  //
+  //   [rsp + 0] = body_idx local (u64; receives _hm_instantiate's out)
+  //
+  // Labels prefixed te_sp_.
+  // ==========================================================================
+  pub let _te_specialize : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) (scheme_id: u64) (type_vec_hash: u64)
+       (out_body_ref: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M3 (#2721): specialisation-cache lookup + fall-through to _hm_instantiate. 6 callee-save pushes (rbx=session_id, rbp=scheme_id, r12=type_vec_hash, r13=out_body_ref, r14=cache_row_base, r15=scratch slot/entry addr) + sub rsp,8 for the body_idx local AND to align rsp%16==0 at the _hm_instantiate CALL. Validate: rdi < 8 (TE_ERR_BAD_SESSION), rsi in [1..16] (TE_ERR_BAD_SCHEME_ID). Compute cache_row_base = &_te_cache_pool + sid*1024 via `shl r, 10` and keep in r14 for the hit scan. Hit scan: for i in 0..64, entry_addr = cache_row + i*16 (`shl r, 4`); if valid != ACTIVE skip; if scheme_id u32 != rsi skip; if hash u32 != rdx32 skip; else read body_ref u32 (zero-extended via xor+mov_d), store u64 at [out_body_ref], return TE_OK. Miss: resolve slot_addr = &_te_scheme_pool + sid*4096 + (scheme_id-1)*256 via `shl r, 12` + `shl r, 8`; read kind byte; if != ACTIVE return TE_ERR_NOT_FOUND. Load scheme_len u32 via xor+mov_d. Prep CALL: rdi := scheme_body (slot_addr + 8), rsi := scheme_len, rdx := rsp (ptr to local body_idx slot). CALL _hm_instantiate -- clobbers r11 so cache_row_base reload path uses a fresh lea. On full-u64 cmp rax, 0 jne branch: translate HM_ERR_* (0x2D00/0x2D01/0x2D02/0x2D03) into TE_ERR_HM_* (0x3D08/0x3D06/0x3D05/0x3D07) via four cmp+je landing points; non-matched return is forwarded verbatim (shouldn't happen with current hm_core). On HM_OK: load body_idx = [rsp+0]; store u64 at [out_body_ref]; insert into cache. Cache insert: reload _te_head_table via fresh lea, read cache_cursor u8 at head[sid*8+1], mod 64; reload _te_cache_pool via fresh lea, compute entry_addr = row + cursor*16, write valid=1 u8, zero reserved u8[3], scheme_id u32 (from rbp), hash u32 (from r12 low 32), body_ref u32 (from body_idx low 32). Bump cache_cursor: cursor := (cursor + 1) mod 64 computed via `add; cmp cursor, 64; jb ok; xor cursor, cursor; ok:`. Store back. Return TE_OK. All cmp immediates (0, 1, 8, 16, 64, 248, status codes 0x3D00..0x3D08, HM_* codes 0x2D00..0x2D03) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed te_sp_. Full-u64 status cmp on _hm_instantiate return (Wave 118 lesson).",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        // Save args to callee-saves.
+        mov rbx, rdi;                          // rbx = session_id
+        mov rbp, rsi;                          // rbp = scheme_id
+        mov r12, rdx;                          // r12 = type_vec_hash
+        mov r13, rcx;                          // r13 = out_body_ref
+
+        // ---- Guard: session_id < 8.
+        cmp rbx, 8;
+        jae te_sp_bad_sid;
+
+        // ---- Guard: scheme_id in [1..16].
+        cmp rbp, 1;
+        jb  te_sp_bad_scheme_id;
+        cmp rbp, 16;
+        ja  te_sp_bad_scheme_id;
+
+        // ---- Compute cache_row_base = &_te_cache_pool + sid * 1024.
+        mov r10, rbx;
+        shl r10, 10;
+        lea r11, [rip + _te_cache_pool];
+        add r10, r11;
+        mov r14, r10;                          // r14 = cache_row_base
+
+        // ---- Hit scan: for i in 0..64.
+        xor rcx, rcx;                          // i = 0
+
+      te_sp_scan:
+        cmp rcx, 64;                           // TE_MAX_CACHE_ENTRIES
+        jae te_sp_miss;
+
+        // entry_addr = cache_row + i * 16.
+        mov r10, rcx;
+        shl r10, 4;
+        mov r15, r14;
+        add r15, r10;                          // r15 = entry_addr
+
+        // Read valid byte.
+        xor rax, rax;
+        mov_b rax, [r15 + 0];                  // TE_CE_OFF_VALID
+        cmp rax, 1;                            // TE_CE_ACTIVE
+        jne te_sp_scan_next;
+
+        // Read stored scheme_id u32.
+        xor rax, rax;
+        mov_d rax, [r15 + 4];                  // TE_CE_OFF_SCHEME_ID
+        cmp rax, rbp;
+        jne te_sp_scan_next;
+
+        // Read stored hash u32; mask r12 to low 32 bits for compare.
+        xor rax, rax;
+        mov_d rax, [r15 + 8];                  // TE_CE_OFF_HASH
+        mov r9, r12;
+        shl r9, 32;
+        shr r9, 32;                            // r9 = r12 & 0xFFFFFFFF
+        cmp rax, r9;
+        jne te_sp_scan_next;
+
+        // -----------------------------------------------------------
+        // HIT: read body_ref u32 (zero-extended u64 via xor+mov_d).
+        // -----------------------------------------------------------
+        xor rax, rax;
+        mov_d rax, [r15 + 12];                 // TE_CE_OFF_BODY_REF
+        mov [r13 + 0], rax;                    // *out_body_ref = body_ref
+        jmp te_sp_ok;
+
+      te_sp_scan_next:
+        add rcx, 1;
+        jmp te_sp_scan;
+
+        // -----------------------------------------------------------
+        // MISS: resolve the scheme slot and call _hm_instantiate.
+        // -----------------------------------------------------------
+      te_sp_miss:
+        // slot_addr = &_te_scheme_pool + sid * 4096 + (scheme_id - 1) * 256.
+        mov r10, rbx;
+        shl r10, 12;                           // sid * 4096
+        lea r11, [rip + _te_scheme_pool];
+        add r10, r11;                          // r10 = row_addr
+        mov r9, rbp;
+        sub r9, 1;                             // (scheme_id - 1) 0-based
+        shl r9, 8;                             // * 256
+        add r10, r9;                           // r10 = slot_addr
+        mov r15, r10;                          // r15 = slot_addr (saved)
+
+        // Read kind byte; must be ACTIVE.
+        xor rax, rax;
+        mov_b rax, [r15 + 0];
+        cmp rax, 1;                            // TE_SLOT_ACTIVE
+        jne te_sp_not_found;
+
+        // Read scheme_len u32.
+        xor rax, rax;
+        mov_d rax, [r15 + 4];                  // scheme_len
+
+        // Prepare CALL args: rdi = scheme_body ptr, rsi = scheme_len,
+        //                    rdx = &local body_idx (rsp + 0).
+        mov rdi, r15;
+        add rdi, 8;                            // scheme_body = slot + 8
+        mov rsi, rax;                          // scheme_len
+        mov rdx, rsp;                          // body_idx slot
+
+        // Zero the local slot before the CALL so a short-write doesn't
+        // leave stack-garbage visible.
+        xor rax, rax;
+        mov [rsp + 0], rax;
+
+        // CALL _hm_instantiate -- clobbers caller-save including r11.
+        call _hm_instantiate;
+
+        // Full-u64 compare (Wave 118 lesson: packed-return low byte 0
+        // would false-positive a byte-level check).
+        cmp rax, 0;
+        jne te_sp_hm_err;
+
+        // ---- HM_OK: read body_idx from local slot.
+        mov r9, [rsp + 0];                     // r9 = body_idx (pool_idx)
+        mov [r13 + 0], r9;                     // *out_body_ref = body_idx
+
+        // ---- Cache insert at (session's) cache_cursor.
+        // Reload _te_head_table (r11 clobbered by CALL).
+        lea r11, [rip + _te_head_table];
+        mov r10, rbx;
+        shl r10, 3;                            // sid * 8
+        xor rcx, rcx;
+        mov_b rcx, [r11 + r10 + 1];            // TE_HD_OFF_CACHE_CURSOR
+        // Defensive mod-64 (an earlier buggy write could store > 63).
+        cmp rcx, 64;
+        jb  te_sp_cursor_ok;
+        xor rcx, rcx;
+
+      te_sp_cursor_ok:
+        // Reload _te_cache_pool (r11 clobbered on the fresh lea above
+        // we also used it; the two LEAs are independent).
+        lea r11, [rip + _te_cache_pool];
+        mov r10, rbx;
+        shl r10, 10;
+        add r10, r11;                          // r10 = cache_row_base
+        mov r8, rcx;
+        shl r8, 4;                             // cursor * 16
+        add r10, r8;                           // r10 = entry_addr
+
+        // Write valid = 1 u8 at [+0].
+        mov rax, 1;                            // TE_CE_ACTIVE
+        mov_b [r10 + 0], rax;
+
+        // Zero reserved bytes [+1..+3].
+        xor rax, rax;
+        mov_b [r10 + 1], rax;
+        mov_b [r10 + 2], rax;
+        mov_b [r10 + 3], rax;
+
+        // scheme_id u32 at [+4].
+        mov_d [r10 + 4], rbp;
+
+        // hash u32 at [+8]: use r12's low 32 bits via masked copy.
+        mov r8, r12;
+        shl r8, 32;
+        shr r8, 32;
+        mov_d [r10 + 8], r8;
+
+        // body_ref u32 at [+12]: use r9's low 32 bits via masked copy.
+        mov r8, r9;
+        shl r8, 32;
+        shr r8, 32;
+        mov_d [r10 + 12], r8;
+
+        // ---- Bump cache_cursor: (cursor + 1) mod 64.
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  te_sp_cursor_wrap_done;
+        xor rcx, rcx;
+
+      te_sp_cursor_wrap_done:
+        // Store back; reload _te_head_table (r11 was reused above).
+        lea r11, [rip + _te_head_table];
+        mov r10, rbx;
+        shl r10, 3;
+        mov_b [r11 + r10 + 1], rcx;            // TE_HD_OFF_CACHE_CURSOR
+
+        jmp te_sp_ok;
+
+        // -----------------------------------------------------------
+        // HM error translation: map HM_ERR_* -> TE_ERR_HM_*.
+        // -----------------------------------------------------------
+      te_sp_hm_err:
+        cmp rax, 0x2D00;                       // HM_ERR_OCCURS
+        je  te_sp_hm_occurs;
+        cmp rax, 0x2D01;                       // HM_ERR_MISMATCH
+        je  te_sp_hm_mismatch;
+        cmp rax, 0x2D02;                       // HM_ERR_POOL_FULL
+        je  te_sp_hm_pool_full;
+        cmp rax, 0x2D03;                       // HM_ERR_OUT_TOO_SMALL
+        je  te_sp_hm_out_too_small;
+        // Unknown HM status: forward verbatim (defensive).
+        jmp te_sp_epilogue;
+
+      te_sp_hm_occurs:
+        mov rax, 0x3D08;
+        jmp te_sp_epilogue;
+
+      te_sp_hm_mismatch:
+        mov rax, 0x3D06;
+        jmp te_sp_epilogue;
+
+      te_sp_hm_pool_full:
+        mov rax, 0x3D05;
+        jmp te_sp_epilogue;
+
+      te_sp_hm_out_too_small:
+        mov rax, 0x3D07;
+        jmp te_sp_epilogue;
+
+        // -----------------------------------------------------------
+        // Return paths.
+        // -----------------------------------------------------------
+      te_sp_ok:
+        xor rax, rax;                          // TE_OK = 0
+        jmp te_sp_epilogue;
+
+      te_sp_bad_sid:
+        mov rax, 0x3D00;                       // TE_ERR_BAD_SESSION
+        jmp te_sp_epilogue;
+
+      te_sp_bad_scheme_id:
+        mov rax, 0x3D01;                       // TE_ERR_BAD_SCHEME_ID
+        jmp te_sp_epilogue;
+
+      te_sp_not_found:
+        mov rax, 0x3D02;                       // TE_ERR_NOT_FOUND
+        jmp te_sp_epilogue;
+
+      te_sp_epilogue:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _te_evict_scheme(session_id, scheme_id) -> errno
+  //
+  //   rdi = session_id
+  //   rsi = scheme_id   (1..TE_MAX_SCHEMES)
+  //   rax = TE_OK / TE_ERR_BAD_SESSION / TE_ERR_BAD_SCHEME_ID /
+  //         TE_ERR_NOT_FOUND
+  //
+  //   Marks the scheme slot kind := TE_SLOT_EMPTY. Walks the 64-entry
+  //   cache row and invalidates every entry whose scheme_id matches
+  //   (so a later _te_specialize miss cannot read a stale body_ref,
+  //   AND so a reused scheme_id slot allocated at insert time -- not
+  //   permitted at M3 but conceivable in M5+ compaction -- gets a
+  //   clean cache view).
+  //
+  //   The scheme_count counter is NOT decremented (append-only, like
+  //   SessionEnv's tombstone unset). A later `_te_insert_scheme` call
+  //   on this session will append at the ORIGINAL count, not the
+  //   evicted slot; so eviction permanently retires that scheme_id.
+  //   Compaction is R229.M5+.
+  //
+  // Register plan (5-push, pure-leaf):
+  //   rbx = session_id (preserved for cache-row-base compute)
+  //   rbp = scheme_id  (preserved for the cache scan)
+  //   r12 = scheme_count
+  //   r13 = slot_addr
+  //   r14 = cache_row_base
+  //   r15 = entry_addr scratch
+  //
+  // Pure leaf (no nested CALL); 6 pushes = 48 B; entry rsp%16==8;
+  // after pushes rsp%16==8; the function calls nothing so no align
+  // pad is needed.
+  //
+  // Labels prefixed te_ev_.
+  // ==========================================================================
+  pub let _te_evict_scheme : (u64, u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) (scheme_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M3 (#2721): evict a scheme slot + invalidate matching cache entries. 6 callee-save pushes (rbx=session_id, rbp=scheme_id, r12=scheme_count, r13=slot_addr, r14=cache_row_base, r15=entry_addr scratch); pure leaf; no sub-rsp pad. Validate: rdi < 8 (TE_ERR_BAD_SESSION), rsi in [1..16] (TE_ERR_BAD_SCHEME_ID). Load scheme_count byte from _te_head_table[sid*8+0]; if scheme_id > count return TE_ERR_NOT_FOUND. Compute slot_addr = &_te_scheme_pool + sid*4096 + (scheme_id-1)*256 via `shl r, 12` + `shl r, 8`; read kind byte; if already EMPTY return TE_ERR_NOT_FOUND; else write kind=0 u8 at [+0]. Compute cache_row_base = &_te_cache_pool + sid*1024 via `shl r, 10`. Scan 64 cache entries: for i in 0..64, entry_addr = cache_row + i*16; if valid != ACTIVE skip; if scheme_id u32 != rbp skip; else write valid=0 u8 at [+0] (zero-cost cache tombstone -- scheme_id/hash/body_ref left intact, the valid gate alone suffices for lookup rejection). Return TE_OK. All cmp immediates (0, 1, 8, 16, 64, 256, 1024, 4096, 0x3D00/0x3D01/0x3D02) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed te_ev_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Guard: session_id < 8.
+        cmp rdi, 8;
+        jae te_ev_bad_sid;
+
+        // ---- Guard: scheme_id in [1..16].
+        cmp rsi, 1;
+        jb  te_ev_bad_scheme_id;
+        cmp rsi, 16;
+        ja  te_ev_bad_scheme_id;
+
+        mov rbx, rdi;                          // rbx = session_id
+        mov rbp, rsi;                          // rbp = scheme_id
+
+        // ---- Load scheme_count from head table.
+        lea r11, [rip + _te_head_table];
+        mov r10, rbx;
+        shl r10, 3;
+        xor rax, rax;
+        mov_b rax, [r11 + r10 + 0];            // TE_HD_OFF_SCHEME_COUNT
+        mov r12, rax;                          // r12 = scheme_count
+
+        // ---- Guard: scheme_id <= scheme_count (1-based).
+        cmp rbp, r12;
+        ja  te_ev_not_found;
+
+        // ---- Compute slot_addr = &_te_scheme_pool + sid*4096 +
+        //      (scheme_id - 1)*256.
+        mov r10, rbx;
+        shl r10, 12;
+        lea r11, [rip + _te_scheme_pool];
+        add r10, r11;
+        mov r9, rbp;
+        sub r9, 1;
+        shl r9, 8;
+        add r10, r9;
+        mov r13, r10;                          // r13 = slot_addr
+
+        // ---- Read kind; must be ACTIVE.
+        xor rax, rax;
+        mov_b rax, [r13 + 0];
+        cmp rax, 1;                            // TE_SLOT_ACTIVE
+        jne te_ev_not_found;
+
+        // ---- Tombstone the slot: kind := 0.
+        xor rax, rax;
+        mov_b [r13 + 0], rax;                  // TE_SLOT_EMPTY
+
+        // ---- Compute cache_row_base = &_te_cache_pool + sid*1024.
+        mov r10, rbx;
+        shl r10, 10;
+        lea r11, [rip + _te_cache_pool];
+        add r10, r11;
+        mov r14, r10;                          // r14 = cache_row_base
+
+        // ---- Scan 64 cache entries; invalidate matching scheme_id.
+        xor rcx, rcx;                          // i = 0
+
+      te_ev_scan:
+        cmp rcx, 64;
+        jae te_ev_ok;
+
+        // entry_addr = cache_row + i * 16.
+        mov r10, rcx;
+        shl r10, 4;
+        mov r15, r14;
+        add r15, r10;                          // r15 = entry_addr
+
+        // valid check.
+        xor rax, rax;
+        mov_b rax, [r15 + 0];
+        cmp rax, 1;                            // TE_CE_ACTIVE
+        jne te_ev_scan_next;
+
+        // scheme_id match check.
+        xor rax, rax;
+        mov_d rax, [r15 + 4];
+        cmp rax, rbp;
+        jne te_ev_scan_next;
+
+        // Invalidate: valid := 0.
+        xor rax, rax;
+        mov_b [r15 + 0], rax;
+
+      te_ev_scan_next:
+        add rcx, 1;
+        jmp te_ev_scan;
+
+      te_ev_ok:
+        xor rax, rax;                          // TE_OK = 0
+        jmp te_ev_epilogue;
+
+      te_ev_bad_sid:
+        mov rax, 0x3D00;                       // TE_ERR_BAD_SESSION
+        jmp te_ev_epilogue;
+
+      te_ev_bad_scheme_id:
+        mov rax, 0x3D01;                       // TE_ERR_BAD_SCHEME_ID
+        jmp te_ev_epilogue;
+
+      te_ev_not_found:
+        mov rax, 0x3D02;                       // TE_ERR_NOT_FOUND
+        jmp te_ev_epilogue;
+
+      te_ev_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}
