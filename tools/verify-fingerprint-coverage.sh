@@ -83,6 +83,18 @@ ROOT = sys.argv[1]
 # ---------------------------------------------------------------------------
 
 ALLOWLIST = {
+    # Wave 115 R228.M1 (paideia-os#2711): completion protocol substrate.
+    # COMPLETION OK fires on every _cp_request invocation (success,
+    # error, or UNIMPLEMENTED path). Unreachable at M1 — no production
+    # caller yet; shell UX wires it at R228.M2+. Retire when the shell
+    # tab-completion handler drives _cp_request end-to-end with an
+    # asserting smoke-mode golden.
+    "COMPLETION OK":
+        "Wave 115 R228.M1: src/kernel/core/shell/completion_proto.pdx "
+        "emits this from _cp_request's tail on every return path. "
+        "Unreachable at M1 (no caller yet). Retires when R228.M2+ "
+        "wires the shell tab-completion handler.",
+
     # Wave 111 R139.M6 (paideia-os#2644): cross-session file open.
     # Four fingerprints emitted from cross_session_open.pdx: INIT /
     # ALLOW / REQUEST / REVOKE OK. All unreachable at M6 (no
@@ -533,10 +545,52 @@ ALLOWLIST = {
         "Retires when R127.M5 wires the TTY recall binding with an "
         "asserting smoke-mode golden.",
 
+    # Wave UMB-W28 R229.M1 (paideia-os#2719): REPL evaluator loop
+    # scaffold. REPL_LOOP INIT OK fires on every boot via _rl_init in
+    # the svc.* bringup cascade (kernel_main.pdx right after
+    # _shell_history_init, before _hf_init). INIT_SESSION OK / TICK OK
+    # / EMIT_PROMPT OK are present as .rodata tags inside
+    # _rl_init_session / _rl_tick / _rl_emit_prompt; at M1 no
+    # production path invokes any of them because the shell parent's
+    # dispatch loop (R229.M2+) is the first wave with a caller that
+    # drives init_session + emit_prompt + tick. All four retire from
+    # this allowlist when R229.M2 lands with an asserting smoke-mode
+    # golden that mints a REPL slot, emits a prompt, drives a byte
+    # sequence to PARSED, and dispatches through to IDLE.
+    "REPL_LOOP INIT OK":
+        "Wave UMB-W28 R229.M1: src/kernel/core/shell/repl_loop.pdx "
+        "emits this unconditionally on boot via _rl_init in the svc.* "
+        "bringup cascade (after _shell_history_init). Retires when "
+        "R229.M2 (eval dispatch + shell parent dispatch loop) adds "
+        "an asserting smoke-mode golden driving the state machine "
+        "end-to-end.",
+    "REPL_LOOP INIT_SESSION OK":
+        "Wave UMB-W28 R229.M1: src/kernel/core/shell/repl_loop.pdx "
+        "emits this from _rl_init_session. Unreachable from any "
+        "production path at M1 (no shell parent task binds a "
+        "REPL slot yet; the dispatch loop that would call "
+        "_rl_init_session lands with R229.M2). Retires alongside "
+        "REPL_LOOP INIT OK when the dispatch loop lands.",
+    "REPL_LOOP TICK OK":
+        "Wave UMB-W28 R229.M1: src/kernel/core/shell/repl_loop.pdx "
+        "emits this from _rl_tick on the READING -> PARSED "
+        "transition (byte 0x0A). Unreachable from any production "
+        "path at M1 (no caller drives _rl_tick yet; the TTY input "
+        "ISR wire-up lands with R229.M2). Retires alongside "
+        "REPL_LOOP INIT OK when the dispatch loop lands.",
+    "REPL_LOOP EMIT_PROMPT OK":
+        "Wave UMB-W28 R229.M1: src/kernel/core/shell/repl_loop.pdx "
+        "emits this from _rl_emit_prompt. Unreachable from any "
+        "production path at M1 (no shell parent task emits a prompt "
+        "yet; the dispatch loop that would call _rl_emit_prompt "
+        "lands with R229.M2). Retires alongside REPL_LOOP INIT OK "
+        "when the dispatch loop lands.",
+
     # Wave UMB-W18 R127.M7 (paideia-os#2603): datalog-queryable history
     # fact store. HISTORY_FACTS INIT OK fires on every boot via
-    # _hf_init in the svc.* bringup cascade (kernel_main.pdx right
-    # after _shell_history_init, before _shell_jobs_init). APPEND OK
+    # _rl_init / _hf_init in the svc.* bringup cascade (kernel_main.pdx
+    # right after _shell_history_init / _rl_init, before _shell_jobs_init).
+    # APPEND OK
     # is present as a .rodata tag inside _hf_append, which is called
     # from _shell_history_append after the ring write (hook landed
     # 2026-10-14 in this same wave), so it transitively depends on a

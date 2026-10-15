@@ -1,0 +1,1065 @@
+// src/kernel/core/shell/completion_proto.pdx -- Wave UMB-W28 R228.M1
+//                                                 (paideia-os #2711)
+//
+// Shell completion protocol substrate -- LSP-style request/response
+// records + dispatcher. M1 lands the kernel-side protocol surface so
+// R228.M2+ can wire tab-completion UX on top. Only the COMMAND kind is
+// implemented at M1; PATH / SCHEMA_FIELD / DATALOG_PREDICATE return
+// CP_UNIMPLEMENTED and their handlers land in follow-up milestones.
+//
+// =============================================================================
+// SECTION 0  SCOPE -- R228.M1 vs. follow-ups
+// =============================================================================
+//
+// LANDED HERE (R228.M1):
+//   (1) Request / Response / Item wire-format records (fixed-size,
+//       pointer-free, directly embeddable in an IPC payload).
+//   (2) `_cp_request(req_ptr, resp_ptr, resp_cap, items_blob_ptr,
+//       items_blob_cap) -> packed u64` -- the one entry point. Reads
+//       the request record, dispatches on kind, writes the response
+//       record + items blob, returns `(n_items << 32) | status`.
+//   (3) COMMAND kind: iterates _kcm_table via kcm_list_first /
+//       kcm_list_next (src/kernel/core/cap/kind_cmd_module.pdx §R123.M5),
+//       filters by prefix, packs up to CP_MAX_ITEMS=32 names into the
+//       items blob with kind=CP_KIND_COMMAND.
+//   (4) Protocol constants (kinds, return codes, record offsets).
+//   (5) Boot-time init that zero-scrubs the stats table.
+//
+// DEFERRED (R228.M2+):
+//   (a) PATH kind. Walks the CoW FS at the context path and returns
+//       dirent names matching prefix. Depends on R134 vfs_dir_readnext
+//       being capability-wrapped for completion queries.
+//   (b) SCHEMA_FIELD kind. Resolves (schema_sig_handle, prefix) ->
+//       member names. Depends on R222.M1 SchemasSig completing its
+//       member-table export API (currently internal-only).
+//   (c) DATALOG_PREDICATE kind. Scans the fact-store predicate index
+//       for prefix matches. Depends on R226 datalog predicate index.
+//   (d) Cross-session completion (R228 x R139.M-series). Today the
+//       session_id is validated but not consulted; a completion request
+//       issued inside session S returns the same answer as inside S'
+//       for every kind. Follow-up gates PATH on the session's cwd and
+//       SCHEMA_FIELD / DATALOG_PREDICATE on the session's capability
+//       env.
+//   (e) UX surface. The syscall / cap_invoke dispatch that lets the
+//       userspace line editor fire this is R228.M2; this file lands
+//       only the in-kernel callable primitive.
+//   (f) Score ranking. M1 returns completions in iteration order
+//       (first-match-first). A ranked variant (frecency * prefix-weight
+//       * recent-use) lands as a wrapper that re-sorts the blob.
+//
+// =============================================================================
+// SECTION 1  SPEC-vs-CODEBASE RECONCILIATION -- response record size
+// =============================================================================
+//
+// The R228.M1 briefing specifies the response record as 128B with
+// fields {request_id: u32, n_items: u16, truncated_flag: u16,
+// items_offset: u32, items_blob_len: u32, reserved: [u8; 108]}. The
+// explicit fields total 16 bytes, so 16 + 108 = 124, 4 bytes short of
+// the declared 128B footprint.
+//
+// Per feedback_spec_vs_codebase_conflicts (PRESERVE binding invariant,
+// FLAG specification drift): the 128B total is the binding invariant
+// (the response record is embedded in a 128B IPC frame slot on the
+// wire; any other size breaks downstream frame alignment). This file
+// resolves the shortfall by inserting a `status: u32` field at [+16]
+// -- an engineering improvement over a reserved hole, since every
+// callable response benefits from carrying its own status word (the
+// `_cp_request` return value packs n_items + status, but a reader
+// that looks only at the response record otherwise lacks the status).
+// The reserved tail then runs from [+20..+128] = 108 bytes exactly as
+// the briefing specifies.
+//
+// Design-doc side: design/shell/completion-protocol.md §3.2 flags this
+// drift and documents the resolution.
+//
+// =============================================================================
+// SECTION 2  WIRE FORMAT -- records, offsets, and byte layouts
+// =============================================================================
+//
+// Request record (64B, 8 qwords):
+//   [+0]  session_id    : u32  -- SS_POOL slot (validated against 0..8)
+//   [+4]  request_id    : u32  -- caller-chosen correlation id
+//   [+8]  kind          : u16  -- CP_KIND_* (COMMAND=1, PATH=2,
+//                                SCHEMA_FIELD=3, DATALOG_PREDICATE=4)
+//   [+10] prefix_offset : u16  -- byte offset from req_ptr to prefix
+//                                bytes (prefix may live in the same
+//                                buffer as the request, or in a
+//                                separate caller buffer -- see §4)
+//   [+12] prefix_len    : u16  -- prefix byte count
+//   [+14] cursor_pos    : u16  -- line-editor cursor column (reserved;
+//                                M1 does not consume it, carried for
+//                                M2+ context-sensitive completion)
+//   [+16] context_offset: u32  -- byte offset to context bytes (M2+)
+//   [+20] context_len   : u32  -- context byte count (M2+)
+//   [+24] reserved[40]        -- zero at mint, non-zero reserved for
+//                                protocol v2 extensions
+//
+// Response record (128B, 16 qwords):
+//   [+0]  request_id      : u32  -- echo of request record's field
+//   [+4]  n_items         : u16  -- 0..CP_MAX_ITEMS (= 32)
+//   [+6]  truncated_flag  : u16  -- 1 if iteration hit cap before
+//                                   exhausting the source; 0 otherwise
+//   [+8]  items_offset    : u32  -- byte offset within items_blob to
+//                                   the first item (M1 always 0)
+//   [+12] items_blob_len  : u32  -- byte count of items written
+//                                   (= n_items * CP_ITEM_BYTES)
+//   [+16] status          : u32  -- CP_OK / CP_ERR_* (resolves briefing
+//                                   drift -- see §1)
+//   [+20] reserved[108]           -- zero at mint, non-zero reserved
+//
+// Completion item (64B, 8 qwords):
+//   [+0]  kind : u8   -- CP_KIND_*
+//   [+1]  len  : u8   -- 0..CP_ITEM_TEXT_MAX (= 62)
+//   [+2]  text : [u8; 62]  -- raw UTF-8 bytes, NO trailing NUL
+//                            required (len gives the exact span); the
+//                            unused tail is zero-filled by cp_pack_item
+//
+// =============================================================================
+// SECTION 3  PREFIX / CONTEXT BUFFER DISCIPLINE
+// =============================================================================
+//
+// The request record carries prefix_offset / prefix_len (and
+// context_offset / context_len) as u16 / u32 offsets. _cp_request
+// resolves them AS OFFSETS FROM req_ptr: the caller places both the
+// request header and the prefix (and context) bytes contiguously in a
+// single buffer. This mirrors the pdxfs manifest discipline (fixed
+// header + variable-length tail in one allocation) and sidesteps the
+// capability-forwarding question of how a second buffer would be
+// authorised through the completion syscall.
+//
+// Addressing math: prefix_ptr := req_ptr + prefix_offset. prefix_offset
+// MUST be >= CP_REQ_BYTES (64) and prefix_offset + prefix_len MUST not
+// overflow the caller-supplied request buffer. M1 does NOT size-check
+// the request buffer (caller-trusted; this is a kernel primitive) but
+// does validate prefix_len <= CP_ITEM_TEXT_MAX (62) so an over-length
+// prefix cannot match anything useful. Over-length prefix -> CP_OK
+// with n_items=0.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE DISCIPLINE
+// =============================================================================
+//
+// `_cp_request` returns a packed u64:
+//   bits [31:0]   = status (CP_OK or CP_ERR_*)
+//   bits [63:32]  = n_items (u32, 0..CP_MAX_ITEMS)
+//
+// A caller recovers them as:
+//   status  = ret & 0xFFFFFFFF
+//   n_items = ret >> 32
+//
+// The response record carries the same fields separately (echoed back
+// in the record body); a well-behaved caller reads either source. The
+// packed-return idiom matches cmd_module_* conventions (one u64 return
+// per cap_invoke) and avoids an output pointer.
+//
+// Status codes (R228.M1 briefing):
+//   CP_OK                = 0           -- request processed; see n_items
+//   CP_ERR_BAD_REQUEST   = 0x2F00      -- null ptr / resp_cap too small /
+//                                         session_id out of range / etc
+//   CP_ERR_UNKNOWN_KIND  = 0x2F01      -- kind not in CP_KIND_* enum
+//   CP_ERR_OUT_TOO_SMALL = 0x2F02      -- items_blob_cap below one item
+//   CP_UNIMPLEMENTED     = 0x2F03      -- kind known but handler not
+//                                         wired at this milestone
+//
+// =============================================================================
+// SECTION 5  COMMAND KIND -- M1 implementation
+// =============================================================================
+//
+// For CP_KIND_COMMAND, the dispatcher walks the KIND_CMD_MODULE row
+// pool via the R123.M5 discovery iterator (kind_cmd_module.pdx §762
+// kcm_list_first / §829 kcm_list_next / §902 kcm_read_name). The
+// iteration shape:
+//
+//   row := kcm_list_first()                 -- first LIVE row_id or
+//                                              CM_LIST_END (0xFFFFFCC6)
+//   while row != CM_LIST_END and n_items < max_items:
+//     name_len := kcm_read_name(row, name_scratch)
+//     if name_len is a valid [1..CM_NAME_MAX] span and
+//        name starts with prefix:
+//       pack item at items_blob + n_items * CP_ITEM_BYTES
+//       n_items += 1
+//     row := kcm_list_next(row)
+//
+// Capacity ceiling: max_items := min(CP_MAX_ITEMS,
+// items_blob_cap / CP_ITEM_BYTES). If the iteration would exceed this
+// ceiling, the truncated_flag is set in the response and iteration
+// stops. The caller may re-issue with a larger items_blob (M2+ will
+// add a continuation cursor; M1 lacks one -- a caller that hits the
+// cap gets the first 32 matches only).
+//
+// Prefix-match discipline: cp_prefix_match is case-sensitive byte
+// compare. prefix_len == 0 matches every row (an empty prefix returns
+// the full command set, up to the cap). prefix_len > name_len (prefix
+// longer than name) is NOT a match. Short-circuit on the first
+// disagreement.
+//
+// =============================================================================
+// SECTION 6  ENCODER-PITFALL POSTURE
+// =============================================================================
+//
+// Standard paideia-as encoder posture (feedback_pdx_encoder_pitfalls):
+//   * No `test rN, rN` -- every zero-check uses `cmp reg, 0`.
+//   * No 2-op `imul r, imm` -- item stride 64 uses shl 6 (single shift);
+//     CP_ITEM_BYTES = 64 by design to make this clean.
+//   * No `and reg, imm64` -- every u16/u32 extraction stages the mask
+//     through r10/r11; where mov_w / mov_d suffice, we use those (both
+//     zero-extend to 64 bits per vops.pdx §614).
+//   * No multiline `pub let name = "..."` -- all tag strings are
+//     single-line.
+//   * Reserved labels: cp_ prefix with second-level qualifiers:
+//     cp_in_ (init), cp_nt_ (note), cp_pm_ (prefix match),
+//     cp_pi_ (pack item), cp_dc_ (do command), cp_rq_ (public request
+//     dispatcher). None of {loop, if, else, let, fn} collides.
+//   * Module basename CompletionProto <-> file basename
+//     completion_proto.pdx (asm-mangle matches linker symbol).
+//   * Fingerprint tag sizes include trailing NUL (string length + 1).
+//
+// Register plan: the public _cp_request lands four callee-save pushes
+// (rbx=req_ptr, r12=resp_ptr+resp_cap stash, r13=items_blob_ptr,
+// r14=items_blob_cap/n_items) and uses rbp for a scratch frame when
+// nested calls widen beyond three. Entry rsp%16==8; +32 pushes land
+// rsp%16==8; +8 align pad lands rsp%16==0 at every nested call.
+//
+// =============================================================================
+
+module CompletionProto = structure {
+
+  // =========================================================================
+  // SECTION 7  CONSTANTS
+  // =========================================================================
+
+  // Record sizes (bytes).
+  pub let CP_REQ_BYTES      : u64 = 64
+  pub let CP_RESP_BYTES     : u64 = 128
+  pub let CP_ITEM_BYTES     : u64 = 64
+  pub let CP_ITEM_TEXT_MAX  : u64 = 62
+
+  // Return codes (per briefing §3).
+  pub let CP_OK                : u64 = 0
+  pub let CP_ERR_BAD_REQUEST   : u64 = 0x2F00
+  pub let CP_ERR_UNKNOWN_KIND  : u64 = 0x2F01
+  pub let CP_ERR_OUT_TOO_SMALL : u64 = 0x2F02
+  pub let CP_UNIMPLEMENTED     : u64 = 0x2F03
+
+  // Completion kinds (per briefing §2).
+  pub let CP_KIND_COMMAND           : u64 = 1
+  pub let CP_KIND_PATH              : u64 = 2
+  pub let CP_KIND_SCHEMA_FIELD      : u64 = 3
+  pub let CP_KIND_DATALOG_PREDICATE : u64 = 4
+  pub let CP_KIND_MAX               : u64 = 4
+
+  // Request-record field offsets.
+  pub let CP_REQ_OFF_SESSION_ID     : u64 = 0
+  pub let CP_REQ_OFF_REQUEST_ID     : u64 = 4
+  pub let CP_REQ_OFF_KIND           : u64 = 8
+  pub let CP_REQ_OFF_PREFIX_OFFSET  : u64 = 10
+  pub let CP_REQ_OFF_PREFIX_LEN     : u64 = 12
+  pub let CP_REQ_OFF_CURSOR_POS     : u64 = 14
+  pub let CP_REQ_OFF_CONTEXT_OFFSET : u64 = 16
+  pub let CP_REQ_OFF_CONTEXT_LEN    : u64 = 20
+
+  // Response-record field offsets.
+  pub let CP_RESP_OFF_REQUEST_ID     : u64 = 0
+  pub let CP_RESP_OFF_N_ITEMS        : u64 = 4
+  pub let CP_RESP_OFF_TRUNCATED      : u64 = 6
+  pub let CP_RESP_OFF_ITEMS_OFFSET   : u64 = 8
+  pub let CP_RESP_OFF_ITEMS_BLOB_LEN : u64 = 12
+  pub let CP_RESP_OFF_STATUS         : u64 = 16
+
+  // Item field offsets.
+  pub let CP_ITEM_OFF_KIND : u64 = 0
+  pub let CP_ITEM_OFF_LEN  : u64 = 1
+  pub let CP_ITEM_OFF_TEXT : u64 = 2
+
+  // M1 iteration cap.
+  pub let CP_MAX_ITEMS : u64 = 32
+
+  // Mirrors from kind_cmd_module.pdx §272 (local copies so this file
+  // compiles standalone; parent values frozen at R123.M5).
+  pub let CP_KCM_MODULE_MAX : u64 = 8          // CM_MODULE_MAX
+  pub let CP_KCM_NAME_MAX   : u64 = 64         // CM_NAME_MAX
+  pub let CP_KCM_LIST_END   : u64 = 0xFFFFFCC6 // CM_LIST_END
+  pub let CP_KCM_BAD_ROW    : u64 = 0xFFFFFCC7 // CM_BAD_ROW
+
+  // Mirror from shell_session.pdx §277 (SS_POOL_MAX = 8). session_id
+  // in a well-formed request is in [0, 8). Enforcement is lenient at
+  // M1 (we only reject out-of-range values via CP_ERR_BAD_REQUEST;
+  // we do not consult the session row for M1's single COMMAND kind,
+  // which is session-independent).
+  pub let CP_SS_POOL_MAX : u64 = 8
+
+  // Stats indices.
+  pub let CP_ST_REQUESTS      : u64 = 0
+  pub let CP_ST_OK            : u64 = 1
+  pub let CP_ST_BAD_REQUEST   : u64 = 2
+  pub let CP_ST_UNKNOWN_KIND  : u64 = 3
+  pub let CP_ST_UNIMPL        : u64 = 4
+  pub let CP_ST_OUT_TOO_SMALL : u64 = 5
+  pub let CP_ST_TRUNCATED     : u64 = 6
+  pub let CP_ST_MAX           : u64 = 8
+
+  // =========================================================================
+  // SECTION 8  STORAGE
+  // =========================================================================
+
+  // 8 u64 stats slots.
+  pub let mut _cp_stats : [u64; 8] = uninit @align(64)
+
+  // Scratch buffer for one name read via kcm_read_name. CM_NAME_MAX =
+  // 64 bytes; align the slot to 64 to let the byte-copy loop be driven
+  // by scalar-indexed addressing with no straddle penalty.
+  pub let mut _cp_name_scratch : [u8; 64] = uninit @align(64)
+
+  // Truncated-flag side channel from cp_do_command to _cp_request.
+  // The assembly ABI returns exactly one u64, so a packed return would
+  // need to steal bits from the status word; a static side channel is
+  // cheaper and keeps the status enum uncluttered. Zeroed at the top
+  // of each _cp_request call before dispatch.
+  pub let mut _cp_last_truncated : u64 = 0
+
+  // =========================================================================
+  // SECTION 9  FINGERPRINT KEYS / TAGS (local)
+  //
+  // Local naming avoids churn in src/kernel/core/klog/keys.pdx. Prefix
+  // cp_ matches the module's label namespace.
+  // =========================================================================
+
+  pub let cp_tag_request_ok : [u8; 14] = "COMPLETION OK\0"
+
+  pub let cp_k_sid    : [u8; 4] = "sid\0"
+  pub let cp_k_rid    : [u8; 4] = "rid\0"
+  pub let cp_k_kind   : [u8; 5] = "kind\0"
+  pub let cp_k_items  : [u8; 6] = "items\0"
+  pub let cp_k_status : [u8; 7] = "status\0"
+
+  // =========================================================================
+  // SECTION 10  completion_proto_init() -> ()
+  //
+  // Zero-scrub _cp_stats, _cp_name_scratch, and _cp_last_truncated at
+  // boot. .bss is already zero at real boot; defensive, matches
+  // cmd_registry_init / ss_pool_init one-for-one. Called from
+  // kernel_main's shell-substrate reset cascade.
+  // =========================================================================
+
+  pub let completion_proto_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W28 R228.M1 (paideia-os #2711): defensive scrub of _cp_stats (8 u64), _cp_name_scratch (64 bytes = 8 u64), and _cp_last_truncated. Three straight-line loops / stores, mirrors cmd_registry_init posture. Labels prefixed cp_in_.",
+      block: {
+        lea r10, [rip + _cp_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      cp_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  cp_in_stats;
+
+        lea r10, [rip + _cp_name_scratch];
+        xor rcx, rcx;
+      cp_in_scratch:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  cp_in_scratch;
+
+        mov [rip + _cp_last_truncated], rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 11  cpn_note(which) -- bounded stats increment.
+  //
+  // Load-inc-store, same shape as cr_note / ss_note. Bounds check guards
+  // against the pool size (8). Labels prefixed cp_nt_.
+  // =========================================================================
+
+  pub let cpn_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W28 R228.M1 (paideia-os #2711): bounded stats increment on _cp_stats. Load-inc-store idiom. Labels prefixed cp_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae cp_nt_out;
+        lea r10, [rip + _cp_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      cp_nt_out:
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 12  cp_prefix_match(prefix_ptr, prefix_len, name_ptr, name_len)
+  //             -> u64 (0 or 1)
+  //
+  // Byte-compare prefix against name, case-sensitive. Returns:
+  //   1 if prefix_len == 0 OR (prefix_len <= name_len AND
+  //                             name_ptr[0..prefix_len] == prefix_ptr[0..prefix_len])
+  //   0 otherwise.
+  //
+  // Leaf, no callee-save, no stack. Register plan: rdi=prefix_ptr,
+  // rsi=prefix_len, rdx=name_ptr, rcx=name_len. r8=cursor; r9/r10/r11
+  // scratch for byte loads.
+  // =========================================================================
+
+  pub let cp_prefix_match : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (prefix_ptr: u64) (prefix_len: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W28 R228.M1 (paideia-os #2711): byte-compare prefix_ptr[0..prefix_len] against name_ptr[0..prefix_len] with early fallback on prefix_len > name_len (-> 0) and short-circuit on first disagreement. Empty prefix matches everything (return 1 immediately). Byte loads via `xor r10,r10; mov_b r10,[reg+r8*1]` with pre-zero (mov_b does NOT zero-extend per paideia-as encoder gap -- see panic_dump.pdx §220 pattern). Leaf, no callee-save, no stack. Labels prefixed cp_pm_.",
+      block: {
+        // prefix_len == 0 -> universal match.
+        cmp rsi, 0;
+        je  cp_pm_yes;
+
+        // prefix_len > name_len -> cannot match.
+        cmp rsi, rcx;
+        ja  cp_pm_no;
+
+        // r8 = cursor, 0..prefix_len.
+        xor r8, r8;
+
+      cp_pm_scan:
+        cmp r8, rsi;
+        jae cp_pm_yes;
+
+        // Load prefix byte -> r10 (pre-zeroed).
+        xor r10, r10;
+        mov_b r10, [rdi + r8 * 1];
+
+        // Load name byte -> r11 (pre-zeroed).
+        xor r11, r11;
+        mov_b r11, [rdx + r8 * 1];
+
+        cmp r10, r11;
+        jne cp_pm_no;
+
+        add r8, 1;
+        jmp cp_pm_scan;
+
+      cp_pm_yes:
+        mov rax, 1;
+        ret;
+
+      cp_pm_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 13  cp_pack_item(kind, name_ptr, name_len, item_dst) -> ()
+  //
+  // Writes one 64-byte item at item_dst. Layout: kind byte at +0, len
+  // byte at +1, text bytes at +2..+2+clamped_len, remainder zero-filled.
+  // Caller supplies name_ptr/name_len; cp_pack_item clamps name_len to
+  // CP_ITEM_TEXT_MAX = 62 (silent truncation). Zeroes the full 64-byte
+  // slot first so trailing bytes are deterministic for a reader that
+  // consumes the full 64B even when len < 62.
+  //
+  // Register plan: 3 callee-save pushes (rbx = item_dst, r12 = name_ptr,
+  // r13 = clamped_len). Entry rsp%16==8; +24 pushes land rsp%16==0 at
+  // the only exit point (no nested calls). Labels prefixed cp_pi_.
+  // =========================================================================
+
+  pub let cp_pack_item : (u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (kind: u64) (name_ptr: u64) (name_len: u64) (item_dst: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W28 R228.M1 (paideia-os #2711): write one 64-byte completion item at item_dst. Zero all 8 qwords first (deterministic trailing bytes). Write kind byte via mov_b [+0]. Clamp name_len to CP_ITEM_TEXT_MAX=62, write that byte via mov_b [+1]. Byte-copy clamped bytes to [+2..+2+clamped_len] via `xor r10,r10; mov_b r10,[r12+r8*1]; mov_b [rbx+2+r8*1],r10` (pre-zeroed load; byte store). Three callee-save pushes (rbx=item_dst, r12=name_ptr, r13=clamped_len) land rsp%16==0 at the final ret (entry rsp%16==8; +24=32, 32%16==0). Encoder posture: no test, no 2-op imul, no and reg,imm64 (clamp via cmp+mov). Labels prefixed cp_pi_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rcx;                    // rbx = item_dst
+        mov r12, rsi;                    // r12 = name_ptr
+        // name_len (unclamped) in rdx; clamp into r13.
+        mov r13, rdx;
+        mov r10, 62;                     // CP_ITEM_TEXT_MAX
+        cmp r13, r10;
+        jbe cp_pi_len_ok;
+        mov r13, r10;                    // clamp
+      cp_pi_len_ok:
+
+        // Zero the 64-byte slot (8 qword stores, rbx + 0..56).
+        xor rax, rax;
+        mov [rbx + 0],  rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 32], rax;
+        mov [rbx + 40], rax;
+        mov [rbx + 48], rax;
+        mov [rbx + 56], rax;
+
+        // Write kind byte at [+0]. rdi = kind (first SysV arg).
+        // mov_b takes a 64-bit reg source but writes only its low 8;
+        // pre-mask by moving kind through a scratch (defensive: a
+        // caller passing a wide kind value cannot leak into +1 since
+        // mov_b emits a single-byte store).
+        mov r10, rdi;
+        mov_b [rbx + 0], r10;
+
+        // Write len byte at [+1].
+        mov_b [rbx + 1], r13;
+
+        // Byte-copy loop: r8 = cursor, 0..clamped_len.
+        xor r8, r8;
+      cp_pi_scan:
+        cmp r8, r13;
+        jae cp_pi_out;
+
+        xor r10, r10;
+        mov_b r10, [r12 + r8 * 1];
+        mov_b [rbx + 2 + r8 * 1], r10;
+
+        add r8, 1;
+        jmp cp_pi_scan;
+
+      cp_pi_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 14  cp_do_command(prefix_ptr, prefix_len,
+  //                           items_blob_ptr, items_blob_cap)
+  //             -> packed u64 (n_items << 32) | status
+  //
+  // COMMAND-kind handler. Walks the _kcm_table row pool via
+  // kcm_list_first + kcm_list_next, reads each live row's name via
+  // kcm_read_name, filters by prefix, and packs matches into items_blob.
+  //
+  // Sets _cp_last_truncated = 1 when iteration stops at the capacity
+  // cap with a next-row that would have matched; 0 otherwise. (M1
+  // approximation: we set truncated when n_items == max_items AND the
+  // next kcm_list_next returned a valid row, regardless of whether
+  // that next row would have matched. A refinement that only sets
+  // truncated on an actually-skipped match is deferred.)
+  //
+  // Register plan: five callee-save pushes (rbx = prefix_ptr,
+  // r12 = prefix_len, r13 = items_blob_ptr, r14 = max_items,
+  // r15 = n_items). Entry rsp%16==8; +40 pushes land rsp%16==0 at
+  // every nested call site (no further sub rsp needed). Labels
+  // prefixed cp_dc_.
+  // =========================================================================
+
+  pub let cp_do_command : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (prefix_ptr: u64) (prefix_len: u64) (items_blob_ptr: u64) (items_blob_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "UMB-W28 R228.M1 (paideia-os #2711): COMMAND-kind handler. Compute max_items := min(CP_MAX_ITEMS=32, items_blob_cap/64) via `shr r14,6; cmp r14,32; jbe keep; mov r14,32`. If max_items == 0 -> early return (0<<32)|CP_ERR_OUT_TOO_SMALL. Else iterate: row := kcm_list_first; while row != CM_LIST_END (0xFFFFFCC6) and row < CP_KCM_MODULE_MAX=8 and n_items < max_items: name_len := kcm_read_name(row, _cp_name_scratch); if name_len is a valid [1..64] span (not CM_BAD_ROW) and cp_prefix_match(prefix,prefix_len,scratch,name_len)==1: cp_pack_item(CP_KIND_COMMAND=1, scratch, name_len, items_blob_ptr+n_items*64); n_items++; row := kcm_list_next(row). After loop: if n_items == max_items AND the final kcm_list_next did not hit CM_LIST_END/CM_BAD_ROW, set _cp_last_truncated=1 and bump CP_ST_TRUNCATED. Effects widened to {mem,sysreg} and capabilities to {cap} because kcm_list_* / kcm_read_name reach into the cap-kind table (same widening cr_rl_ uses). Five callee-save pushes (rbx=prefix_ptr, r12=prefix_len, r13=items_blob_ptr, r14=max_items, r15=n_items) + sub rsp,16 reserve two stash slots at [rsp+0]=name_len and [rsp+8]=row_cursor (both spilled across nested calls since r9/r10/r11 are all caller-save in SysV and would be clobbered by kcm_* and cp_pack_item). Alignment: entry rsp%16==8; +5*8=40, (8-40)%16=0; +16 preserves %16==0 at every nested CALL. Encoder posture: shr r14,6 (power-of-2 divide via shift; no idiv/imul); no test; no and r,imm64. Labels prefixed cp_dc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 16;
+
+        mov rbx, rdi;                    // rbx = prefix_ptr
+        mov r12, rsi;                    // r12 = prefix_len
+        mov r13, rdx;                    // r13 = items_blob_ptr
+
+        // Compute max_items = min(32, items_blob_cap / 64).
+        // items_blob_cap arrived in rcx (4th SysV arg); divide by 64
+        // via shr 6.
+        mov r14, rcx;
+        shr r14, 6;                      // r14 = items_blob_cap/64
+        mov r10, 32;                     // CP_MAX_ITEMS
+        cmp r14, r10;
+        jbe cp_dc_cap_ok;
+        mov r14, r10;                    // clamp to 32
+      cp_dc_cap_ok:
+
+        // max_items == 0 -> no room for even one item.
+        cmp r14, 0;
+        je  cp_dc_out_too_small;
+
+        // n_items = 0.
+        xor r15, r15;
+
+        // Call kcm_list_first (0-arg). Spill the cursor to [rsp+8]
+        // (r9/r10/r11 are caller-save and would be clobbered by any
+        // nested call inside the loop body).
+        call kcm_list_first;
+        mov [rsp + 8], rax;              // row cursor stash
+
+      cp_dc_loop:
+        // Load row cursor from stash.
+        mov r9, [rsp + 8];
+
+        // Termination: row == CM_LIST_END.
+        mov r10, 0xFFFFFCC6;             // CP_KCM_LIST_END
+        cmp r9, r10;
+        je  cp_dc_done;
+
+        // Defensive: row == CM_BAD_ROW.
+        mov r10, 0xFFFFFCC7;             // CP_KCM_BAD_ROW
+        cmp r9, r10;
+        je  cp_dc_done;
+
+        // Defensive: row >= CP_KCM_MODULE_MAX (should never happen
+        // after FIRST/NEXT but costs one cmp).
+        mov r10, 8;                      // CP_KCM_MODULE_MAX
+        cmp r9, r10;
+        jae cp_dc_done;
+
+        // Capacity check: n_items == max_items -> truncate.
+        cmp r15, r14;
+        jae cp_dc_truncated;
+
+        // Read the name into _cp_name_scratch. kcm_read_name takes
+        // (row_id, out_ptr).
+        mov rdi, r9;
+        lea rsi, [rip + _cp_name_scratch];
+        call kcm_read_name;              // rax = name_len | CM_BAD_ROW
+
+        // name_len == CM_BAD_ROW -> skip (torn iteration).
+        mov r10, 0xFFFFFCC7;             // CP_KCM_BAD_ROW
+        cmp rax, r10;
+        je  cp_dc_next;
+
+        // name_len == 0 -> skip (unnamed row -- shouldn't happen but
+        // defensive against a torn torn-open race during R123.M5).
+        cmp rax, 0;
+        je  cp_dc_next;
+
+        // name_len > CP_KCM_NAME_MAX -> truncate at CP_KCM_NAME_MAX
+        // (defensive against a corrupted name_len array). cp_pack_item
+        // will further clamp to CP_ITEM_TEXT_MAX = 62.
+        mov r10, 64;                     // CP_KCM_NAME_MAX
+        cmp rax, r10;
+        jbe cp_dc_len_ok;
+        mov rax, r10;
+      cp_dc_len_ok:
+        // Stash name_len at [rsp + 0]; row cursor already in [rsp+8].
+        mov [rsp + 0], rax;
+
+        // Prefix match: cp_prefix_match(prefix_ptr, prefix_len,
+        //                               _cp_name_scratch, name_len).
+        mov rdi, rbx;
+        mov rsi, r12;
+        lea rdx, [rip + _cp_name_scratch];
+        mov rcx, [rsp + 0];              // name_len
+        call cp_prefix_match;            // rax = 0 or 1
+        cmp rax, 0;
+        je  cp_dc_next;
+
+        // Match! Pack the item. cp_pack_item(CP_KIND_COMMAND,
+        //                        _cp_name_scratch, name_len, item_dst).
+        mov rdi, 1;                      // CP_KIND_COMMAND
+        lea rsi, [rip + _cp_name_scratch];
+        mov rdx, [rsp + 0];              // name_len
+        // item_dst = items_blob_ptr + n_items * 64.
+        mov rcx, r15;
+        shl rcx, 6;                      // n_items * 64
+        add rcx, r13;                    // + items_blob_ptr
+        call cp_pack_item;
+
+        // n_items++.
+        add r15, 1;
+
+      cp_dc_next:
+        // Advance the iterator. kcm_list_next(row_id) using the
+        // stashed row cursor at [rsp+8] (nested calls above may have
+        // clobbered any live register copy).
+        mov rdi, [rsp + 8];
+        call kcm_list_next;
+        mov [rsp + 8], rax;              // new row cursor
+        jmp cp_dc_loop;
+
+      cp_dc_truncated:
+        // Set the truncated flag and bump the stat.
+        mov rax, 1;
+        mov [rip + _cp_last_truncated], rax;
+        mov rdi, 6;                      // CP_ST_TRUNCATED
+        call cpn_note;
+        jmp cp_dc_done;
+
+      cp_dc_done:
+        // Pack return: (n_items << 32) | CP_OK.
+        mov rax, r15;
+        shl rax, 32;                     // n_items in high half
+        // CP_OK == 0, no OR needed.
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cp_dc_out_too_small:
+        // (0 << 32) | CP_ERR_OUT_TOO_SMALL.
+        mov rax, 0x2F02;                 // CP_ERR_OUT_TOO_SMALL
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 15  _cp_request(req_ptr, resp_ptr, resp_cap,
+  //                         items_blob_ptr, items_blob_cap)
+  //             -> packed u64 (n_items << 32) | status
+  //
+  // Public entry point. Validates arguments, reads request fields,
+  // dispatches on kind, writes the response record, returns the packed
+  // (n_items, status) result.
+  //
+  // Validation order (each failure is CP_ERR_BAD_REQUEST unless noted):
+  //   (1) req_ptr != 0
+  //   (2) resp_ptr != 0
+  //   (3) resp_cap >= CP_RESP_BYTES (128)
+  //   (4) items_blob_ptr != 0 (even for an UNIMPLEMENTED kind -- the
+  //       caller is in violation of the API if they omit it)
+  //   (5) session_id < CP_SS_POOL_MAX (strict range check; the session
+  //       row is not consulted at M1 but a sane id is required for the
+  //       response record to be meaningful)
+  //   (6) kind in [1..CP_KIND_MAX=4]
+  //
+  // Then dispatch on kind:
+  //   kind == CP_KIND_COMMAND -> cp_do_command
+  //   kind in {PATH, SCHEMA_FIELD, DATALOG_PREDICATE} -> CP_UNIMPLEMENTED
+  //
+  // Response-record writeout (always, even on error, so a reader sees
+  // the status without having to inspect the return register):
+  //   [+0]  request_id (echoed)
+  //   [+4]  n_items (0 on error)
+  //   [+6]  truncated_flag (from _cp_last_truncated)
+  //   [+8]  items_offset (0; M1 always starts at blob+0)
+  //   [+12] items_blob_len (n_items * 64)
+  //   [+16] status
+  //   [+20..+128] zero-filled reserved tail
+  //
+  // Register plan: four callee-save pushes (rbx = req_ptr,
+  // r12 = resp_ptr, r13 = items_blob_ptr, r14 = items_blob_cap) + one
+  // scratch push (r15 = request_id / n_items / kind at different
+  // phases, re-used disciplined). Entry rsp%16==8; +40 pushes land
+  // rsp%16==8; +8 align pad lands rsp%16==0 at every nested call.
+  // Labels prefixed cp_rq_.
+  //
+  // The emit-fingerprint tail uses klog_s1_x4 (level, subsys, tag, k1,
+  // v1, k2, v2) with k3/v3 and k4/v4 passed via the stack-arg idiom
+  // (sub rsp,16 reserved; push v4; push v3; call; add rsp,16). We log
+  // sid, rid, kind, items as hex (klog_s1_x4). Fingerprint is bumped
+  // on every return path (OK and error) so the smoke harness can
+  // observe the dispatch outcome.
+  // =========================================================================
+
+  pub let _cp_request : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (req_ptr: u64) (resp_ptr: u64) (resp_cap: u64) (items_blob_ptr: u64) (items_blob_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "UMB-W28 R228.M1 (paideia-os #2711): public completion-protocol entry point. Validates (req_ptr/resp_ptr/items_blob_ptr non-null, resp_cap>=128, session_id<CP_SS_POOL_MAX=8, kind in [1..4]), zero-scrubs _cp_last_truncated, dispatches: COMMAND -> cp_do_command; PATH/SCHEMA_FIELD/DATALOG_PREDICATE -> CP_UNIMPLEMENTED. On every return path (OK, error, unimpl) writes the full response record: request_id echoed, n_items + truncated + items_offset + items_blob_len + status + zero reserved tail. Bumps CP_ST_REQUESTS unconditionally; status-specific stat on completion. Fingerprint emit via klog_s1_x4 (SUBSYS_CAP_, cp_tag_request_ok, sid+rid+kind+items) tracks every dispatch outcome. Five callee-save pushes (rbx=req_ptr, r12=resp_ptr, r13=items_blob_ptr, r14=items_blob_cap, r15=status/scratch) land rsp%16==0 at every nested call (entry rsp%16==8; (8-40)%16=0). Field reads use mov_w (u16 zero-extend) and mov_d (u32 zero-extend) per vops.pdx L614 discipline. Response writeout uses qword stores where fields are quadword-aligned and mov_d / mov_w for the sub-qword fields. The klog_s1_x4 call reserves 48 bytes (preserves rsp%16==0 since 48%16==0) + populates [rsp+0]=v2, [rsp+8]=k3, [rsp+16]=v3, [rsp+24]=k4, [rsp+32]=v4 via mov (dump.pdx L83-115 push idiom replaced with sub+mov to avoid intermediate stack churn). Encoder posture: no test, no 2-op imul, no and r,imm64 (every mask through r10/r11 or via mov_d/mov_w). Labels prefixed cp_rq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // rbx = req_ptr
+        mov r12, rsi;                    // r12 = resp_ptr
+        mov r13, rcx;                    // r13 = items_blob_ptr
+        mov r14, r8;                     // r14 = items_blob_cap
+        // resp_cap (rdx) is caller-save and would be clobbered by the
+        // cpn_note CALL below; stash to r15 across the validation
+        // window. r15 is reused for status post-dispatch.
+        mov r15, rdx;
+
+        // Reset the truncated side channel for this request.
+        xor rax, rax;
+        mov [rip + _cp_last_truncated], rax;
+
+        // Bump the request counter (unconditional). cpn_note clobbers
+        // caller-save regs; rbx/r12/r13/r14/r15 all safe.
+        mov rdi, 0;                      // CP_ST_REQUESTS
+        call cpn_note;
+
+        // ---- Validation (1): req_ptr != 0 ----
+        cmp rbx, 0;
+        je  cp_rq_bad;
+
+        // ---- Validation (2): resp_ptr != 0 ----
+        cmp r12, 0;
+        je  cp_rq_bad;
+
+        // ---- Validation (3): resp_cap >= 128 ----
+        mov r10, 128;                    // CP_RESP_BYTES
+        cmp r15, r10;
+        jb  cp_rq_bad;
+
+        // ---- Validation (4): items_blob_ptr != 0 ----
+        cmp r13, 0;
+        je  cp_rq_bad;
+
+        // ---- Validation (5): session_id < CP_SS_POOL_MAX ----
+        // session_id is a u32 at req[+0]. mov_d zero-extends to 64b.
+        mov_d r15, [rbx + 0];
+        mov r10, 8;                      // CP_SS_POOL_MAX
+        cmp r15, r10;
+        jae cp_rq_bad;
+
+        // ---- Validation (6): kind in [1..4] ----
+        // kind is a u16 at req[+8]. mov_w zero-extends.
+        mov_w r11, [rbx + 8];
+        cmp r11, 0;
+        je  cp_rq_bad;
+        mov r10, 4;                      // CP_KIND_MAX
+        cmp r11, r10;
+        ja  cp_rq_unknown;
+
+        // ---- Dispatch ----
+        // r11 holds kind. Fast path: kind == 1 -> COMMAND. Anything
+        // else (2, 3, 4) -> UNIMPLEMENTED at M1.
+        cmp r11, 1;
+        jne cp_rq_unimpl;
+
+        // ---- COMMAND path ----
+        // Resolve prefix_offset (u16 @ req+10) and prefix_len (u16 @
+        // req+12). prefix_ptr := req_ptr + prefix_offset.
+        mov_w r10, [rbx + 10];           // prefix_offset
+        add r10, rbx;                    // prefix_ptr
+        mov_w rcx, [rbx + 12];           // prefix_len (clamp below)
+
+        // Clamp prefix_len to CP_ITEM_TEXT_MAX=62 (over-length prefix
+        // can never match an item slot's text buffer; capping avoids
+        // reading past the request buffer for the degenerate case).
+        mov r9, 62;                      // CP_ITEM_TEXT_MAX
+        cmp rcx, r9;
+        jbe cp_rq_pfxlen_ok;
+        mov rcx, r9;
+      cp_rq_pfxlen_ok:
+
+        // Call cp_do_command(prefix_ptr, prefix_len, items_blob_ptr,
+        //                    items_blob_cap).
+        mov rdi, r10;                    // prefix_ptr
+        mov rsi, rcx;                    // prefix_len
+        mov rdx, r13;                    // items_blob_ptr
+        mov rcx, r14;                    // items_blob_cap
+        call cp_do_command;              // rax = (n_items<<32)|status
+
+        // Split rax -> status (low 32), n_items (high 32). Spill
+        // n_items to r14 (callee-save; items_blob_cap no longer needed
+        // post-dispatch) so it survives the cpn_note call that follows.
+        // r11 is caller-save in SysV, so a cpn_note call MUST be
+        // assumed to clobber it.
+        mov r14, rax;
+        shr r14, 32;                     // r14 = n_items
+        mov r15, rax;
+        mov r10, 0xFFFFFFFF;             // mask (staged, no and r,imm64)
+        and r15, r10;                    // r15 = status
+
+        // Bump CP_ST_OK on success, CP_ST_OUT_TOO_SMALL on that error.
+        cmp r15, 0;
+        je  cp_rq_bump_ok;
+        mov r10, 0x2F02;                 // CP_ERR_OUT_TOO_SMALL
+        cmp r15, r10;
+        jne cp_rq_write;                 // other codes shouldn't occur
+        mov rdi, 5;                      // CP_ST_OUT_TOO_SMALL
+        call cpn_note;
+        jmp cp_rq_write;
+      cp_rq_bump_ok:
+        mov rdi, 1;                      // CP_ST_OK
+        call cpn_note;
+        jmp cp_rq_write;
+
+      cp_rq_unimpl:
+        // UNIMPLEMENTED path for kinds 2/3/4 at M1.
+        xor r14, r14;                    // n_items = 0 (spilled)
+        mov r15, 0x2F03;                 // CP_UNIMPLEMENTED
+        mov rdi, 4;                      // CP_ST_UNIMPL
+        call cpn_note;
+        jmp cp_rq_write;
+
+      cp_rq_unknown:
+        xor r14, r14;                    // n_items = 0 (spilled)
+        mov r15, 0x2F01;                 // CP_ERR_UNKNOWN_KIND
+        mov rdi, 3;                      // CP_ST_UNKNOWN_KIND
+        call cpn_note;
+        jmp cp_rq_write;
+
+      cp_rq_bad:
+        xor r14, r14;                    // n_items = 0 (spilled)
+        mov r15, 0x2F00;                 // CP_ERR_BAD_REQUEST
+        mov rdi, 2;                      // CP_ST_BAD_REQUEST
+        call cpn_note;
+        jmp cp_rq_write;
+
+      cp_rq_write:
+        // ---- Response record writeout ----
+        // Only write if resp_ptr is sane (we jumped straight here from
+        // cp_rq_bad which checked). Re-check defensively: resp_ptr may
+        // be zero on the BAD path reached via validation (2). Guard
+        // the writes with a cmp to avoid faulting.
+        cmp r12, 0;
+        je  cp_rq_finalise;
+
+        // Echo request_id (u32 @ req+4) into resp+0.
+        // Guard: req_ptr may be 0 on BAD path (1). Use a staged 0
+        // when req_ptr is bogus; the response's request_id field is
+        // informational.
+        cmp rbx, 0;
+        je  cp_rq_rid_zero;
+        mov_d r10, [rbx + 4];
+        jmp cp_rq_rid_write;
+      cp_rq_rid_zero:
+        xor r10, r10;
+      cp_rq_rid_write:
+        mov_d [r12 + 0], r10;            // resp.request_id
+
+        // n_items (u16 @ resp+4). r14 holds the spilled count (low 16
+        // used; count is bounded by CP_MAX_ITEMS=32).
+        mov_w [r12 + 4], r14;
+
+        // truncated_flag (u16 @ resp+6).
+        mov rax, [rip + _cp_last_truncated];
+        mov_w [r12 + 6], rax;
+
+        // items_offset (u32 @ resp+8) = 0 (M1).
+        xor rax, rax;
+        mov_d [r12 + 8], rax;
+
+        // items_blob_len (u32 @ resp+12) = n_items * 64.
+        mov rcx, r14;
+        shl rcx, 6;
+        mov_d [r12 + 12], rcx;
+
+        // status (u32 @ resp+16).
+        mov_d [r12 + 16], r15;
+
+        // Reserved tail: zero-fill resp[+20..+128]. That's 108 bytes.
+        // 108 / 8 = 13.5 -- we zero 13 qwords (resp+24..+128 = 104
+        // bytes starting at an 8-aligned offset) then one dword at
+        // resp+20. Specifically: resp+20 is u32-aligned not u64. We
+        // zero resp+20 via mov_d, then resp+24..resp+120 via 13
+        // qwords.
+        xor rax, rax;
+        mov_d [r12 + 20], rax;
+        mov [r12 + 24], rax;
+        mov [r12 + 32], rax;
+        mov [r12 + 40], rax;
+        mov [r12 + 48], rax;
+        mov [r12 + 56], rax;
+        mov [r12 + 64], rax;
+        mov [r12 + 72], rax;
+        mov [r12 + 80], rax;
+        mov [r12 + 88], rax;
+        mov [r12 + 96], rax;
+        mov [r12 + 104], rax;
+        mov [r12 + 112], rax;
+        mov [r12 + 120], rax;
+
+      cp_rq_finalise:
+        // ---- Fingerprint emit: `COMPLETION OK sid=.. rid=.. kind=..
+        //      items=..` via klog_s1_x4.
+        //
+        // klog_s1_x4 takes 6 register args (level, subsys, tag, k1, v1,
+        // k2) and consumes 5 stack args at [rsp+0..+32] pre-CALL
+        // (v2, k3, v3, k4, v4 bottom-up). See wrappers.pdx L162-168.
+        //
+        // At entry to this label rsp%16==0 (5 callee-save pushes, no
+        // sub). We reserve 48 bytes via `sub rsp, 48` (16-aligned so
+        // rsp%16==0 preserved), populate the 5 slots via mov (plus 8
+        // bytes of pad we don't need to touch), issue the call, then
+        // `add rsp, 48`.
+        //
+        // Guard req_ptr == 0 (reached via validation path 1) by
+        // zeroing sid/rid/kind rather than dereferencing a null req.
+
+        sub rsp, 48;
+
+        // Stage v2 (rid), v3 (kind), v4 (items). Items is still in r11.
+        cmp rbx, 0;
+        je  cp_rq_emit_zero;
+        // Reload rid/kind directly to their stack slots via a scratch.
+        mov_d rax, [rbx + 4];            // rax = rid (u32 zero-ext)
+        mov  [rsp + 0], rax;             // v2 = rid
+        mov_w rax, [rbx + 8];            // rax = kind (u16 zero-ext)
+        mov  [rsp + 16], rax;            // v3 = kind
+        jmp cp_rq_emit_pack;
+      cp_rq_emit_zero:
+        xor rax, rax;
+        mov [rsp + 0],  rax;             // v2 = 0
+        mov [rsp + 16], rax;             // v3 = 0
+      cp_rq_emit_pack:
+        // k3 = cp_k_kind (fixed string ptr).
+        lea rax, [rip + cp_k_kind];
+        mov [rsp + 8], rax;              // k3 = cp_k_kind
+
+        // v4 = items (r14, spilled n_items from dispatch).
+        mov [rsp + 32], r14;             // v4 = items
+
+        // k4 = cp_k_items.
+        lea rax, [rip + cp_k_items];
+        mov [rsp + 24], rax;             // k4 = cp_k_items
+
+        // 6 register args: rdi, rsi, rdx, rcx, r8, r9.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + cp_tag_request_ok];
+        lea rcx, [rip + cp_k_sid];       // k1
+        cmp rbx, 0;
+        je  cp_rq_emit_sid_zero;
+        mov_d r8, [rbx + 0];             // v1 = sid
+        jmp cp_rq_emit_do;
+      cp_rq_emit_sid_zero:
+        xor r8, r8;                      // v1 = 0
+      cp_rq_emit_do:
+        lea r9, [rip + cp_k_rid];        // k2
+
+        call klog_s1_x4;
+        add rsp, 48;
+
+        // ---- Compute return packed value: (n_items << 32) | status ----
+        // r14 = spilled n_items, r15 = status.
+        mov rax, r14;
+        shl rax, 32;
+        or  rax, r15;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 16  POST-M1 EXTENSION POINTS (documentation anchor)
+  //
+  // M2 PATH handler (cp_do_path, not yet landed):
+  //   * Reads context bytes at req_ptr + context_offset (the directory
+  //     path to list) and uses vfs_open + vfs_dir_readnext to iterate
+  //     dirent names. Capability gate TBD at R134 x R228 crossing.
+  //
+  // M2 SCHEMA_FIELD handler (cp_do_schema_field):
+  //   * Reads context bytes as a schema-signature handle (e.g. hex id)
+  //     and consults the R222.M1 SchemasSig member-table export API
+  //     (currently internal) to enumerate field names.
+  //
+  // M2 DATALOG_PREDICATE handler (cp_do_datalog_predicate):
+  //   * Reads context bytes as a datalog scope (session id for the
+  //     fact store) and scans the predicate index built by R226.M1
+  //     datalog parsers for prefix matches.
+  //
+  // All three handlers conform to the cp_do_command contract:
+  //   signature (prefix_ptr, prefix_len, items_blob_ptr, items_blob_cap)
+  //            -> packed u64 (n_items << 32) | status
+  //
+  // The _cp_request dispatcher's cp_rq_unimpl arm expands to a
+  // switch-on-kind that invokes the matching cp_do_* function as each
+  // handler lands. No change to the public ABI.
+  // =========================================================================
+
+}
