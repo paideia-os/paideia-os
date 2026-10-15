@@ -29,8 +29,12 @@ syscall, binds no ambient service, holds no capability of its own
 ASCII fast-path heuristic.
 **R223.M1 landed — v1.1.0.** Pipeline-stage parser (`cmd | cmd | ...`
 tokeniser with quoting + escape handling).
-See [`STATUS.md`](STATUS.md) for the per-milestone roadmap; R221.M2+
-and R223.M2+ remain in follow-up issues.
+**R224.M1 landed — v1.5.0.** Lambda literal grammar
+(`\x:u64 -> ...` / `\(x:u64, y:u64) -> ...`): LambdaHeader + Param
+descriptor emitter, body bytes copied verbatim for R224.M2
+expression parse.
+See [`STATUS.md`](STATUS.md) for the per-milestone roadmap; R221.M2+,
+R223.M2+, R224.M2+ remain in follow-up issues.
 
 ## API surface
 
@@ -84,6 +88,46 @@ per the shape documented at each site.
 | 56 | 2 | `flags` | u16 (bit 0 `HAS_ESCAPES`, bit 1 `HAS_QUOTES`) |
 | 58 | 6 | `_reserved[6]` | u8[6] (zero at M1) |
 
+### R224.M1 — Lambda literal grammar
+
+| Function | Signature | Return |
+|---|---|---|
+| `LambdaLit::_ll_parse` | `(bytes_ptr: u64, bytes_len: u64, out_ptr: u64, out_cap: u64) -> u64` | `(bytes_written << 32) \| status`; status in `{LL_OK, LL_ERR_SYNTAX, LL_ERR_TOO_MANY_PARAMS, LL_ERR_UNKNOWN_TYPE, LL_ERR_OUT_TOO_SMALL, LL_ERR_NO_ARROW}` |
+| `LambdaLit::_ll_parse_param` | `(bytes_ptr: u64, bytes_len: u64, cursor_in: u64, param_write_ptr: u64) -> u64` | `(new_cursor << 32) \| status`; cross-fn helper |
+| `LambdaLit::_ll_skip_ws` | `(bytes_ptr: u64, bytes_len: u64, cursor_in: u64) -> u64` | advanced cursor past SP/TAB/LF/CR |
+| `LambdaLit::_ll_classify_type` | `(ident_ptr: u64, ident_len: u64) -> u64` | one of `LL_TYPE_U64`..`LL_TYPE_PID` or `LL_UNKNOWN_TYPE` |
+
+#### LL_* status codes (`src/lambda_lit.pdx` Section 1)
+
+| Name | Value | Meaning |
+|---|---|---|
+| `LL_OK` | `0` | Parse succeeded; `bytes_written = 32 + n_params*32 + body_len`. |
+| `LL_ERR_SYNTAX` | `0x2C00` | Grammar mismatch at ident, `:`, `(`, `)`, or `,`. |
+| `LL_ERR_TOO_MANY_PARAMS` | `0x2C01` | `> LL_MAX_PARAMS` (8). |
+| `LL_ERR_UNKNOWN_TYPE` | `0x2C02` | `type_name` not in the M1 set (u64/i64/str/hex/hash32/tsc/path/pid). |
+| `LL_ERR_OUT_TOO_SMALL` | `0x2C03` | `out_cap < 32 + n_params*32 + body_len`. |
+| `LL_ERR_NO_ARROW` | `0x2C04` | ParamList terminator was not `->`. |
+
+#### `LambdaHeader` record (32 bytes)
+
+| Offset | Size | Field | Type |
+|---:|---:|---|---|
+| 0 | 4 | `magic` | u32 (= `LL_HEADER_MAGIC = 0x44424D4C` / `'LMBD'`) |
+| 4 | 2 | `n_params` | u16 (0..`LL_MAX_PARAMS`) |
+| 6 | 2 | `flags` | u16 (reserved; 0 at M1) |
+| 8 | 4 | `body_offset` | u32 (= 32 + n_params*32; offset within out) |
+| 12 | 4 | `body_len` | u32 (opaque body byte count) |
+| 16 | 16 | `reserved[16]` | u8[16] (zero at M1; M2+: effect-row id, cap-row id) |
+
+#### `Param` descriptor (32 bytes each)
+
+| Offset | Size | Field | Type |
+|---:|---:|---|---|
+| 0 | 1 | `type_code` | u8 (`LL_TYPE_*`, 1..9 with 7 reserved) |
+| 1 | 1 | `name_len` | u8 (1..`LL_NAME_MAX` = 13) |
+| 2 | 14 | `name_inline[14]` | u8[14] (ASCII; zero-padded past `name_len`) |
+| 16 | 16 | `reserved[16]` | u8[16] (zero at M1; M2+: default-value, closure-capture, destructure) |
+
 ## Fast-path strategy
 
 `_u8n_decode_and_normalize` begins by calling
@@ -115,6 +159,11 @@ library standalone.
 `Pipeline::_pl_parse` has no external linker dependencies; it only
 CALLs the module-private `_pl_emit_word`.
 
+`LambdaLit::_ll_parse` has no external linker dependencies; it only
+CALLs the module-private `_ll_skip_ws`, `_ll_classify_type`, and
+`_ll_parse_param` (the last of which in turn CALLs `_ll_skip_ws` and
+`_ll_classify_type`).
+
 ## Build
 
 ```sh
@@ -134,6 +183,10 @@ or `$PATH`.
 - `design/shell/pipeline-stage-parser.md` — R223.M1 grammar, state
   machine, `PipelineStage` layout, interactions with R129.M5
   renderer `as` syntax and R222 cmd-functor dispatch.
+- `design/shell/lambda-literal-grammar.md` — R224.M1 grammar,
+  LambdaHeader + Param record layout, interactions with R222.M1
+  SchemasSig (shared type codes), forward path to R224.M2 expression
+  parse + R224.M3 effect polymorphism.
 
 ## References
 
