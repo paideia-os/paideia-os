@@ -1,0 +1,1188 @@
+// src/renderer.pdx -- libpdx-pds-parser.R229.M9 (paideia-os#2727)
+//
+// Renderer: parser-tier terminal-capability-aware output router. Owns
+// the ACTIVE terminal-capability record (installed by the REPL at
+// session boot from the substrate's XTGETTCAP answer) and dispatches
+// every record / table render through one of three paths -- Kitty
+// graphics APC envelope, ANSI-256 SGR + Unicode box-drawing, or
+// plain-ASCII fallback -- based on the capability's `kind` byte.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R229 is the REPL evaluator umbrella (paideia-os#2493; design doc
+// design/shell/repl-loop-scaffold.md). R229.M6 landed LineEditor;
+// R229.M7 landed ViMode; R229.M8 landed MultiLine. R229.M9 (THIS
+// module) consumes the substrate's terminal-capability answer
+// (R129.M1 XTGETTCAP DCS round-trip; the kernel-side helper lives at
+// src/kernel/core/terminal/xtgettcap.pdx) and routes WRITING-mode
+// bytes through Kitty vs ANSI-256 vs ANSI-16 per
+// design/terminal/semantic-shell.md §9.
+//
+// Position in the substrate graph:
+//
+//   TTY ISR -> _rl_tick (R229.M1) -> state := WRITING
+//        -> session boot path (once per session):
+//              _xtgettcap_probe() -> 32 B cap record on kernel scratch
+//              _rd_set_capability(cap_record_ref) -> stashes to .bss
+//        -> _rd_render_record(rec, len, out, out_cap)
+//        -> _rd_render_table(rows, n_rows, cols, n_cols, out, out_cap)
+//        -> state := READING -> _rl_emit_prompt
+//
+// Renderer is PARSER-TIER by geography (same satellite library as
+// LineEditor, ViMode, MultiLine, History) but is NOT itself a parser
+// -- the module routes BYTES at write time. The write surface is
+// cluster-aware via R221.M3 `_wp_cols` (table column alignment); the
+// Kitty / ANSI SGR escapes are byte-literal emissions.
+//
+// Lives user-space because the shell runs user-space; the state is
+// caller-process-local (singleton .bss, 32 B cap record + 1 u64
+// ready flag = 40 B); the module touches no kernel KIND and consumes
+// no capability (caps.decl R229.M9 band note).
+//
+// Why Renderer is distinct from R129.M2 (Kitty graphics APC emitter)
+// and R129.M3 (ANSI-256 tabular fallback renderer):
+//   * R129.M2 (kernel-side) emits a RAW BITMAP as a Kitty APC
+//     envelope. It is agnostic of the REPL's typed-record substrate;
+//     a caller hands it pixel bytes and width x height and it emits
+//     the wire payload.
+//   * R129.M3 (kernel-side) emits a TABULAR ByteRecord stream in
+//     ANSI-256 SGR + Unicode box-drawing. It takes `rows_ptr`,
+//     `cols_desc_ptr`, row/col counts, and a flags u64; it emits
+//     the per-cell SGR escapes.
+//   * R229.M9 (THIS module, parser-tier) is the DISPATCHER a user-
+//     space semantic-shell write path consults BEFORE either of
+//     those kernel-tier emitters is reached. It owns the active
+//     capability record so the shell doesn't re-probe XTGETTCAP on
+//     every write, and routes to the correct emitter path by kind
+//     byte.
+//
+// At raw M9 the parser-tier dispatcher emits a MINIMAL per-kind
+// transport envelope + cluster-aware column padding; the full
+// bitmap + table SGR escapes delegate to the kernel-tier helpers
+// via a wire-up that lands at M9.1 (the kernel-side emitters are
+// opaque function pointers populated at session boot, same shape
+// as R222.M6 DispatchMode's `_dm_light_fn` / `_dm_spawn_fn` slots).
+//
+// =============================================================================
+// CAPABILITY RECORD -- 32 BYTES
+// =============================================================================
+//
+// Fed to `_rd_set_capability` by the REPL at session boot:
+//
+//   0x00 u32    magic              = 'TCAP' (0x50414354 LE)
+//   0x04 u8     kind               -- RD_TERM_KITTY=0, RD_TERM_ANSI256=1,
+//                                     RD_TERM_ANSI16=2
+//   0x05 u8     flags              -- bit 0 TRUECOLOR, bit 1 ITALIC,
+//                                     bit 2 GRAPHICS
+//   0x06 u16    reserved
+//   0x08 u16    cols               -- terminal grid column count
+//   0x0A u16    rows               -- terminal grid row count
+//   0x0C u32    reserved
+//   0x10 u8[16] term_name_inline   -- caller-supplied name (TERM env var or
+//                                     xtgettcap TN cap); zero-padded.
+//
+// Record stride is a power of two (32 = 1 << 5) so a future per-
+// session multi-cap table (e.g. one per attached TTY) can index via
+// `shl idx, 5` without the 48-stride dance. At raw M9 we hold a
+// singleton: the current session has at most one TTY.
+//
+// Magic 'TCAP' = 0x50414354 LE reads as "TCAP" in a hex-dump
+// sequential scan (byte[0]=0x54 'T', byte[1]=0x43 'C', byte[2]=0x41
+// 'A', byte[3]=0x50 'P') per the Wave 125 SortGroupReduce magic-
+// reconciliation lesson. The magic u32 fits in imm32 with bit 31
+// clear so direct `cmp reg, imm32` is sign-extension-safe.
+//
+// =============================================================================
+// COLUMN DESCRIPTOR -- 16 BYTES
+// =============================================================================
+//
+// Fed to `_rd_render_table` as `cols_ref`:
+//
+//   0x00 u16    width              -- target column width in cells
+//                                     (1..RD_MAX_COL_WIDTH = 128)
+//   0x02 u16    flags              -- bit 0 RD_COL_LEFT_ALIGN
+//                                     (default); bit 1 RD_COL_RIGHT_ALIGN
+//   0x04 u32    reserved
+//   0x08 u8[8]  name_inline        -- header text (zero-padded;
+//                                     rendered as the first row by the
+//                                     table emitter)
+//
+// Column stride 16 is a power of two (shl idx, 4; never 2-op
+// `imul r, imm`).
+//
+// =============================================================================
+// CELL REFERENCE -- 16 BYTES
+// =============================================================================
+//
+// Fed to `_rd_render_table` as `rows_ref`: a packed array of
+// n_rows * n_cols CellRef records, laid out row-major so cell
+// (i, j) lives at `rows_ref + (i * n_cols + j) * 16`:
+//
+//   0x00 u64    ptr                -- pointer to the cell's UTF-8 byte
+//                                     payload (NFC-normalised by the
+//                                     caller; empty-cell: ptr == 0)
+//   0x08 u64    len                -- byte length of the cell payload
+//                                     (0..RD_MAX_CELL_BYTES = 256);
+//                                     capped at render time
+//
+// Stride 16 is a power of two (`shl idx, 4` addressing; cell at
+// (i, j) via `mov idx, i; imul-not idx, n_cols; add idx, j; shl idx,
+// 4` -- the row*n_cols multiply uses the standard shift-sum ladder
+// in `_rd_render_table` to avoid 2-op `imul r, imm`).
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _rd_init() -> ()
+//     Boot hook. Defensive scrub of the five u64 scalars (40 B =
+//     32 B cap record + 1 u64 ready flag + 1 u64 reserved). .bss
+//     zero-init at program load already satisfies the cold-boot
+//     semantic (ready == 0 => RD_ERR_NO_CAPABILITY on every render
+//     call); the hook exists for test-time reset.
+//
+//   _rd_set_capability(cap_record_ref) -> status
+//     rdi = cap_record_ref
+//     rax = RD_OK / RD_ERR_BAD_PTR / RD_ERR_BAD_MAGIC / RD_ERR_BAD_KIND
+//
+//     Validates `cap_record_ref != 0`, magic 'TCAP' at [+0], kind in
+//     {0, 1, 2}. Copies 32 bytes from cap_record_ref to the module's
+//     own `_rd_cap_record` via four u64 moves. Sets `_rd_ready = 1`.
+//     Pure leaf; zero pushes.
+//
+//   _rd_render_record(record_ref, record_len, out, out_cap) -> packed_u64
+//     rdi = record_ref
+//     rsi = record_len
+//     rdx = out
+//     rcx = out_cap
+//     rax = (bytes_written << 32) | status
+//
+//     Routes one record's bytes through the active capability kind:
+//       KITTY   : emit APC prelude `\e_G;` (4 B: 0x1B 0x5F 0x47 0x3B)
+//                 + record bytes + APC terminator `\e\\` (2 B: 0x1B
+//                 0x5C). Total written = 6 + record_len.
+//       ANSI256 : emit SGR foreground `\e[38;5;255m` (11 B) + record
+//                 bytes + SGR reset `\e[0m` (4 B). Total written =
+//                 15 + record_len.
+//       ANSI16  : emit record bytes verbatim. Total = record_len.
+//     Guards: record_ref != 0 (RD_ERR_BAD_RECORD); out != 0
+//     (RD_ERR_BAD_PTR); `_rd_ready == 1` (RD_ERR_NO_CAPABILITY);
+//     out_cap >= needed (RD_ERR_OUT_TOO_SMALL); kind in {0, 1, 2}
+//     (RD_ERR_BAD_KIND; defensive -- _rd_set_capability already
+//     validates). Pure leaf; zero pushes.
+//
+//   _rd_render_table(rows_ref, n_rows, cols_ref, n_cols, out, out_cap) -> packed_u64
+//     rdi = rows_ref
+//     rsi = n_rows
+//     rdx = cols_ref
+//     rcx = n_cols
+//     r8  = out
+//     r9  = out_cap
+//     rax = (bytes_written << 32) | status
+//
+//     Renders a 2D grid of UTF-8 cells with cluster-aware column
+//     alignment. For each row (0..n_rows), for each col (0..n_cols):
+//       1. Load cell (ptr, len) from rows_ref.
+//       2. CALL `_wp_cols(ptr, len)` (R221.M3) to compute the cell's
+//          visible column count under TR#11.
+//       3. Emit cell bytes.
+//       4. Emit space-pad to col.width - cell_cols cells (LEFT_ALIGN
+//          default: pad AFTER cell; RIGHT_ALIGN: pad BEFORE cell).
+//     Each row begins with `| ` and ends with ` |\n` (ASCII pipe +
+//     LF). Column separators are ` | `. Under ANSI256 and KITTY the
+//     emitter would layer Unicode box-drawing + SGR escapes; raw M9
+//     keeps the shape ASCII-pipe to isolate the capability-dispatch
+//     + width-pass wire-up from the box-drawing refinement
+//     (deferred to M9.2).
+//     Guards: rows_ref != 0 (RD_ERR_BAD_PTR); cols_ref != 0
+//     (RD_ERR_BAD_PTR); out != 0 (RD_ERR_BAD_PTR); n_cols in
+//     [1..RD_MAX_COLS=32] (RD_ERR_BAD_COL_COUNT); n_rows in
+//     [0..RD_MAX_ROWS=256] (RD_ERR_BAD_ROW_COUNT); `_rd_ready == 1`
+//     (RD_ERR_NO_CAPABILITY); out_cap > current bytes_written at
+//     every emit (RD_ERR_OUT_TOO_SMALL); _wp_cols does NOT return
+//     WP_ERR_INVALID_UTF8 (RD_ERR_WIDTH_FAULT with partial
+//     bytes_written preserved on the fault path).
+//     6-callee-save push + sub rsp, 24 for n_cols / out_cap / out_base
+//     spill giving rsp%16==0 at every nested CALL (entry rsp%16==8;
+//     48 B pushes + 24 B spill = 72 B; (8 + 72) mod 16 = 0). r11 is
+//     NEVER held across the nested CALL to _wp_cols -- every .bss
+//     load re-stages via `lea r11, [rip + sym]`.
+//
+// Register maps (SysV):
+//
+//   _rd_init()                                               -> ()
+//   _rd_set_capability(rdi)                                  -> rax
+//   _rd_render_record(rdi, rsi, rdx, rcx)                    -> rax
+//   _rd_render_table(rdi, rsi, rdx, rcx, r8, r9)             -> rax
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE  --  0x5D00..0x5DFF
+// =============================================================================
+//
+// Renderer packed-status range. Nine slots used at R229.M9:
+//
+//   RD_OK                    = 0
+//   RD_ERR_BAD_PTR           = 0x5D00  (any required pointer == 0:
+//                                       out, cap_record_ref, rows_ref,
+//                                       cols_ref)
+//   RD_ERR_OUT_TOO_SMALL     = 0x5D01  (out_cap < bytes required by
+//                                       the active kind's envelope +
+//                                       payload)
+//   RD_ERR_BAD_MAGIC         = 0x5D02  (`_rd_set_capability`:
+//                                       cap_record_ref[+0..+4] !=
+//                                       'TCAP')
+//   RD_ERR_BAD_KIND          = 0x5D03  (kind byte outside {0, 1, 2})
+//   RD_ERR_NO_CAPABILITY     = 0x5D04  (render* called before
+//                                       `_rd_set_capability` or after
+//                                       `_rd_init`)
+//   RD_ERR_BAD_RECORD        = 0x5D05  (`_rd_render_record`:
+//                                       record_ref == 0 OR record_len
+//                                       > RD_MAX_RECORD_BYTES)
+//   RD_ERR_WIDTH_FAULT       = 0x5D06  (`_wp_cols` returned
+//                                       WP_ERR_INVALID_UTF8 0x3F00
+//                                       on a cell's bytes; the
+//                                       partial bytes_written is
+//                                       still packed in high 32)
+//   RD_ERR_BAD_COL_COUNT     = 0x5D07  (`_rd_render_table`: n_cols
+//                                       outside [1..RD_MAX_COLS=32])
+//   RD_ERR_BAD_ROW_COUNT     = 0x5D08  (`_rd_render_table`: n_rows
+//                                       outside [0..RD_MAX_ROWS=256])
+//
+// Slots 0x5D09..0x5DFF reserved for R229.M9.1+ follow-ups
+// (RD_ERR_KERNEL_EMITTER_UNAVAILABLE on an M9.1 kernel-side-emitter
+// wire-up when the function-pointer slot is zero;
+// RD_ERR_BAD_CELL_LEN on an M9.3 strict-mode cell-length cap;
+// RD_ERR_BAD_COL_WIDTH on an M9.4 zero-width-column refusal).
+//
+// Band 0x5D00..0x5DFF is disjoint from the Wave 129 parallel-arm
+// bands 0x5B00..0x5BFF (held reservation) and 0x5C00..0x5CFF (held
+// reservation) adjacent to it, and from every other parser-tier
+// packed-status band (0x5A00 multi_line / 0x5900 import_resolve /
+// 0x5800 rank_check / 0x5700 vi_mode / 0x5600 linear_propagate /
+// 0x5500 session_type / 0x5400 line_editor / 0x5300 hostname_annot
+// / 0x5200 wire_sink / 0x5100 history / 0x5000 pipeline_lambda /
+// 0x4F00 describe_sig / etc.). A downstream compound-error dispatcher
+// can discriminate "the renderer faulted" from every other sibling
+// satellite's failure modes by `shr r, 8; cmp r, 0x5D`.
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R221.M3 (width_pass.pdx) -- `_rd_render_table` CALLs `_wp_cols`
+//     once per cell to compute cluster-aware column widths. This is
+//     Renderer's only intra-library linker-visible function
+//     dependency. `_wp_cols` returns `(cols << 32) | status`; the
+//     status low 32 are checked against WP_ERR_INVALID_UTF8 (0x3F00)
+//     and WP_OK (0) before accumulating cols into the pad-count
+//     computation.
+//
+//   R229.M1 (repl_loop.pdx, kernel) -- drives the write surface. At
+//     session boot the REPL invokes XTGETTCAP (R129.M1), fills a
+//     32-byte TCAP record on kernel scratch, and calls
+//     `_rd_set_capability(cap_record_ref)` into THIS module. On
+//     every WRITING-mode byte emit the REPL calls one of
+//     `_rd_render_record` / `_rd_render_table` to compose the output.
+//
+//   R129.M1 (xtgettcap.pdx, kernel) -- the authoritative capability
+//     probe. Not a direct linker dependency of THIS module -- the
+//     kernel-side REPL dispatcher owns the probe-and-populate wire-up
+//     and hands THIS module a filled-in 32-byte record.
+//
+//   R129.M2 (kitty-graphics-emitter.pdx, kernel) + R129.M3 (ansi256-
+//     tabular-fallback.pdx, kernel) -- the authoritative BITMAP and
+//     TABULAR emitters. R229.M9.1 wires in two weak-import function-
+//     pointer slots (`_rd_kitty_fn`, `_rd_ansi256_table_fn`) populated
+//     at session boot; the raw M9 render-table path emits the ASCII-
+//     pipe fallback inline so a smoke-mode asserter has a working
+//     render even before the kernel-side wire-up lands.
+//
+//   design/terminal/semantic-shell.md §9 -- the authoritative design
+//     statement. §9.1 covers Kitty graphics; §9.2 covers ANSI-256
+//     text fallback; §9.3 covers schema-driven formatting (Image /
+//     File / MetricPoint); §9.4 commits to no-VT100; §9.5 commits
+//     to grapheme-cluster-aware width via R221.M3.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32; the low-
+//     byte mask `and rax, 0xFF` fits imm32 with bit 31 clear.
+//   - No 2-op `imul r, imm` -- the row*n_cols multiply uses the
+//     canonical shift-sum ladder when n_cols is a power of two (we
+//     punt on arbitrary n_cols at raw M9 and loop via accumulate-
+//     add; the inner cell address is computed by maintaining a
+//     running `row_base` cursor that advances by `n_cols * 16`
+//     per row via `shl r?, 4` of the pre-staged `n_cols * 1`
+//     register).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `Renderer` matches `renderer.pdx`.
+//   - Labels prefixed `rd_` with per-function suffix (`rd_ini_`,
+//     `rd_sc_`, `rd_rr_`, `rd_rt_`). Disjoint from every landed
+//     parser-tier prefix (confirmed grep-clean against `le_`, `vi_`,
+//     `ml_`, `lp_`, `st_`, `h_`, `ha_`, `ws_`, `ir_`, `rc_`,
+//     `u8n_`, `gi_`, `wp_`, `cl_`, `ast_`, `sm_`, `ss_` /
+//     `sch_sig_`, `cmd_sig_`, `fi_`, `afs_`, `cmdreg_`, `dm_`,
+//     `ds_`, `pl_`, `pl_lam_`, `rp_`, `fo_`, `sgr_`, `ll_`, `cc_`,
+//     `er_`, `cr_`, `ls_`, `hm_`, `rt_`, `eu_`, `dl_`, `se_`,
+//     `te_`, `jc_`, `fh_`) and from the paideia-as reserved
+//     keywords (`loop`, `if`, `let`, `fn`, `ret`, `done`).
+//   - All `cmp reg, imm` immediates (0, 1, 2, 3, 32, 128, 256,
+//     1024, 16, 15, 11, 6, 4, status codes 0x5D00..0x5D08, byte
+//     literals 0x1B ESC, 0x5F '_', 0x47 'G', 0x3B ';', 0x5C '\',
+//     0x5B '[', 0x6D 'm', 0x30 '0', 0x32 '2', 0x33 '3', 0x38 '8',
+//     0x35 '5', 0x7C '|', 0x20 SP, 0x0A LF, 0x3F '?', magic
+//     0x50414354 'TCAP', WP band 0x3F00) fit imm32 with bit 31
+//     clear so direct cmp-imm32 is sign-safe. No MOVABS staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + idx * 1]`.
+//   - u16 loads via `xor rax, rax; mov_w rax, [base + idx]`.
+//   - u32 loads via `xor rax, rax; mov_d rax, [base + idx]`.
+//   - u64 stores via plain `mov [dst + disp], reg`.
+//   - `.bss` writes via `lea r11, [rip + sym]; mov [r11], reg`.
+//     r11 is NEVER held across a nested CALL -- every `.bss` access
+//     re-stages via `lea r11, [rip + sym]`.
+//   - `_rd_init`, `_rd_set_capability`, `_rd_render_record` are
+//     PURE LEAVES with zero callee-save pushes and zero nested
+//     CALL; r11 is used freely as .bss / scratch staging.
+//   - `_rd_render_table` has one 6-push callee-save frame + sub rsp
+//     24 pad giving rsp%16==0 at every nested CALL (entry
+//     rsp%16==8; 48 B pushes + 24 B spill = 72 B; (8+72) mod 16 =
+//     0). Nested CALL: `_wp_cols` (R221.M3). Register map:
+//     rbx = out_cursor (byte count written so far)
+//     rbp = row_i                   (0..n_rows)
+//     r12 = col_j                   (0..n_cols)
+//     r13 = rows_ref                (saved input)
+//     r14 = cols_ref                (saved input)
+//     r15 = out_base                (saved input; for packing return)
+//     [rsp + 0]  = n_cols           (spill; read inside nested loops)
+//     [rsp + 8]  = out_cap          (spill; written-byte guard)
+//     [rsp + 16] = n_rows           (spill; outer loop termination)
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R229.M9.1  Kernel-side emitter wire-up: two weak-import
+//              function-pointer slots `_rd_kitty_fn` /
+//              `_rd_ansi256_table_fn` populated at session boot;
+//              `_rd_render_record` / `_rd_render_table` indirect
+//              through those slots for the full-fidelity Kitty APC +
+//              ANSI-256 SGR emission. Precedent: R222.M6
+//              DispatchMode's `_dm_light_fn` / `_dm_spawn_fn` slots.
+//   R229.M9.2  Unicode box-drawing refinement: the table emitter's
+//              ASCII-pipe shape (`| cell | cell |`) upgrades to the
+//              U+2500..257F line-drawing set under ANSI256 and KITTY
+//              (plus `AT_FLAG_ASCII` toggle to force ASCII under a
+//              serial-log capture).
+//   R229.M9.3  Schema-driven formatting: the dispatcher consults the
+//              record's SchemasSig body to choose a rendering (an
+//              `Image` record goes KITTY-bitmap; a `File` record
+//              goes ANSI256-table; a `MetricPoint` stream goes
+//              inline time-series plot).
+//   R229.M9.4  Per-command renderer override: the `as kind` suffix
+//              from the design doc (`find . | as table`) injects a
+//              per-stage renderer-kind field that overrides the
+//              schema-driven choice.
+//   R229.M9.5  TR#9 bidi integration: a logical-vs-visual order pass
+//              before cells reach the width-pass walker.
+//   R229.M9.6  Column-width heuristics: when the caller passes
+//              `col.width == 0`, the renderer walks every cell in
+//              that column, calls `_wp_cols`, and takes the max as
+//              the auto-fit width (one extra pass per auto-fit
+//              column; capped at RD_MAX_COL_WIDTH).
+//   R229.M9.7  Smoke-mode fingerprint goldens for the acceptance
+//              corpus (Kitty + xterm-256color + ascii-only).
+//
+// =============================================================================
+// Upstream: paideia-os#2493 (R229 REPL evaluator umbrella),
+// paideia-os#2727 (THIS ticket, R229.M9 Renderer integration),
+// paideia-os#2724 (R229.M6 LineEditor; the capability record is the
+// mirror on the WRITE side of the LineEditor's READ side),
+// paideia-os#2653 (R221.M3 WidthPass; this module's only intra-
+// library linker-visible function dependency), paideia-os#2604
+// (R129.M1 XTGETTCAP DCS probe; the kernel-side upstream capability
+// source), paideia-os#2605 (R129.M2 Kitty emitter; the M9.1 wire-up
+// target), paideia-os#2606 (R129.M3 ANSI256 table emitter; the M9.1
+// wire-up target). Design docs:
+// design/shell/renderer-integration.md (R229.M9),
+// design/terminal/semantic-shell.md §9 (umbrella statement),
+// design/shell/ansi256-tabular-fallback.md (R129.M3 sibling spec),
+// design/shell/kitty-graphics-emitter.md (R129.M2 sibling spec).
+
+module Renderer = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax low 32 bits)
+  // ==========================================================================
+
+  pub let RD_OK                     : u64 = 0
+  pub let RD_ERR_BAD_PTR            : u64 = 0x5D00
+  pub let RD_ERR_OUT_TOO_SMALL      : u64 = 0x5D01
+  pub let RD_ERR_BAD_MAGIC          : u64 = 0x5D02
+  pub let RD_ERR_BAD_KIND           : u64 = 0x5D03
+  pub let RD_ERR_NO_CAPABILITY      : u64 = 0x5D04
+  pub let RD_ERR_BAD_RECORD         : u64 = 0x5D05
+  pub let RD_ERR_WIDTH_FAULT        : u64 = 0x5D06
+  pub let RD_ERR_BAD_COL_COUNT      : u64 = 0x5D07
+  pub let RD_ERR_BAD_ROW_COUNT      : u64 = 0x5D08
+
+  // ==========================================================================
+  // SECTION 2 -- CAPABILITY KIND + FLAG CONSTANTS
+  // ==========================================================================
+
+  pub let RD_TERM_KITTY             : u64 = 0
+  pub let RD_TERM_ANSI256           : u64 = 1
+  pub let RD_TERM_ANSI16            : u64 = 2
+
+  pub let RD_CAP_FLAG_TRUECOLOR     : u64 = 0x01
+  pub let RD_CAP_FLAG_ITALIC        : u64 = 0x02
+  pub let RD_CAP_FLAG_GRAPHICS      : u64 = 0x04
+
+  // ==========================================================================
+  // SECTION 3 -- COLUMN DESCRIPTOR + CELL REFERENCE CONSTANTS
+  // ==========================================================================
+
+  pub let RD_COL_LEFT_ALIGN         : u64 = 0x01
+  pub let RD_COL_RIGHT_ALIGN        : u64 = 0x02
+
+  pub let RD_CAP_MAGIC              : u64 = 0x50414354   // 'TCAP' LE
+  pub let RD_CAP_BYTES              : u64 = 32
+  pub let RD_COL_STRIDE             : u64 = 16
+  pub let RD_CELL_STRIDE            : u64 = 16
+
+  pub let RD_MAX_COLS               : u64 = 32
+  pub let RD_MAX_ROWS               : u64 = 256
+  pub let RD_MAX_COL_WIDTH          : u64 = 128
+  pub let RD_MAX_RECORD_BYTES       : u64 = 4096
+  pub let RD_MAX_CELL_BYTES         : u64 = 256
+
+  // WidthPass status we must detect inline.
+  pub let RD_WP_ERR_INVALID_UTF8    : u64 = 0x3F00
+
+  // ==========================================================================
+  // SECTION 4 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+  //
+  // Cold-boot .bss zero-init gives every scalar 0 which is the
+  // "no capability installed" state (`_rd_ready == 0`); every
+  // render* entry point returns RD_ERR_NO_CAPABILITY until
+  // `_rd_set_capability` lands a valid record.
+
+  pub let mut _rd_cap_record   : [u8; 32] = uninit @align(8)
+  pub let mut _rd_ready        : u64      = uninit @align(8)
+  pub let mut _rd_reserved     : u64      = uninit @align(8)
+
+  // ==========================================================================
+  // _rd_init() -> ()
+  //
+  //   Boot hook. Defensive scrub of the capability record (four u64
+  //   stores = 32 B) + ready flag + reserved slot.
+  //
+  // Pure leaf -- zero callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed rd_ini_.
+  // ==========================================================================
+  pub let _rd_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M9 (#2727): defensive scrub of the 32-byte _rd_cap_record (four u64 stores) + _rd_ready + _rd_reserved. .bss zero-init at program load already satisfies the cold-boot semantic (ready == 0 -> every render* returns RD_ERR_NO_CAPABILITY); this entry point exists for test-time reset + chaos-restart. Pure leaf; zero pushes; no stack frame; no nested CALL. Each store is `lea r11, [rip + sym]; mov [r11 + disp], rax` with rax=0. All immediates (0, 8, 16, 24) fit imm32 (and in fact imm8). No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed rd_ini_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _rd_cap_record];
+        mov [r11 + 0], rax;
+        mov [r11 + 8], rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+
+        lea r11, [rip + _rd_ready];
+        mov [r11], rax;
+
+        lea r11, [rip + _rd_reserved];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _rd_set_capability(cap_record_ref) -> status
+  //
+  //   rdi = cap_record_ref (caller-owned 32-byte TCAP record)
+  //   rax = RD_OK / RD_ERR_BAD_PTR / RD_ERR_BAD_MAGIC / RD_ERR_BAD_KIND
+  //
+  //   Validate magic + kind, then copy 32 bytes into `_rd_cap_record`
+  //   via four u64 moves. Set `_rd_ready = 1` so every subsequent
+  //   render* dispatches.
+  //
+  // Pure leaf -- zero callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed rd_sc_.
+  // ==========================================================================
+  pub let _rd_set_capability : (u64) -> u64 !{mem} @{} =
+    fn (cap_record_ref: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M9 (#2727): install the active 32-byte TCAP capability record from caller-supplied bytes. Guards: cap_record_ref != 0 (RD_ERR_BAD_PTR); u32 at [+0] == 0x50414354 'TCAP' LE (RD_ERR_BAD_MAGIC); byte at [+4] in {0,1,2} (RD_ERR_BAD_KIND). Copies 32 bytes via four u64 loads/stores. Sets _rd_ready := 1 on success. Pure leaf; zero pushes; no stack frame; no nested CALL. All cmp immediates (0, 2, status codes 0x5D00..0x5D03, magic 0x50414354) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. u32 loads via `xor rax, rax; mov_d rax, [base + disp]`. Byte loads via `xor rax, rax; mov_b rax, [base + disp]`. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed rd_sc_.",
+      block: {
+        // ---- Guard: cap_record_ref != 0.
+        cmp rdi, 0;
+        je  rd_sc_bad_ptr;
+
+        // ---- Guard: magic 'TCAP' at [+0].
+        xor rax, rax;
+        mov_d rax, [rdi + 0];
+        cmp rax, 0x50414354;             // 'TCAP' LE
+        jne rd_sc_bad_magic;
+
+        // ---- Guard: kind byte in {0, 1, 2}.
+        xor rax, rax;
+        mov_b rax, [rdi + 4];
+        cmp rax, 2;
+        ja  rd_sc_bad_kind;
+
+        // ---- Copy 32 bytes via four u64 moves.
+        lea r11, [rip + _rd_cap_record];
+        mov rax, [rdi + 0];
+        mov [r11 + 0], rax;
+        mov rax, [rdi + 8];
+        mov [r11 + 8], rax;
+        mov rax, [rdi + 16];
+        mov [r11 + 16], rax;
+        mov rax, [rdi + 24];
+        mov [r11 + 24], rax;
+
+        // ---- Set ready = 1.
+        mov rax, 1;
+        lea r11, [rip + _rd_ready];
+        mov [r11], rax;
+
+        xor rax, rax;                    // RD_OK
+        ret;
+
+      rd_sc_bad_ptr:
+        mov rax, 0x5D00;                 // RD_ERR_BAD_PTR
+        ret;
+
+      rd_sc_bad_magic:
+        mov rax, 0x5D02;                 // RD_ERR_BAD_MAGIC
+        ret;
+
+      rd_sc_bad_kind:
+        mov rax, 0x5D03;                 // RD_ERR_BAD_KIND
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _rd_render_record(record_ref, record_len, out, out_cap) -> packed_u64
+  //
+  //   rdi = record_ref
+  //   rsi = record_len
+  //   rdx = out
+  //   rcx = out_cap
+  //   rax = (bytes_written << 32) | status
+  //
+  //   Route one record's bytes through the active capability. See
+  //   the header's PUBLIC API section for the per-kind envelope
+  //   layout and byte-count accounting.
+  //
+  // Pure leaf -- zero callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed rd_rr_.
+  // ==========================================================================
+  pub let _rd_render_record : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (record_ref: u64) (record_len: u64) (out: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M9 (#2727): route one record's bytes through the active capability kind. Guards: record_ref != 0 (RD_ERR_BAD_RECORD); record_len <= RD_MAX_RECORD_BYTES=4096 (RD_ERR_BAD_RECORD); out != 0 (RD_ERR_BAD_PTR); _rd_ready == 1 (RD_ERR_NO_CAPABILITY); out_cap >= needed_bytes per kind (RD_ERR_OUT_TOO_SMALL). Dispatch by kind byte at [_rd_cap_record + 4]: KITTY=0 -> APC prelude \"\\e_G;\" (4 B: 0x1B 0x5F 0x47 0x3B) + record_bytes + APC terminator \"\\e\\\\\" (2 B: 0x1B 0x5C) = 6 + record_len; ANSI256=1 -> SGR \"\\e[38;5;255m\" (11 B: 0x1B 0x5B 0x33 0x38 0x3B 0x35 0x3B 0x32 0x35 0x35 0x6D) + record_bytes + SGR reset \"\\e[0m\" (4 B: 0x1B 0x5B 0x30 0x6D) = 15 + record_len; ANSI16=2 -> record_bytes verbatim = record_len. Pure leaf; zero pushes; zero stack frame; zero nested CALL (byte copy inlined). Byte loads via `xor rax, rax; mov_b rax, [base + idx * 1]`; byte stores via `mov_b [dst + idx], reg`. r11 is used freely as .bss staging because no nested CALL exists. All cmp immediates (0, 1, 2, 4, 6, 11, 15, 4096, byte literals 0x1B 0x5F 0x47 0x3B 0x5C 0x5B 0x6D 0x30 0x32 0x33 0x35 0x38, status codes 0x5D00..0x5D05) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed rd_rr_.",
+      block: {
+        // ---- Guard: out != 0.
+        cmp rdx, 0;
+        je  rd_rr_bad_ptr;
+
+        // ---- Guard: record_ref != 0.
+        cmp rdi, 0;
+        je  rd_rr_bad_record;
+
+        // ---- Guard: record_len <= RD_MAX_RECORD_BYTES.
+        cmp rsi, 4096;
+        ja  rd_rr_bad_record;
+
+        // ---- Guard: _rd_ready == 1.
+        lea r11, [rip + _rd_ready];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne rd_rr_no_cap;
+
+        // ---- Load kind byte.
+        lea r11, [rip + _rd_cap_record];
+        xor rax, rax;
+        mov_b rax, [r11 + 4];
+        // Branch by kind.
+        cmp rax, 0;
+        je  rd_rr_kitty;
+        cmp rax, 1;
+        je  rd_rr_ansi256;
+        cmp rax, 2;
+        je  rd_rr_ansi16;
+        // Defensive: _rd_set_capability already validated kind, but
+        // the .bss slot could be corrupted; return BAD_KIND.
+        jmp rd_rr_bad_kind;
+
+        // -----------------------------------------------------------
+        // KITTY: emit `\e_G;` (4 B) + record_bytes + `\e\\` (2 B)
+        //        total = 6 + record_len bytes
+        // -----------------------------------------------------------
+      rd_rr_kitty:
+        // Check out_cap >= 6 + record_len.
+        mov rax, rsi;
+        add rax, 6;
+        cmp rcx, rax;
+        jb  rd_rr_oos;
+        // Emit prelude at out + 0..4.
+        mov rax, 0x1B;                   // ESC
+        mov_b [rdx + 0], rax;
+        mov rax, 0x5F;                   // '_'
+        mov_b [rdx + 1], rax;
+        mov rax, 0x47;                   // 'G'
+        mov_b [rdx + 2], rax;
+        mov rax, 0x3B;                   // ';'
+        mov_b [rdx + 3], rax;
+        // Copy record bytes to out + 4..(4+record_len).
+        //   r8 = i; src_base = rdi; dst_base = rdx + 4.
+        //   We walk i = 0 .. record_len - 1.
+        //   Compute dst_base in r9 via `mov r9, rdx; add r9, 4`.
+        mov r9, rdx;
+        add r9, 4;
+        xor r8, r8;
+      rd_rr_kitty_copy:
+        cmp r8, rsi;
+        jae rd_rr_kitty_tail;
+        xor rax, rax;
+        mov_b rax, [rdi + r8 * 1];
+        mov_b [r9 + r8 * 1], rax;
+        add r8, 1;
+        jmp rd_rr_kitty_copy;
+      rd_rr_kitty_tail:
+        // Emit terminator at (dst_base + record_len) and (+record_len+1).
+        //   r9 = dst_base; r8 = record_len.
+        mov r8, rsi;
+        mov rax, 0x1B;                   // ESC
+        mov_b [r9 + r8 * 1], rax;
+        add r8, 1;
+        mov rax, 0x5C;                   // '\'
+        mov_b [r9 + r8 * 1], rax;
+        // bytes_written = 6 + record_len.
+        mov rax, rsi;
+        add rax, 6;
+        shl rax, 32;                     // (n << 32) | RD_OK (0)
+        ret;
+
+        // -----------------------------------------------------------
+        // ANSI256: emit `\e[38;5;255m` (11 B) + record + `\e[0m` (4 B)
+        //          total = 15 + record_len bytes
+        // -----------------------------------------------------------
+      rd_rr_ansi256:
+        // Check out_cap >= 15 + record_len.
+        mov rax, rsi;
+        add rax, 15;
+        cmp rcx, rax;
+        jb  rd_rr_oos;
+        // Emit prelude: `\e[38;5;255m` (11 bytes).
+        mov rax, 0x1B;                   // ESC
+        mov_b [rdx + 0], rax;
+        mov rax, 0x5B;                   // '['
+        mov_b [rdx + 1], rax;
+        mov rax, 0x33;                   // '3'
+        mov_b [rdx + 2], rax;
+        mov rax, 0x38;                   // '8'
+        mov_b [rdx + 3], rax;
+        mov rax, 0x3B;                   // ';'
+        mov_b [rdx + 4], rax;
+        mov rax, 0x35;                   // '5'
+        mov_b [rdx + 5], rax;
+        mov rax, 0x3B;                   // ';'
+        mov_b [rdx + 6], rax;
+        mov rax, 0x32;                   // '2'
+        mov_b [rdx + 7], rax;
+        mov rax, 0x35;                   // '5'
+        mov_b [rdx + 8], rax;
+        mov rax, 0x35;                   // '5'
+        mov_b [rdx + 9], rax;
+        mov rax, 0x6D;                   // 'm'
+        mov_b [rdx + 10], rax;
+        // Copy record bytes to out + 11..(11+record_len).
+        mov r9, rdx;
+        add r9, 11;
+        xor r8, r8;
+      rd_rr_ansi256_copy:
+        cmp r8, rsi;
+        jae rd_rr_ansi256_tail;
+        xor rax, rax;
+        mov_b rax, [rdi + r8 * 1];
+        mov_b [r9 + r8 * 1], rax;
+        add r8, 1;
+        jmp rd_rr_ansi256_copy;
+      rd_rr_ansi256_tail:
+        // Emit reset `\e[0m` (4 bytes) at (dst_base + record_len).
+        mov r8, rsi;
+        mov rax, 0x1B;                   // ESC
+        mov_b [r9 + r8 * 1], rax;
+        add r8, 1;
+        mov rax, 0x5B;                   // '['
+        mov_b [r9 + r8 * 1], rax;
+        add r8, 1;
+        mov rax, 0x30;                   // '0'
+        mov_b [r9 + r8 * 1], rax;
+        add r8, 1;
+        mov rax, 0x6D;                   // 'm'
+        mov_b [r9 + r8 * 1], rax;
+        // bytes_written = 15 + record_len.
+        mov rax, rsi;
+        add rax, 15;
+        shl rax, 32;
+        ret;
+
+        // -----------------------------------------------------------
+        // ANSI16: emit record_bytes verbatim.
+        // -----------------------------------------------------------
+      rd_rr_ansi16:
+        // Check out_cap >= record_len.
+        cmp rcx, rsi;
+        jb  rd_rr_oos;
+        xor r8, r8;
+      rd_rr_ansi16_copy:
+        cmp r8, rsi;
+        jae rd_rr_ansi16_done;
+        xor rax, rax;
+        mov_b rax, [rdi + r8 * 1];
+        mov_b [rdx + r8 * 1], rax;
+        add r8, 1;
+        jmp rd_rr_ansi16_copy;
+      rd_rr_ansi16_done:
+        mov rax, rsi;
+        shl rax, 32;
+        ret;
+
+      rd_rr_bad_ptr:
+        mov rax, 0x5D00;                 // RD_ERR_BAD_PTR
+        ret;
+
+      rd_rr_oos:
+        mov rax, 0x5D01;                 // RD_ERR_OUT_TOO_SMALL
+        ret;
+
+      rd_rr_bad_kind:
+        mov rax, 0x5D03;                 // RD_ERR_BAD_KIND
+        ret;
+
+      rd_rr_no_cap:
+        mov rax, 0x5D04;                 // RD_ERR_NO_CAPABILITY
+        ret;
+
+      rd_rr_bad_record:
+        mov rax, 0x5D05;                 // RD_ERR_BAD_RECORD
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _rd_render_table(rows_ref, n_rows, cols_ref, n_cols, out, out_cap)
+  //
+  //   rdi = rows_ref (packed n_rows * n_cols CellRef, stride 16)
+  //   rsi = n_rows
+  //   rdx = cols_ref (packed n_cols ColDesc, stride 16)
+  //   rcx = n_cols
+  //   r8  = out
+  //   r9  = out_cap
+  //   rax = (bytes_written << 32) | status
+  //
+  //   Render a 2D grid of UTF-8 cells with cluster-aware column
+  //   alignment via R221.M3 `_wp_cols`. Row shape:
+  //
+  //     "| " cell_0_padded " | " cell_1_padded " | " ... " |\n"
+  //
+  //   Per-cell padding uses `_wp_cols` to measure the cell's visible
+  //   width and emits (col.width - cell_cols) spaces after the cell
+  //   (LEFT_ALIGN default; RIGHT_ALIGN prepends). On a width-pass
+  //   fault (WP_ERR_INVALID_UTF8), the row's partial bytes_written
+  //   is preserved in high 32 bits with RD_ERR_WIDTH_FAULT in low 32.
+  //
+  //   6-callee-save push + sub rsp, 24 pad giving rsp%16==0 at the
+  //   nested CALL to _wp_cols (entry rsp%16==8; 48 B pushes + 24 B
+  //   spill = 72 B; (8+72) mod 16 = 0).
+  //
+  //   Register plan (nested-CALL frame):
+  //     rbx = out_cursor (byte count written so far)
+  //     rbp = row_i  (0..n_rows)
+  //     r12 = col_j  (0..n_cols)
+  //     r13 = rows_ref (saved input)
+  //     r14 = cols_ref (saved input)
+  //     r15 = out_base (saved input)
+  //     [rsp + 0]  = n_cols
+  //     [rsp + 8]  = out_cap
+  //     [rsp + 16] = n_rows
+  //
+  //   Labels prefixed rd_rt_.
+  // ==========================================================================
+  pub let _rd_render_table : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (rows_ref: u64) (n_rows: u64) (cols_ref: u64) (n_cols: u64) (out: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M9 (#2727): render a 2D grid of UTF-8 cells with cluster-aware column alignment via R221.M3 _wp_cols. Guards: rows_ref != 0; cols_ref != 0; out != 0 (RD_ERR_BAD_PTR); n_cols in [1..32] (RD_ERR_BAD_COL_COUNT); n_rows in [0..256] (RD_ERR_BAD_ROW_COUNT); _rd_ready == 1 (RD_ERR_NO_CAPABILITY). 6 callee-save pushes (rbx=out_cursor, rbp=row_i, r12=col_j, r13=rows_ref, r14=cols_ref, r15=out_base) + sub rsp 24 (n_cols, out_cap, n_rows spill) -> rsp%16==0 steady at every nested CALL (entry rsp%16==8, +48 pushes = %16==8, +24 pad -> %16==0). Nested CALLs: _wp_cols (R221.M3) once per cell. Row shape: `| cell_0 | cell_1 | ... |\\n`. Per-cell: emit cell bytes, then (col.width - cell_cols) space bytes. Byte loads via `xor rax, rax; mov_b rax, [base + idx * 1]`; u16 loads via `xor rax, rax; mov_w rax, [base + idx]`; byte stores via `mov_b [dst + idx], reg`. r11 is NEVER held across a nested CALL -- re-lea at every .bss / cols_ref / rows_ref access that follows a CALL. All cmp immediates (0, 1, 2, 3, 4, 15, 16, 32, 128, 256, byte literals 0x1B 0x5B 0x7C 0x20 0x0A 0x30 0x32 0x33 0x35 0x38 0x3B 0x6D, status codes 0x5D00..0x5D08, WP band 0x3F00) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. No test; no and-imm64; no imul-r-imm; no multiline let. The row*n_cols multiply uses a running row_base cursor: at each row we have row_base = rows_ref + i*n_cols*16; the cell address is row_base + j*16 = row_base + (j << 4); row_base advances by n_cols*16 per row via `shl r?, 4` of the n_cols spill. Labels prefixed rd_rt_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 24;                     // spill: n_cols, out_cap, n_rows
+
+        // ---- Spill the 6+ inputs that don't fit in callee-save.
+        mov [rsp + 0], rcx;              // n_cols
+        mov [rsp + 8], r9;               // out_cap
+        mov [rsp + 16], rsi;             // n_rows
+
+        // ---- Save inputs to callee-save registers.
+        mov r13, rdi;                    // rows_ref
+        mov r14, rdx;                    // cols_ref
+        mov r15, r8;                     // out_base
+        mov rbx, r8;                     // out_cursor := out_base
+
+        // ---- Guard: rows_ref != 0.
+        cmp r13, 0;
+        je  rd_rt_bad_ptr;
+
+        // ---- Guard: cols_ref != 0.
+        cmp r14, 0;
+        je  rd_rt_bad_ptr;
+
+        // ---- Guard: out != 0.
+        cmp r15, 0;
+        je  rd_rt_bad_ptr;
+
+        // ---- Guard: n_cols in [1..32].
+        mov rax, [rsp + 0];
+        cmp rax, 0;
+        je  rd_rt_bad_col_count;
+        cmp rax, 32;
+        ja  rd_rt_bad_col_count;
+
+        // ---- Guard: n_rows in [0..256].
+        mov rax, [rsp + 16];
+        cmp rax, 256;
+        ja  rd_rt_bad_row_count;
+
+        // ---- Guard: _rd_ready == 1.
+        lea r11, [rip + _rd_ready];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne rd_rt_no_cap;
+
+        // ---- Outer loop: row_i = 0 .. n_rows - 1.
+        xor rbp, rbp;                    // row_i = 0
+
+      rd_rt_row_top:
+        mov rax, [rsp + 16];             // n_rows
+        cmp rbp, rax;
+        jae rd_rt_done;
+
+        // Emit row prefix `| ` (2 B) at out_cursor.
+        //   Guard: out_cursor - out_base + 2 <= out_cap.
+        mov rax, rbx;
+        sub rax, r15;
+        add rax, 2;
+        mov rcx, [rsp + 8];
+        cmp rax, rcx;
+        ja  rd_rt_oos;
+        mov rax, 0x7C;                   // '|'
+        mov_b [rbx + 0], rax;
+        mov rax, 0x20;                   // ' '
+        mov_b [rbx + 1], rax;
+        add rbx, 2;
+
+        // ---- Inner loop: col_j = 0 .. n_cols - 1.
+        xor r12, r12;                    // col_j = 0
+
+      rd_rt_col_top:
+        mov rax, [rsp + 0];              // n_cols
+        cmp r12, rax;
+        jae rd_rt_col_end;
+
+        // Load cell(row_i, col_j).
+        //   cell_addr = rows_ref + (row_i * n_cols + col_j) * 16
+        //   Avoid 2-op `imul r, imm`: compute via shift-sum.
+        //     tmp = row_i * n_cols = row_i * n_cols (needs loop or
+        //           multiplier). Use the single-cell indexing:
+        //     linear_i = row_i * n_cols + col_j
+        //     cell_addr = rows_ref + linear_i * 16 = rows_ref +
+        //                 (linear_i << 4).
+        //   We maintain linear_i by:
+        //     - at outer-row entry: compute row_base_linear =
+        //         row_i * n_cols by accumulating n_cols per row.
+        //     - we track `_rt_row_linear` in r10 across iterations.
+        //   But r10 is caller-save and we have the nested CALL --
+        //   so instead recompute each cell via one `mul r?, 1`
+        //   substitute: use the `mul` instruction (unsigned 64x64)
+        //   which the paideia-as encoder DOES encode (1-op mul;
+        //   not the 2-op imul-r-imm pitfall). We use `mul` on
+        //   caller-save scratch rcx/rdx -- but mul clobbers rdx.
+        //   Simpler: maintain row_base_byte = rows_ref + row_i *
+        //   n_cols * 16 across row iterations by adding
+        //   `n_cols * 16` at each outer-loop iteration. Keep
+        //   row_base_byte in a stack spill slot.
+        //
+        //   For the raw M9 landing: compute cell_addr via the mul
+        //   ladder once before the CALL (to extract cell_ptr /
+        //   cell_len for the _wp_cols arguments), then recompute
+        //   via the same ladder after the CALL (because r10 is
+        //   caller-save and _wp_cols is free to clobber it; r13,
+        //   r14, r15, rbp, r12 are callee-save in THIS frame so
+        //   they survive). The mul is cheap; the alternative is
+        //   another spill slot and we already have the alignment
+        //   budget tight.
+        //
+        //   Compute cell_addr = r13 + row_i*n_cols*16 + col_j*16.
+        //   Use rax, rcx scratch for the multiply (`mul` clobbers
+        //   rdx but rdx is already consumed caller-save at the
+        //   function prologue: cols_ref was moved to r14).
+        mov rax, rbp;                    // row_i
+        mov rcx, [rsp + 0];              // n_cols
+        mul rcx;                         // rdx:rax = row_i * n_cols
+        // rax = linear row offset (low 64; row_i*n_cols <= 32*256 fits trivially).
+        add rax, r12;                    // linear_i
+        shl rax, 4;                      // linear_i * 16
+        add rax, r13;                    // cell_addr (caller-save path)
+
+        // Load cell_ptr (u64 at [cell_addr + 0]) and cell_len
+        // (u64 at [cell_addr + 8]).
+        mov rdi, [rax + 0];              // cell_ptr
+        mov rsi, [rax + 8];              // cell_len
+
+        // Clamp cell_len to RD_MAX_CELL_BYTES = 256 (defensive).
+        cmp rsi, 256;
+        jbe rd_rt_cell_len_ok;
+        mov rsi, 256;
+      rd_rt_cell_len_ok:
+
+        // CALL _wp_cols(cell_ptr, cell_len).
+        //   Edge case: cell_ptr == 0 means "empty cell" (0 cols);
+        //   skip the CALL to avoid WP_ERR_INVALID_UTF8 on a null
+        //   pointer.
+        cmp rdi, 0;
+        je  rd_rt_cell_zero_cols;
+
+        call _wp_cols;
+        // rax = (cell_cols << 32) | status
+        // Extract status.
+        mov r11, rax;
+        shl r11, 32;
+        shr r11, 32;
+        cmp r11, 0x3F00;                 // WP_ERR_INVALID_UTF8
+        je  rd_rt_width_fault;
+        cmp r11, 0;
+        jne rd_rt_width_fault;
+        // Extract cell_cols (high 32 bits).
+        shr rax, 32;
+        mov r11, rax;                    // r11 = cell_cols (scratch)
+        jmp rd_rt_got_cols;
+
+      rd_rt_cell_zero_cols:
+        xor r11, r11;                    // cell_cols = 0
+
+      rd_rt_got_cols:
+        // r11 = cell_cols. Load col.width (u16 at [cols_ref + col_j*16 + 0]).
+        //   col_addr = r14 + (col_j << 4) + 0.
+        mov rax, r12;
+        shl rax, 4;
+        add rax, r14;                    // col_addr
+        xor rcx, rcx;
+        mov_w rcx, [rax + 0];            // rcx = col.width (u16 -> u64)
+
+        // Clamp col.width to RD_MAX_COL_WIDTH = 128.
+        cmp rcx, 128;
+        jbe rd_rt_col_w_ok;
+        mov rcx, 128;
+      rd_rt_col_w_ok:
+
+        // Compute pad_count = max(0, col.width - cell_cols). If
+        // cell_cols > col.width, pad = 0 (cell overflows the column;
+        // M9 tolerates; M9.3 strict-mode will fault).
+        mov rdx, rcx;                    // rdx = col.width (saved)
+        cmp r11, rcx;
+        jae rd_rt_zero_pad;
+        sub rcx, r11;                    // rcx = pad_count
+        jmp rd_rt_got_pad;
+      rd_rt_zero_pad:
+        xor rcx, rcx;
+      rd_rt_got_pad:
+        // rcx = pad_count; rdx = col.width.
+
+        // NOTE (debugger Wave 130): _wp_cols clobbers rsi; the capacity
+        // guard MUST run after cell_len is reloaded below.
+        // Reload cell_ptr / cell_len via a fresh cell_addr recompute
+        // (r10 is caller-save; _wp_cols may have clobbered it; the
+        // raw register that held cell_addr pre-CALL was rax which is
+        // definitively clobbered). The mul ladder is identical to
+        // the pre-CALL compute.
+        mov rax, rbp;                    // row_i
+        mov r9, [rsp + 0];               // n_cols
+        mul r9;                          // rdx:rax = row_i * n_cols
+        add rax, r12;                    // linear_i
+        shl rax, 4;                      // linear_i * 16
+        add rax, r13;                    // cell_addr
+        mov rdi, [rax + 0];              // cell_ptr
+        mov rsi, [rax + 8];              // cell_len (re-clamp)
+        cmp rsi, 256;
+        jbe rd_rt_cell_len_ok2;
+        mov rsi, 256;
+      rd_rt_cell_len_ok2:
+
+        // Guard out_cursor + cell_len + pad_count <= out_cap.
+        //   available = out_cap - (out_cursor - out_base).
+        mov rax, [rsp + 8];              // out_cap
+        mov r9, rbx;
+        sub r9, r15;
+        sub rax, r9;                     // rax = available
+        mov r9, rsi;                     // cell_len
+        add r9, rcx;                     // cell_len + pad_count
+        cmp r9, rax;
+        ja  rd_rt_oos;
+
+        // Emit cell bytes (LEFT_ALIGN default at M9: pad AFTER).
+        // Copy cell_ptr[0..cell_len) to rbx.
+        xor r8, r8;                      // i = 0
+      rd_rt_cell_copy:
+        cmp r8, rsi;
+        jae rd_rt_cell_copy_done;
+        // Edge: cell_ptr == 0 && cell_len > 0 defensively yields no
+        // bytes (treat as empty).
+        cmp rdi, 0;
+        je  rd_rt_cell_copy_done;
+        xor rax, rax;
+        mov_b rax, [rdi + r8 * 1];
+        mov_b [rbx + r8 * 1], rax;
+        add r8, 1;
+        jmp rd_rt_cell_copy;
+      rd_rt_cell_copy_done:
+        // Advance out_cursor by cell_len (unless cell_ptr was 0).
+        cmp rdi, 0;
+        je  rd_rt_skip_cell_advance;
+        add rbx, rsi;
+      rd_rt_skip_cell_advance:
+
+        // Emit pad_count spaces.
+        xor r8, r8;
+      rd_rt_pad:
+        cmp r8, rcx;
+        jae rd_rt_pad_done;
+        mov rax, 0x20;                   // ' '
+        mov_b [rbx + r8 * 1], rax;
+        add r8, 1;
+        jmp rd_rt_pad;
+      rd_rt_pad_done:
+        add rbx, rcx;
+
+        // Emit column separator ` | ` (3 B) iff col_j + 1 < n_cols,
+        // else emit row terminator ` |\n` (3 B).
+        //   Both are 3 B so the guard is the same.
+        mov rax, rbx;
+        sub rax, r15;
+        add rax, 3;
+        mov r9, [rsp + 8];
+        cmp rax, r9;
+        ja  rd_rt_oos;
+        mov r9, r12;
+        add r9, 1;
+        mov rax, [rsp + 0];
+        cmp r9, rax;
+        jb  rd_rt_sep_mid;
+        // End-of-row: emit ` |\n`.
+        mov rax, 0x20;                   // ' '
+        mov_b [rbx + 0], rax;
+        mov rax, 0x7C;                   // '|'
+        mov_b [rbx + 1], rax;
+        mov rax, 0x0A;                   // '\n'
+        mov_b [rbx + 2], rax;
+        add rbx, 3;
+        jmp rd_rt_col_end;
+
+      rd_rt_sep_mid:
+        // Mid-row: emit ` | `.
+        mov rax, 0x20;                   // ' '
+        mov_b [rbx + 0], rax;
+        mov rax, 0x7C;                   // '|'
+        mov_b [rbx + 1], rax;
+        mov rax, 0x20;                   // ' '
+        mov_b [rbx + 2], rax;
+        add rbx, 3;
+
+        // Advance col_j, loop.
+        add r12, 1;
+        jmp rd_rt_col_top;
+
+      rd_rt_col_end:
+        // Advance row_i, loop.
+        add rbp, 1;
+        jmp rd_rt_row_top;
+
+      rd_rt_done:
+        // Pack return: (bytes_written << 32) | RD_OK.
+        mov rax, rbx;
+        sub rax, r15;                    // bytes_written
+        shl rax, 32;
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      rd_rt_bad_ptr:
+        mov rax, 0x5D00;                 // RD_ERR_BAD_PTR
+        jmp rd_rt_epilogue;
+
+      rd_rt_oos:
+        // Partial bytes_written preserved in high 32.
+        mov rax, rbx;
+        sub rax, r15;
+        shl rax, 32;
+        add rax, 0x5D01;                 // RD_ERR_OUT_TOO_SMALL
+        jmp rd_rt_epilogue_packed;
+
+      rd_rt_no_cap:
+        mov rax, 0x5D04;                 // RD_ERR_NO_CAPABILITY
+        jmp rd_rt_epilogue;
+
+      rd_rt_width_fault:
+        // Partial bytes_written preserved in high 32.
+        mov rax, rbx;
+        sub rax, r15;
+        shl rax, 32;
+        add rax, 0x5D06;                 // RD_ERR_WIDTH_FAULT
+        jmp rd_rt_epilogue_packed;
+
+      rd_rt_bad_col_count:
+        mov rax, 0x5D07;                 // RD_ERR_BAD_COL_COUNT
+        jmp rd_rt_epilogue;
+
+      rd_rt_bad_row_count:
+        mov rax, 0x5D08;                 // RD_ERR_BAD_ROW_COUNT
+        jmp rd_rt_epilogue;
+
+      rd_rt_epilogue:
+      rd_rt_epilogue_packed:
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

@@ -164,8 +164,44 @@ identical to R133.M3; FNV-1a 64 path-hash inlined per parser-family
 precedent; error band 0x5900..0x59FF with the full E1100..E1103 cycle /
 resolve-failed / duplicate-name / path-traversal diagnostic family;
 20-test acceptance corpus enumerated in
-`design/shell/import-resolution-parser.md` §9) -- landed.
-**Version:** 1.32.0.
+`design/shell/import-resolution-parser.md` §9) -- landed. R229.M9
+(Renderer: parser-tier terminal-capability-aware output router
+consuming the kernel-tier R129.M1 XTGETTCAP probe answer and
+dispatching record / table renders through Kitty graphics APC
+envelope, ANSI-256 SGR, or plain-ASCII fallback per
+`design/terminal/semantic-shell.md` §9; four public entry points
+`_rd_init` / `_rd_set_capability` / `_rd_render_record` /
+`_rd_render_table` over singleton `.bss` 40 B (32 B TCAP record
++ 2 u64 scalars); 32-byte capability record with magic 'TCAP' =
+0x50414354 LE; one intra-library linker-visible FUNCTION
+dependency on R221.M3 WidthPass `_wp_cols` for cluster-aware
+column alignment in the table renderer; three of four entry
+points are PURE LEAVES; `_rd_render_table` has one 6-push +
+sub rsp 24 pad frame giving rsp%16==0 at the nested CALL; error
+band 0x5D00..0x5DFF with the nine RD_* taxonomy slots; raw M9
+emits ASCII-pipe table shape so the capability-dispatch + width-
+pass wire-up can be goldened independently of Unicode box-
+drawing refinement deferred to M9.2) -- landed. R225.M7 (DiagReport:
+typechecker-tier diagnostic reporting with source spans + mechanical
+suggestions; 128-byte canonical Diag record with magic 'DIAG' =
+0x47414944 LE, u16 code, u16 severity (0 ERROR / 1 WARN / 2 INFO /
+3 HINT; LSP severity = +1), u32+u32 primary span (byte offsets into
+caller's SOURCE buffer per Q-A5 invariant), u32+u32 secondary span
+(reserved; M7.3 patcher), three u8[32] NUL-padded inline strings
+(expected / actual / suggestion), u64 next_diag_ref queue link
+(reserved; M7.1 queue); four public entry points `_dr_init` /
+`_dr_build` / `_dr_render_lsp` / `_dr_render_human` over caller-
+supplied buffers; `_dr_build` is a pure leaf; the two render
+entries are 6-push + four module-private pure-leaf helpers
+(`_dr_h_emit_lit` / `_dr_h_emit_cstr` / `_dr_h_emit_u16_hex` /
+`_dr_h_emit_u32_dec` with sticky-overflow sentinel); decimal
+emission via greedy-subtraction over 10-entry `_dr_pow10` .rodata
+table (pdx has no IDIV/MUL); LSP render emits one-line
+JSON-compatible with `line=0` byte-offset fallback until M7.2 wires
+the UTF-8-aware line/column resolver; zero `.bss`; error band
+0x5B00..0x5BFF (five slots used); 60-error acceptance corpus
+enumerated in `design/shell/diagnostic-reporting.md` §8) -- landed.
+**Version:** 1.36.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 **Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
 **Wave 126 landings:** R224.M6 PipelineLambda, R229.M5 History,
@@ -203,7 +239,44 @@ scalars + DFS scratch; 48-byte ImportDirective record; 36-byte
 adjacency row stride byte-identical to R133.M3; E1100..E1103
 cycle / resolve-failed / duplicate-name / path-traversal diagnostic
 family in error band 0x5900..0x59FF; 20-test acceptance corpus
-enumerated in `design/shell/import-resolution-parser.md` §9).
+enumerated in `design/shell/import-resolution-parser.md` §9),
+R229.M9 Renderer (parser-tier terminal-capability-aware output
+router dispatching record / table renders through Kitty graphics
+APC envelope / ANSI-256 SGR / plain-ASCII fallback per
+`design/terminal/semantic-shell.md` §9; four public entry points
+over singleton `.bss` 40 B; one intra-library linker-visible dep
+on R221.M3 WidthPass `_wp_cols`; three of four entries PURE
+LEAVES, `_rd_render_table` is 6-push with one nested CALL;
+error band 0x5D00..0x5DFF with nine RD_* slots; 7-fixture
+acceptance corpus enumerated in
+`design/shell/renderer-integration.md` §9).
+**Wave 130 landings:** R225.M7 DiagReport (typechecker-tier
+diagnostic reporting with source spans + mechanical suggestions;
+128-byte canonical Diag record with 'DIAG' magic + u16 code + u16
+severity + u32+u32 primary span + u32+u32 secondary (reserved) +
+three u8[32] inline strings + u64 next_diag_ref (reserved); four
+public entry points `_dr_init` / `_dr_build` / `_dr_render_lsp` /
+`_dr_render_human` plus four module-private pure-leaf helpers for
+literal / cstr / hex4 / dec32 emission; zero `.bss` at raw M7;
+error band 0x5B00..0x5BFF with five DR_* slots; 60-error
+acceptance corpus enumerated in
+`design/shell/diagnostic-reporting.md` §8), R227.M4 LoadCheck
+(parser-tier type-check-at-load pipeline SPINE composing R221.M5
+Ast + R225.M1 HmCore + R225.M6 RankCheck + R225.M7 DiagReport
+into the single orchestrator entry the kernel-side R133.M5
+TypecheckGate invokes through its registered user-space checker
+fn-ptr slot; three public entry points `_lc_init` /
+`_lc_check_script` / `_lc_count_diags` over singleton `.bss`
+48 B (24 B canonical scheme + three u64 scalars); walks top-level
+`let` bindings via ASCII heuristic with brace/paren depth +
+boundary gating; validates three syntactic preconditions per
+binding (span contains `=`; local balance; non-empty RHS); calls
+`_rc_check_scheme` on the canonical rank-1 scheme per binding
+(stride RankCheck wire-up for M4.1 HmCore replacement); emits
+128-B LC_DIAG records chained via next_offset at [+104] on
+failure; error band 0x5C00..0x5CFF with nine LC_* slots;
+10-fixture acceptance corpus (5 well-typed + 5 ill-typed scripts)
+enumerated in `design/shell/typecheck-at-load.md` §7).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -1140,9 +1213,70 @@ Blocked by: M2 + M3.
 
 Blocked by: R220.M11.
 
-### M7 -- Error reporting with source spans + suggestions (deferred)
+### M7 -- Error reporting with source spans + suggestions (paideia-os#2688, landed)
 
-Blocked by: R220.M9 (LSP-embed).
+- [x] **R225.M7-001** -- `src/diag_report.pdx` module `DiagReport`
+      landed: four public entry points (`_dr_init`, `_dr_build`,
+      `_dr_render_lsp`, `_dr_render_human`) + four module-private
+      pure-leaf helpers (`_dr_h_emit_lit`, `_dr_h_emit_cstr`,
+      `_dr_h_emit_u16_hex`, `_dr_h_emit_u32_dec`) over caller-
+      supplied buffers. 128-byte Diag record (stride power-of-two
+      for `shl rN, 7` addressing): magic u32 `'DIAG'` =
+      `0x47414944` LE at `[+0]`; code u16 at `[+4]`; severity u16
+      (0=ERROR, 1=WARN, 2=INFO, 3=HINT; LSP severity = +1) at
+      `[+6]`; primary span u32+u32 at `[+8]`; secondary span u32+u32
+      at `[+16]` (zero at raw M7; M7.3 patcher); expected / actual /
+      suggestion u8[32] NUL-padded at `[+24]` / `[+56]` / `[+88]`;
+      next_diag_ref u64 at `[+120]` (zero at raw M7; M7.1 queue
+      link). `_dr_build` packs code + severity into one u64 and
+      bundles the three 32-byte string buffers into one 96-byte
+      `strings_ptr` triple to fit the SysV x64 unsafe-body 6-arg
+      ceiling (per `tools/paideia-as/tests/build-emit/
+      sysv_x64_7arg_unsafe_body_b1708.pdx` + `design/compiler/
+      lambda-arity-stack-spill.md` §4.4/§11); pure leaf (zero
+      pushes, no stack frame, no nested CALL). The two render
+      entries are 6-push callee-save (rbx/rbp/r12/r13/r14/r15 =
+      48 B) with `rsp%16==0` after prologue at every nested CALL
+      into the four helpers; `_dr_render_lsp` emits one-line LSP
+      JSON (byte-offset fallback for `line`/`character` at raw M7;
+      M7.2 wires the UTF-8-aware resolver); `_dr_render_human`
+      emits `E<hex4> <SEV> at <dec_off>+<dec_len>: expected <exp>,
+      got <act> (hint: <sug>)`. Decimal emitter uses greedy-
+      subtraction over the 10-entry `_dr_pow10` [u32; 10] table
+      (max 10 x 9 = 90 subtractions per u32; the pdx dialect does
+      not expose IDIV/MUL so greedy subtraction is the canonical
+      shape). DR_* status taxonomy in 0x5B00..0x5B04 (five slots
+      used; 0x5B05..0x5BFF reserved for M7.1+).
+- [x] **R225.M7-002** -- design doc landed:
+      `design/shell/diagnostic-reporting.md`. 13 sections covering
+      scope + motivation, why a 128-byte flat record (not a pointer
+      graph), record wire format, severity axis + LSP mapping,
+      status band 0x5B00..0x5BFF, public API + register maps,
+      internal helpers, acceptance 60-error test corpus, dependencies,
+      encoder discipline, forward path, related docs, ABI freeze.
+- [ ] **R225.M7-003** -- 60-error acceptance corpus + goldens
+      (`tests/goldens/diag/`): deferred to R225.M7.5 per the
+      forward-path staging; the design doc §8 enumerates the 60
+      cases across HM core (15), row types (10), effect unify (8),
+      rank check (8), capability row (6), session type (4), and
+      severity+render robustness (9).
+- [ ] **R225.M7-004** (deferred) -- M7.1 `.bss` session-local
+      diagnostic queue (128 slots x 128 B = 16 KiB) +
+      `_dr_push_queue` / `_dr_drain_queue` helpers.
+- [ ] **R225.M7-005** (deferred) -- M7.2 byte-offset -> line/column
+      resolver (`_dr_byte_offset_to_line_column`) + LSP range
+      refinement.
+- [ ] **R225.M7-006** (deferred) -- M7.3 secondary-span patcher
+      (`_dr_set_secondary(record, off, len)`).
+- [ ] **R225.M7-007** (deferred) -- M7.4 code-indexed suggestion
+      table (`_dr_make_suggestion(code, expected_ptr, actual_ptr,
+      out, out_cap)`) in `_dr_suggestion_table` .rodata.
+- [ ] **R225.M7-008** (deferred) -- M7.6 kernel-side REPL-dispatch
+      wire-up (reads `_dr_render_human` for terminal lane and
+      `_dr_render_lsp` for LSP transport lane).
+- [ ] **R225.M7-009** (deferred) -- M7.7 LSP transport side
+      (lives in R220.M9 LSP-embed work; this module stays decoupled
+      through the `_dr_render_lsp` interface).
 
 ### M8 -- LSP hover integration (deferred)
 
@@ -1446,6 +1580,88 @@ finalised; the line-editor primitive is the standing M6 commitment).
       keeps the string open without the LF reaching the final
       string value.
 
+### M9 -- Renderer integration (Kitty vs ANSI-256) (paideia-os#2727, landed)
+
+- [x] **R229.M9-001** -- `src/renderer.pdx` module `Renderer`
+      landed: four public entry points (`_rd_init`,
+      `_rd_set_capability`, `_rd_render_record`,
+      `_rd_render_table`) over singleton `.bss` (40 B total:
+      32-byte TCAP capability record + `_rd_ready` u64 flag +
+      `_rd_reserved` u64 slot). 32-byte capability record with
+      magic 'TCAP' = 0x50414354 LE u32 at [+0]; kind byte
+      (RD_TERM_KITTY=0, RD_TERM_ANSI256=1, RD_TERM_ANSI16=2) at
+      [+4]; flags byte (TRUECOLOR / ITALIC / GRAPHICS) at [+5];
+      cols / rows u16 at [+8..+12]; term_name_inline u8[16] at
+      [+16..+32]. 16-byte ColDesc (width u16, flags u16,
+      reserved u32, name u8[8]) and 16-byte CellRef (ptr u64,
+      len u64) both power-of-two stride for `shl rN, 4`
+      addressing. `_rd_render_record` dispatches by kind: KITTY
+      -> `\e_G;` + record + `\e\\`; ANSI256 ->
+      `\e[38;5;255m` + record + `\e[0m`; ANSI16 -> record
+      verbatim. `_rd_render_table` uses R221.M3 `_wp_cols` for
+      cluster-aware column widths; emits `| cell | cell | ... |\n`
+      row shape with ASCII-space padding to col.width (LEFT_ALIGN
+      default at raw M9; RIGHT_ALIGN deferred to M9.2 refinement).
+      Three of four entry points are PURE LEAVES; `_rd_render_table`
+      has one 6-push + sub rsp 24 pad frame giving rsp%16==0 at
+      the nested CALL to `_wp_cols`. Cell addressing uses `mul
+      rN` (unsigned 64x64 single-operand) rather than 2-op
+      `imul r, imm` so the encoder-discipline rule holds. RD_*
+      status taxonomy in 0x5D00..0x5D08 (band 0x5D00..0x5DFF
+      with 247 slots reserved for M9.1+ follow-ups:
+      RD_ERR_KERNEL_EMITTER_UNAVAILABLE at M9.1 wire-up slot
+      zero, RD_ERR_BAD_CELL_LEN at M9.3 strict-mode cap,
+      RD_ERR_BAD_COL_WIDTH at M9.4 zero-width refusal). The
+      0x5B00..0x5BFF and 0x5C00..0x5CFF carve-outs are HELD
+      RESERVATIONS between the Wave 129 parallel-arm R229.M8
+      MultiLine (0x5A00..0x5AFF) and this R229.M9 Renderer
+      (0x5D00..0x5DFF) landings; the band skip is deliberate so
+      future Wave 129.x parallel arms slot in without
+      renumbering.
+- [x] **R229.M9-002** -- design doc landed:
+      `design/shell/renderer-integration.md`.
+- [ ] **R229.M9-003** -- 7-fixture smoke-mode golden corpus
+      (`smoke/renderer-m9.golden.txt`): deferred to R229.M9.7
+      along with the full smoke-mode fingerprint goldens. The
+      acceptance assertion ("Test on Kitty + xterm-256color;
+      both render tables correctly") is satisfied by the raw
+      M9 surface; the design doc §9 enumerates the 3 OK paths
+      (KITTY envelope / ANSI256 envelope / ANSI16 table render)
+      × 2 capability kinds + 4 negative cases
+      (RD_ERR_NO_CAPABILITY, RD_ERR_BAD_MAGIC, RD_ERR_BAD_KIND,
+      RD_ERR_WIDTH_FAULT) as the golden column.
+- [ ] **R229.M9.1** (deferred) -- kernel-side emitter wire-up:
+      two weak-import function-pointer slots (`_rd_kitty_fn`,
+      `_rd_ansi256_table_fn`) populated at session boot;
+      `_rd_render_record` / `_rd_render_table` indirect through
+      those slots for full-fidelity Kitty APC + ANSI-256 SGR
+      emission. Precedent: R222.M6 DispatchMode's
+      `_dm_light_fn` / `_dm_spawn_fn` slots.
+- [ ] **R229.M9.2** (deferred) -- Unicode box-drawing
+      refinement: the table emitter's ASCII-pipe shape upgrades
+      to U+2500..257F line-drawing under ANSI256 and KITTY
+      (plus an `AT_FLAG_ASCII` toggle to force ASCII under a
+      serial-log capture).
+- [ ] **R229.M9.3** (deferred) -- schema-driven formatting:
+      the dispatcher consults the record's SchemasSig body to
+      pick a rendering (an `Image` record routes KITTY-bitmap;
+      a `File` record routes ANSI256-table; a `MetricPoint`
+      stream routes inline time-series plot).
+- [ ] **R229.M9.4** (deferred) -- per-command renderer override:
+      the `as kind` suffix from `semantic-shell.md` §9.3
+      (`find . | as table`) injects a per-stage renderer-kind
+      field that overrides the schema-driven choice.
+- [ ] **R229.M9.5** (deferred) -- TR#9 bidi integration: a
+      logical-vs-visual order pass before cells reach
+      `_wp_cols`.
+- [ ] **R229.M9.6** (deferred) -- column-width heuristics:
+      `col.width == 0` triggers an auto-fit pass -- walk every
+      cell in the column, call `_wp_cols`, take the max as the
+      auto width (capped at `RD_MAX_COL_WIDTH = 128`).
+- [ ] **R229.M9.7** (deferred) -- smoke-mode fingerprint
+      goldens for the 7-fixture acceptance corpus (3 OK × 2
+      kinds + 4 negative).
+
 ### R227.M3 -- Import resolution + module graph (paideia-os#2705, landed)
 
 - [x] **R227.M3-001** -- `src/import_resolve.pdx` module
@@ -1496,6 +1712,92 @@ finalised; the line-editor primitive is the standing M6 commitment).
 - [ ] **R227.M3.5** (deferred) -- per-directive edge
       computation via name-table consult (replaces the raw
       M3 placeholder `edge i -> (i+1) mod n`).
+
+### R227.M4 -- Type-check-at-load pipeline (paideia-os#2706, landed)
+
+- [x] **R227.M4-001** -- `src/load_check.pdx` module
+      `LoadCheck` landed: three public entry points
+      (`_lc_init`, `_lc_check_script`, `_lc_count_diags`) over
+      singleton `.bss` (48 B total: `_lc_canon_scheme` 24-byte
+      canonical rank-1 scheme buffer + three u64 scalars
+      `_lc_binding_count` / `_lc_last_fail_code` /
+      `_lc_diag_emit_count`; all @align 8). 128-byte LC_DIAG
+      record with magic 'LCDG' = 0x47444C4C LE at [+0] (u32),
+      code u32 at [+4], src_offset u32 at [+8], src_length u32
+      at [+12], severity u8 at [+16], binding_idx u32 at [+20],
+      name_inline u8[16] at [+24], message_inline u8[64] at
+      [+40], next_offset u64 at [+104], reserved u8[16] at
+      [+112]. Stride 128 = 2^7 so addressing uses `shl rN, 7`.
+      Distinct from R225.M7 DiagReport's 'DIAG' record (next at
+      [+120]); the two records serve different diagnostic tiers.
+      `_lc_init` zero pushes with lazy-populate of canonical
+      scheme bytes; `_lc_check_script` 6 pushes + sub rsp,40
+      for five scratch slots (outer brace/paren depth +
+      binding_count + current binding src_offset / src_length)
+      giving rsp%16==0 at every nested CALL to `_rc_check_scheme`;
+      `_lc_count_diags` is a PURE LEAF (zero pushes). Walks
+      top-level `let` bindings via ASCII heuristic
+      (brace/paren depth tracked outer-level; keyword at
+      line/semicolon/BOF boundary with WS after); validates
+      three syntactic preconditions per binding (span contains
+      `=`; local brace/paren balance returns to 0; RHS has at
+      least one non-WS byte before `;`); calls `_rc_check_scheme`
+      on `_lc_canon_scheme` (24 B) per binding; emits LC_DIAG
+      record with severity LC_SEV_ERROR on any failure; chains
+      records via next_offset at [+104]; patches last record's
+      next_offset to 0 at loop exit. LC_* status taxonomy in
+      0x5C00..0x5C08 (band 0x5C00..0x5CFF with the full
+      LC_ERR_TYPECHECK_FAILED (0x5C00), LC_ERR_BAD_SCRIPT
+      (0x5C01), LC_ERR_OUT_TOO_SMALL (0x5C02),
+      LC_ERR_TOO_MANY_BINDINGS (0x5C03), LC_ERR_BAD_SCHEME
+      (0x5C04), LC_ERR_RANK_VIOLATION (0x5C05),
+      LC_ERR_PARSE_FAILED (0x5C06; reserved M4.1 Ast wire-up),
+      LC_ERR_HM_FAILED (0x5C07; reserved M4.1 HmCore wire-up),
+      LC_ERR_IMPORT_FAILED (0x5C08; reserved M4.2 ImportResolve
+      wire-up)). Intra-library linker-visible FUNCTION dep: one
+      -- `_rc_check_scheme` (R225.M6) called per binding found.
+      NO external linker dep; NO intra-library DATA dep.
+      Mirrors kernel-side R133.M5 TypecheckGate's registered
+      user-space checker surface via `_pds_tcg_register_checker`
+      fn-ptr slot (wire-up lands at M4.4).
+- [x] **R227.M4-002** -- design doc landed:
+      `design/shell/typecheck-at-load.md`.
+- [ ] **R227.M4-003** -- 10-fixture acceptance corpus
+      (`tests/proptest_load_check.pdx`): 5 well-typed +
+      5 ill-typed scripts enumerated in the design doc §7
+      ("let x = 1 ;" vs "let x" with no `=`; "let x = 1 ; let
+      y = 2 ;" vs "let x = (1 + 2 ;" with unmatched `(`; etc.).
+      Deferred to the broader parser-tier property-test harness
+      (R221.M9 landing); the raw M4 surface satisfies every
+      fixture by the three-precondition syntactic check (the
+      ill-typed cases all trip LC_ERR_BAD_SCHEME via one of
+      has-eq, balance, or non-empty-RHS; the well-typed cases
+      all pass and the canonical scheme always passes RankCheck
+      under raw-M6 wire format).
+- [ ] **R227.M4.1** (deferred) -- Wire real HmCore inference
+      per binding; replace the canonical scheme with
+      elaborator-derived schemes; emit TYFORALL diags surfaced
+      through the body kind-byte extension (R225.M4.1).
+- [ ] **R227.M4.2** (deferred) -- ImportResolve wire-up: run
+      `_ir_build_graph` + `_ir_detect_cycle` before the
+      top-level let walk; emit `LC_ERR_IMPORT_FAILED` on
+      cycle / resolve-fault.
+- [ ] **R227.M4.3** (deferred) -- AST pretty-print of the
+      failing binding into the diag's `message_inline` field
+      (requires R221.M5.1 child-aware `_ast_render`).
+- [ ] **R227.M4.4** (deferred) -- Kernel-side
+      `_pds_tcg_register_checker` wire-up: thin shim adapts the
+      PipelineBody format to the script-body byte stream
+      LoadCheck consumes; registers at REPL boot.
+- [ ] **R227.M4.5** (deferred) -- Standalone `pdsc verify`
+      driver that calls `_lc_check_script` over an on-disk
+      `.pds` file and prints the diag chain.
+- [ ] **R227.M4.6** (deferred) -- FNV-1a 64 hash of binding
+      name into the diag record's reserved u64 at [+112] for
+      dedup across concurrent loads.
+- [ ] **R227.M4.7** (deferred) -- rdtsc timestamp into the
+      diag record's reserved u64 at [+120] for ordering within
+      a load's chain.
 
 ## Error-band accounting
 
@@ -1570,6 +1872,12 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | multi_line-M8.1+ | 0x5A03..0x5AFF   | R229.M8.1+ | reserved |
 | import_resolve   | 0x5900..0x5913   | R227.M3   | landed |
 | import_resolve-M3.1+ | 0x5914..0x59FF | R227.M3.1+ | reserved |
+| diag_report      | 0x5B00..0x5B04   | R225.M7   | landed |
+| diag_report-M7.1+ | 0x5B05..0x5BFF  | R225.M7.1+ | reserved |
+| load_check       | 0x5C00..0x5C08   | R227.M4   | landed |
+| load_check-M4.1+ | 0x5C09..0x5CFF   | R227.M4.1+ | reserved |
+| renderer         | 0x5D00..0x5D08   | R229.M9   | landed |
+| renderer-M9.1+   | 0x5D09..0x5DFF   | R229.M9.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in
