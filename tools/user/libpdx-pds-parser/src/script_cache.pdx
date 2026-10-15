@@ -1,0 +1,1110 @@
+// src/script_cache.pdx -- libpdx-pds-parser.R227.M7 (paideia-os#2709)
+//
+// ScriptCache: in-memory LRU cache of elaborated script bodies keyed
+// by (source_hash, deps_hash). The parser-tier substrate behind the
+// REPL's "re-run the same script" fast path. Raw-M7 lands the
+// in-memory layer (zero-filled 32-slot pool, (source_hash, deps_hash)
+// lookup, LRU eviction, invalidate-by-source-hash, stats record).
+// Disk-backed `~/.paideia/script-cache/<hash>.pdc` persistence lands
+// at R227.M7.1 behind pdxfs path integration.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R227 is the pds container / loader umbrella (paideia-os#2491). R227.M1
+// (header pragmas) landed Wave 112 at the kernel tier; R227.M2
+// (cap-decl checker) landed Wave 115 at the kernel tier; R227.M3
+// (ImportResolve) landed Wave 129; R227.M4 (LoadCheck) landed Wave
+// 129; R227.M5 (ModuleFunctor) landed Wave 130 / 131; R227.M6
+// (VersionPragma) landed Wave 132. R227.M7 (THIS module) lands the
+// script-body binary cache: the shim between the REPL's "run the
+// same script a second time" state and the parser-tier elaboration
+// pipeline. The acceptance anchor on the umbrella ticket:
+//
+//     Fixture: a 1000-line script's second load is at least 10x
+//     faster than the first.
+//
+// The parser-tier elaboration pipeline (R221..R225 + R227.M3..M6)
+// walks a script's bytes through Utf8Nfc -> SpanMap -> CtxLexer ->
+// Ast -> ImportResolve -> ModuleFunctor -> LoadCheck -> HM infer +
+// generalise. For a 1000-line script that walk is O(n log n) in the
+// character count with constant factors dominated by the LoadCheck
+// gate's cross-module scheme-store traversal. A cache keyed by the
+// pair (source_hash, deps_hash) short-circuits the whole chain: the
+// first load pays the elaboration cost + an O(1) insert; every
+// subsequent load pays an O(k) scan over 32 slots and an O(1) record
+// read. k = 32 is small enough that even a cold cache beats a single
+// LoadCheck pass over a 1000-line script by orders of magnitude.
+//
+// R227.M7 is PARSER-TIER by geography (same satellite library as
+// R227.M3 ImportResolve, R227.M4 LoadCheck, R227.M5 ModuleFunctor,
+// R227.M6 VersionPragma) but is NOT itself a parser -- the module
+// is a key-value store over caller-supplied opaque hashes + an
+// opaque pointer-plus-length pair. It consumes no parser-tier
+// primitive at raw M7 and emits no parser-tier record format beyond
+// its own 64-byte cache row.
+//
+// =============================================================================
+// WHY LRU AND NOT A HASH TABLE
+// =============================================================================
+//
+// A hash table of elaborated-script records would scale to a larger
+// capacity, but at raw M7 the capacity target is 32 slots -- the
+// shell's working set across a single interactive session rarely
+// exceeds ~8 distinct scripts, and the capacity-32 pool fits in 2 KiB
+// of `.bss`. A hash table at that scale has worse constant factors
+// than a linear scan on modern cache lines: 32 x 64 B = 2048 bytes
+// fits in 32 cache lines (64 B each), and the linear scan touches
+// each cache line exactly once per lookup -- the same hardware pass
+// a hash table would need for its bucket chain, minus the bucket-
+// pointer indirection.
+//
+// LRU over timestamp_us: every slot carries an rdtsc sample. Insert-
+// on-full evicts the slot with the minimum timestamp_us; lookup-on-
+// hit updates the slot's timestamp_us to the current rdtsc so the
+// touched slot moves to the "most recently used" end of the ordering.
+// Invalidate clears every slot whose source_hash matches; the LRU
+// ordering is preserved across invalidation.
+//
+// =============================================================================
+// WHY (source_hash, deps_hash) AND NOT source_hash ALONE
+// =============================================================================
+//
+// A script's elaboration result depends on BOTH its own source bytes
+// AND the elaborated result of every module it imports. A cache keyed
+// on the source hash alone would return stale elaborated bodies when
+// a transitive import changes without the top-level script changing.
+// The dependency hash is the FNV-1a 64 of the concatenated import
+// path hashes resolved by R227.M3 ImportResolve; a change in any
+// transitive dependency's elaborated body flips its path hash, flips
+// the top-level script's deps_hash, and misses the cache. The two
+// hashes are both u64 so the (source, deps) pair fits in 16 bytes
+// inside each cache row.
+//
+// Hash choice: FNV-1a 64. The caller is responsible for computing both
+// hashes; the module does not do any hashing on its own. R229.M5
+// History already carries an FNV-1a 64 inliner precedent in the
+// parser-tier library (`h_app_fnv_loop`), and R227.M3 ImportResolve
+// already stores path hashes as FNV-1a 64 scalars so the deps_hash
+// aggregate is a trivial concatenation of its path hashes.
+//
+// =============================================================================
+// RECORD LAYOUT (64 B, SCC_RECORD_BYTES; stride = 2^6 = power of two)
+// =============================================================================
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//    0x00    4   magic           u32   'SCCA' (0x41434353 LE) -- bytes
+//                                       53 43 43 41 in a hex-dump scan.
+//                                       Zero for a never-used slot;
+//                                       non-zero marks the slot live
+//                                       OR formerly-live (an evicted
+//                                       slot's magic stays stamped;
+//                                       the LIVE bit in flags is the
+//                                       single source of truth for
+//                                       whether the row is a valid
+//                                       cache hit).
+//    0x04    4   flags           u32   bit 0 SCC_FLAG_LIVE set iff the
+//                                       slot is a valid cache row; bits
+//                                       1..31 reserved. _sc_invalidate
+//                                       clears the LIVE bit (and also
+//                                       zeros the magic for extra
+//                                       belt-and-suspenders) on the
+//                                       matched row.
+//    0x08    8   source_hash     u64   FNV-1a 64 of the full source
+//                                       bytes of the script this row
+//                                       caches. Opaque to the module;
+//                                       the caller computes it.
+//    0x10    8   deps_hash       u64   FNV-1a 64 of the concatenation
+//                                       of all transitive import path
+//                                       hashes. Opaque to the module;
+//                                       the caller computes it.
+//    0x18    8   elaborated_body_ref  u64  caller-opaque pointer to
+//                                       the cached elaborated AST OR
+//                                       binary blob. The module never
+//                                       dereferences it; it is handed
+//                                       back verbatim on lookup. A
+//                                       zero value is invalid at insert
+//                                       (SCC_ERR_NULL_REF 0x6503).
+//    0x20    8   elaborated_body_len  u64  byte length of the
+//                                       elaborated body. Opaque to the
+//                                       module; handed back verbatim
+//                                       on lookup. A zero value is
+//                                       invalid at insert
+//                                       (SCC_ERR_ZERO_LEN 0x6504).
+//    0x28    8   timestamp_us    u64   rdtsc sample at insert OR last-
+//                                       lookup time. Low bits are the
+//                                       LRU-ordering primary key:
+//                                       `_sc_insert` on a full pool
+//                                       evicts the row with the
+//                                       minimum timestamp; `_sc_lookup`
+//                                       on a hit updates this slot's
+//                                       timestamp to the current rdtsc
+//                                       so the touched row moves to
+//                                       the "most recently used" end.
+//    0x30   16   cache_key_inline u8[16] 16-byte raw-bytes rendering
+//                                       of (source_hash, deps_hash)
+//                                       for a debug dump. The first
+//                                       8 bytes are the source_hash
+//                                       LE u64; the next 8 are the
+//                                       deps_hash LE u64. R227.M7.2
+//                                       may render this as the hex
+//                                       "ab12cd34..." prefix for the
+//                                       pdxfs `<hash>.pdc` filename
+//                                       path; raw M7 just stamps the
+//                                       raw bytes.
+//
+//   total: 64 B (SCC_RECORD_BYTES; power-of-two stride for
+//                `shl idx, 6` addressing without 2-op imul-r-imm).
+//
+// Rationale:
+//
+//   * Stride 64 = 2^6 so the per-slot addressing uses `shl rN, 6`
+//     (no 2-op `imul r, imm`).
+//   * Magic 'SCCA' = 0x41434353 LE reads as the 4-byte ASCII string
+//     "SCCA" in a hex-dump sequential scan (byte sequence 53 43 43 41).
+//     Distinct from R222.M3 FunctorInstance's 'FINS' (0x534E4946),
+//     R227.M3 ImportResolve's 'IMPT' (0x54504D49), R227.M4 LoadCheck's
+//     'LCDG' (0x47444C4C), R227.M5 ModuleFunctor's 'MFCT' (0x5443464D),
+//     R227.M6 VersionPragma's 'RVPR' (0x52505652), R229.M10
+//     TurnFingerprint's 'TFPR' (0x52504654), R222.M2 CommandSig's
+//     'CSIG' (0x47495343), R229.M5 History's 'HREC' (0x43455248),
+//     R223.M5 WireSink's 'WSNK' (0x4B4E5357), R223.M6 HostnameAnnot's
+//     'HOST' (0x54534F48), R222.M8 DescribeSig's 'DESC' (0x43534544),
+//     R223.M7 SessionType's 'SESS' (0x53534553), R225.M7 DiagReport's
+//     'DIAG' (0x47414944), R225.M9 ProptestHm's 'PTHS' (0x53485450).
+//     Magic 0x41434353 fits imm32 with bit 31 clear so direct
+//     `mov r9, 0x41434353` (mov-r64-imm32-zero-extend) + `mov_d
+//     [r9 + 0], r9` lands the magic without a MOVABS.
+//   * Stats record magic 'SCCS' = 0x53434353 LE (byte sequence 53 43
+//     43 53) stamps the 64-byte stats record written by `_sc_stats`.
+//     Distinct from the row magic 'SCCA' by their last byte ('A' vs
+//     'S'); a downstream reader that scans either record never
+//     confuses them.
+//
+// =============================================================================
+// STATS RECORD LAYOUT (64 B, SCC_STATS_BYTES)
+// =============================================================================
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//    0x00    4   magic           u32   'SCCS' (0x53434353 LE).
+//    0x04    2   version         u16   1 at raw M7; bumped on binary-
+//                                       incompatible layout change.
+//    0x06    2   reserved        u16   0 at raw M7.
+//    0x08    8   entry_count     u64   current live-slot count (0..32).
+//    0x10    8   hit_count       u64   cumulative lookup hits since
+//                                       boot OR last `_sc_init`.
+//    0x18    8   miss_count      u64   cumulative lookup misses since
+//                                       boot OR last `_sc_init`.
+//    0x20    8   capacity        u64   SCC_POOL_SLOTS (= 32 at raw M7).
+//    0x28   24   reserved        u8[24] zero at raw M7. Reserved for
+//                                       R227.M7.1+ (bytes-persisted
+//                                       counter, pdxfs write-count
+//                                       counter, flush-latency sample).
+//
+//   total: 64 B (SCC_STATS_BYTES).
+//
+// =============================================================================
+// POOL + SCALAR STATE (.bss)
+// =============================================================================
+//
+//   `_sc_entries : [u8; 2048]`  (= 32 slots x 64 B) @align(8)
+//   `_sc_entry_count : u64`                         @align(8)
+//   `_sc_hit_count   : u64`                         @align(8)
+//   `_sc_miss_count  : u64`                         @align(8)
+//
+// Pool layout: slot i occupies `_sc_entries[i * 64 .. (i + 1) * 64)`.
+// At cold boot `.bss` zero-init makes every slot's magic 0 and flags
+// 0, which is the exact "never-used" state the lookup / insert paths
+// treat as empty. `_sc_init` defensively re-zeros the three u64
+// scalars so a chaos-restart re-entry drops into the same clean
+// state as a cold boot.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _sc_init() -> ()
+//     Boot hook. Defensive zero of `_sc_entry_count`, `_sc_hit_count`,
+//     `_sc_miss_count`. The pool itself is NOT scrubbed -- `.bss`
+//     zero-init already satisfies the "magic == 0 means never-used
+//     slot" invariant at cold boot.
+//
+//   _sc_lookup(source_hash, deps_hash, out_elaborated_ref, out_len)
+//                                                 -> status
+//     Scan the 32-slot pool for a row whose magic == 'SCCA', LIVE bit
+//     set, source_hash matches, deps_hash matches. On hit: write
+//     `*out_elaborated_ref = slot.elaborated_body_ref`,
+//     `*out_len = slot.elaborated_body_len`, update slot.timestamp_us
+//     = rdtsc, bump `_sc_hit_count`, return SCC_OK (0). On miss: bump
+//     `_sc_miss_count`, return SCC_ERR_NOT_FOUND (0x6510). Guards:
+//     `out_elaborated_ref != 0` AND `out_len != 0` (fail ->
+//     SCC_ERR_BAD_PTR 0x6500).
+//
+//     Register map: (rdi, rsi, rdx, rcx) -> rax.
+//
+//   _sc_insert(source_hash, deps_hash, elaborated_ref, len) -> errno
+//     Place a new cache row. Phase A (free scan): walk the 32 slots
+//     left to right; first slot with flags.LIVE == 0 wins. Phase B
+//     (LRU scan): if phase A finds no free slot, re-walk the pool
+//     and pick the slot with the minimum timestamp_us. Evict (just
+//     overwrite in place; the module owns no finalizer because the
+//     elaborated_ref is caller-opaque). Write the 64-byte record
+//     (magic, LIVE flag, source_hash, deps_hash, elaborated_ref, len,
+//     timestamp_us = rdtsc, cache_key_inline = source_hash LE u64 +
+//     deps_hash LE u64 raw bytes). Bump `_sc_entry_count` iff the
+//     chosen slot was previously empty. Return SCC_OK (0). Guards:
+//     `elaborated_ref != 0` (fail -> SCC_ERR_NULL_REF 0x6503);
+//     `len > 0` (fail -> SCC_ERR_ZERO_LEN 0x6504).
+//
+//     Register map: (rdi, rsi, rdx, rcx) -> rax.
+//
+//   _sc_invalidate(source_hash) -> errno
+//     Scan the 32-slot pool; for every row whose magic == 'SCCA',
+//     LIVE bit set, source_hash matches, zero the magic + flags
+//     fields and decrement `_sc_entry_count`. A source may legitimately
+//     have multiple deps_hash rows cached (one per import graph
+//     configuration encountered); all matching rows are cleared.
+//     Returns SCC_OK (0). The elaborated_body_ref payload is NOT
+//     scrubbed (the module owns no finalizer); the caller is
+//     responsible for releasing the underlying storage if needed.
+//
+//     Register map: rdi -> rax.
+//
+//   _sc_stats(out_stats_ptr) -> status
+//     Write a 64-byte SCCS stats record at `out_stats_ptr`. Fields
+//     per the layout above. Returns SCC_OK (0). Guards:
+//     `out_stats_ptr != 0` (fail -> SCC_ERR_BAD_PTR 0x6500).
+//
+//     Register map: rdi -> rax.
+//
+// =============================================================================
+// STATUS BAND -- 0x6500..0x65FF
+// =============================================================================
+//
+//   SCC_OK                       = 0
+//   SCC_ERR_BAD_PTR              = 0x6500   _sc_lookup: out_elaborated_
+//                                            ref == 0 OR out_len == 0;
+//                                            _sc_stats: out_stats_ptr
+//                                            == 0.
+//   SCC_ERR_RESERVED_01          = 0x6501   reserved for M7.1+ stats
+//                                            out-cap faults.
+//   SCC_ERR_RESERVED_02          = 0x6502   reserved for M7.1+ hash-
+//                                            sentinel faults.
+//   SCC_ERR_NULL_REF             = 0x6503   _sc_insert: elaborated_
+//                                            ref == 0.
+//   SCC_ERR_ZERO_LEN             = 0x6504   _sc_insert: len == 0.
+//   SCC_ERR_NOT_FOUND            = 0x6510   _sc_lookup: no matching
+//                                            slot (hit the full-pool
+//                                            scan without a magic +
+//                                            LIVE + (source, deps)
+//                                            agreement).
+//
+// Slots 0x6505..0x650F reserved for M7.1+ insert / invalidate
+// diagnostics (full-pool-with-no-victim, source-hash-collision-arm,
+// pdxfs-write-fault, serialization-fault, deserialization-fault,
+// corrupt-record-magic, corrupt-record-flags, corrupt-record-length,
+// capacity-saturation-warn, policy-mode-mismatch). Slots
+// 0x6511..0x65FF reserved for M7.2+ lookup diagnostics (stale-
+// deps-hash, miss-by-invalidation-reason, pdxfs-reload-fault, cache-
+// coherence-warn, cross-session-shared-faul, concurrency-fault,
+// LRU-sweep-noise).
+//
+// The 0x6500..0x65FF carve-out skips the parallel-arm 0x6300..0x63FF
+// and 0x6400..0x64FF bands (reserved for R225.M10 per-turn type-check
+// fingerprint and R226.M2 datalog predicate-type resolution per the
+// parallel-arm schedule) and sits directly above the R227.M6
+// VersionPragma band (0x6200..0x62FF). A downstream compound-error
+// dispatcher discriminates "script-cache substrate faulted" from
+// every other sibling satellite's failure modes via
+// `shr r, 8; cmp r, 0x65`. Disjoint from every landed parser-tier
+// packed-status range AND from every kernel-side packed-status band.
+//
+// Grep confirmation at R227.M7 landing time:
+//   grep -rE '0x65(0[0-4]|10)\b' paideia-os/{src,tools,design,tests}
+//     -> no packed-status hits outside this file + caps.decl +
+//        design/shell/script-cache.md.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- the SCC_FLAG_LIVE bit is a single imm8
+//     (`cmp r, 1`); no multi-byte mask is used. The flags u32 is
+//     written as the whole imm32 value (0 or 1) via mov_d, not as a
+//     masked OR into an existing value.
+//   - No 2-op `imul rN, imm` -- the 64-byte stride is `shl rN, 6`
+//     (power of two).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `ScriptCache` matches `script_cache.pdx`.
+//   - Labels prefixed `scc_` with per-handler suffix (`scc_ini_` init,
+//     `scc_lu_` lookup, `scc_in_` insert, `scc_iv_` invalidate,
+//     `scc_st_` stats). `sc_` is RESERVED by the kernel-side
+//     `src/kernel/core/pds/script_cmd.pdx` module (ScriptCmd),
+//     which uses `sc_` as its local-label prefix inside the kernel's
+//     linker scope. The parser-tier library NEVER links the kernel so
+//     the local-label scopes are disjoint by linker design, but to
+//     keep the per-prefix-grep hygiene clean this module adopts
+//     `scc_` (the second `c` for "cache") rather than reuse `sc_`.
+//     The PUBLIC entry symbols `_sc_init`, `_sc_lookup`, `_sc_insert`,
+//     `_sc_invalidate`, `_sc_stats` are GLOBAL linker symbols in the
+//     parser-tier library's linker scope; they are DISJOINT from the
+//     kernel-side `_sc_dispatch_fn` global (kernel linker scope) and
+//     the kernel's local `sc_` label prefix (kernel linker scope).
+//     Grep-confirmed virgin inside tools/user/libpdx-pds-parser/src/
+//     *.pdx (no prior `scc_` label in the parser-tier library) AND
+//     disjoint from every landed parser-tier label prefix (u8n_, gi_,
+//     wp_, cl_, ast_, sm_, fh_, sch_sig_, cmd_sig_, fi_, afs_,
+//     cmdreg_, dm_, ds_, pl_, pl_lam_, rp_, fo_, sgr_, ws_, ha_, st_,
+//     ll_, cc_, er_, cr_, ls_, lp_, hm_, rt_, eu_, dl_, se_, te_,
+//     jc_, h_, le_, vi_, ml_, ir_, rc_, rd_, dr_, lc_, lh_, tf_, mf_,
+//     vp_, pth_). Never bare `loop` / `if` / `let` / `fn` / `ret`
+//     (per reference_paideia_as_reserved_labels).
+//   - All `cmp reg, imm` immediates (0, 1, 32, 64, status codes
+//     0x6500..0x6510, magic 0x41434353 'SCCA' and 0x53434353 'SCCS')
+//     fit imm32 with bit 31 clear so direct cmp-imm32 is sign-
+//     extension-safe.
+//   - u32 loads via `xor rN, rN; mov_d rN, [base + disp]` (zero-
+//     extended into the u64 register).
+//   - u32 stores via `mov_d [dst + disp], reg`.
+//   - u64 stores via plain `mov [dst + disp], reg`.
+//   - No chained-displacement addressing with three terms: all
+//     [base + off + idx] expressions precomputed via `add` first.
+//   - rdtsc clobber discipline: rax/rdx trashed; combine via `shl
+//     rdx, 32; or rax, rdx`.
+//
+// =============================================================================
+// REGISTER-LIVENESS DISCIPLINE
+// =============================================================================
+//
+//   * `_sc_init`: zero pushes; zero stack frame; zero nested CALL.
+//     Three u64 scalars zeroed via three `lea r11, [rip + sym]; mov
+//     [r11], rax` pairs with rax = 0.
+//
+//   * `_sc_lookup`: 5-push callee-save frame (rbx, rbp, r12, r13,
+//     r14 = 40 B). Pure leaf (no nested CALL) so no sub-rsp pad is
+//     needed. Register plan:
+//       rbx = source_hash           (held through the whole scan)
+//       rbp = deps_hash             (held through the whole scan)
+//       r12 = out_elaborated_ref    (write-ptr; validated non-null)
+//       r13 = out_len               (write-ptr; validated non-null)
+//       r14 = scan_idx (0..32)
+//     Scratch: rax, rcx, rdx, rsi, rdi, r8 (slot_addr), r9 (loaded
+//     u32 flags), r10 (shl staging), r11 (lea staging / rdtsc tail).
+//
+//   * `_sc_insert`: 6-push callee-save frame (rbx, rbp, r12, r13,
+//     r14, r15 = 48 B). Pure leaf (no nested CALL) so no sub-rsp pad
+//     is needed. Register plan:
+//       rbx = source_hash
+//       rbp = deps_hash
+//       r12 = elaborated_ref
+//       r13 = len
+//       r14 = scan_idx / chosen_idx (0..32)
+//       r15 = min_timestamp carrier (phase B LRU scan)
+//     Scratch: rax, rcx, rdx, rsi, rdi, r8 (slot_addr), r9 (misc),
+//     r10 (shl staging), r11 (lea staging / is_fresh flag).
+//
+//   * `_sc_invalidate`: 3-push callee-save frame (rbx, rbp, r12
+//     = 24 B). Pure leaf (no nested CALL). Register plan:
+//       rbx = source_hash
+//       rbp = scan_idx
+//       r12 = cleared_count
+//     Scratch: rax, rcx, rdx, r8 (slot_addr), r9 (loaded field), r10
+//     (shl staging), r11 (lea staging).
+//
+//   * `_sc_stats`: 1-push callee-save frame (rbx = 8 B). Pure leaf
+//     (no nested CALL). Register plan:
+//       rbx = out_stats_ptr
+//     Scratch: rax, rcx, rdx, r9, r10, r11.
+//
+// =============================================================================
+// LAZY-INIT DISCIPLINE
+// =============================================================================
+//
+// R227.M7 holds `.bss` state (2048 B pool + 3 x u64 scalars = 2072 B
+// aligned to 2080 B). `.bss` zero-init at cold boot trivially
+// satisfies the module's "magic == 0 means never-used slot" invariant
+// AND the three counter invariants (`_sc_entry_count` = 0,
+// `_sc_hit_count` = 0, `_sc_miss_count` = 0). `_sc_init` defensively
+// re-zeros the three counter scalars on a chaos-restart re-entry so
+// the module recovers to the same clean state. The pool itself is
+// NOT scrubbed on re-init because the magic-0 convention lets the
+// lookup / insert / invalidate paths treat every row with magic != 0
+// consistently -- stale rows from a prior session cannot false-
+// positive a lookup under the new session's hashes (collision
+// probability on FNV-1a 64 is 2^-64 per hash and 2^-128 on the pair).
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R227.M3 (ImportResolve) -- the deps_hash input to `_sc_lookup` /
+//     `_sc_insert` is the FNV-1a 64 of the concatenated import path
+//     hashes resolved by `_ir_resolve_path`. R227.M3 already carries
+//     FNV-1a 64 path hashes as its scalar field layout, so the deps_
+//     hash aggregate is a straight concatenation reduction over the
+//     resolved-import array. No linker dep at raw M7; the caller
+//     computes deps_hash and hands the u64 to this module.
+//
+//   R227.M4 (LoadCheck) -- the elaborated-body-ref payload the shell
+//     caches via `_sc_insert` is the output of the LoadCheck pipeline
+//     orchestrator. R227.M4 produces a 32-byte LoadCheck record that
+//     carries pointers into the module's AST pool; the shell wraps
+//     those pointers (plus the HM inference result) into a single
+//     caller-owned blob and hands `(blob_ptr, blob_len)` to this
+//     module. No linker dep at raw M7.
+//
+//   R229.M5 (History) -- the FNV-1a 64 inliner precedent for the
+//     source_hash computation. The caller-side source_hash reuses
+//     the exact `h_app_fnv_loop` byte-walk shape (fnv_offset_basis
+//     = 0xCBF29CE484222325, prime = 0x100000001B3). No linker dep
+//     at raw M7 -- the caller computes the hash in-line.
+//
+//   R229.M10 (TurnFingerprint) -- the shell's per-turn fingerprint
+//     already captures the current session's command byte span. A
+//     M7.3 forward-path landing threads the (source_hash, deps_hash)
+//     pair into the TurnFingerprint record so a chaos-replay session
+//     exact-reproduces the cache state.
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R227.M7.1  Disk-backed persistence: write each cached row to
+//              `~/.paideia/script-cache/<hash>.pdc` via pdxfs CoW
+//              path integration. Needs the pdxfs path-tree primitive
+//              (R131 forward-path).
+//   R227.M7.2  Hex rendering: `cache_key_inline` field written as
+//              the 16-byte hex-string prefix of the source_hash +
+//              deps_hash pair so the `<hash>.pdc` filename matches
+//              the inline field verbatim.
+//   R227.M7.3  TurnFingerprint wire-up: feed the (source_hash,
+//              deps_hash) pair into the per-turn fingerprint record
+//              so a chaos-replay session exact-reproduces the cache
+//              state.
+//   R227.M7.4  Capacity bump: 32 -> 128 slots once the pool size
+//              moves out of the shell's working-set range (an
+//              editor-plus-build-script session may exceed 32
+//              distinct scripts).
+//   R227.M7.5  Concurrency: a session-shared pool under a RWLock so
+//              a federation-attached peer's cache contributes to the
+//              local session's hit rate.
+//   R227.M7.6  Acceptance fixture: `tests/proptest_script_cache.pdx`
+//              landing the 1000-line script-second-load fixture +
+//              a cold-vs-warm 10x speedup assertion; landing with
+//              R221.M9 property-test harness.
+//
+// =============================================================================
+// Upstream: paideia-os#2491 (R227 pds container umbrella), paideia-os
+// #2709 (THIS ticket, R227.M7 Script-body binary cache). Design doc:
+// design/shell/script-cache.md.
+
+module ScriptCache = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax)
+  // ==========================================================================
+  //
+  // Band 0x6500..0x65FF, reserved for the R227.M7 script-cache
+  // substrate. Disjoint from every prior landed satellite band.
+
+  pub let SCC_OK                       : u64 = 0
+  pub let SCC_ERR_BAD_PTR              : u64 = 0x6500
+  pub let SCC_ERR_RESERVED_01          : u64 = 0x6501
+  pub let SCC_ERR_RESERVED_02          : u64 = 0x6502
+  pub let SCC_ERR_NULL_REF             : u64 = 0x6503
+  pub let SCC_ERR_ZERO_LEN             : u64 = 0x6504
+  pub let SCC_ERR_NOT_FOUND            : u64 = 0x6510
+
+  // ==========================================================================
+  // SECTION 2 -- LAYOUT CONSTANTS
+  // ==========================================================================
+
+  // Pool geometry.
+  pub let SCC_POOL_SLOTS               : u64 = 32
+  pub let SCC_RECORD_BYTES             : u64 = 64
+  pub let SCC_POOL_BYTES               : u64 = 2048   // 32 x 64
+  pub let SCC_SLOT_IDX_SHIFT           : u64 = 6      // shl idx, 6 => * 64
+
+  // Record field offsets.
+  pub let SCC_OFF_MAGIC                : u64 = 0      // u32
+  pub let SCC_OFF_FLAGS                : u64 = 4      // u32
+  pub let SCC_OFF_SOURCE_HASH          : u64 = 8      // u64
+  pub let SCC_OFF_DEPS_HASH            : u64 = 16     // u64
+  pub let SCC_OFF_BODY_REF             : u64 = 24     // u64
+  pub let SCC_OFF_BODY_LEN             : u64 = 32     // u64
+  pub let SCC_OFF_TIMESTAMP            : u64 = 40     // u64
+  pub let SCC_OFF_KEY_INLINE           : u64 = 48     // u8[16]
+
+  // Flag bits in the `flags` u32 at [record + 4].
+  pub let SCC_FLAG_LIVE                : u64 = 1
+
+  // Magics.
+  pub let SCC_RECORD_MAGIC             : u64 = 0x41434353   // 'SCCA' LE
+  pub let SCC_STATS_MAGIC              : u64 = 0x53434353   // 'SCCS' LE
+
+  // Stats record geometry.
+  pub let SCC_STATS_BYTES              : u64 = 64
+  pub let SCC_STATS_VERSION            : u64 = 1
+  pub let SCC_STATS_OFF_MAGIC          : u64 = 0      // u32
+  pub let SCC_STATS_OFF_VERSION        : u64 = 4      // u16
+  pub let SCC_STATS_OFF_RESERVED_6     : u64 = 6      // u16
+  pub let SCC_STATS_OFF_ENTRY_COUNT    : u64 = 8      // u64
+  pub let SCC_STATS_OFF_HIT_COUNT      : u64 = 16     // u64
+  pub let SCC_STATS_OFF_MISS_COUNT     : u64 = 24     // u64
+  pub let SCC_STATS_OFF_CAPACITY       : u64 = 32     // u64
+  pub let SCC_STATS_OFF_RESERVED_40    : u64 = 40     // u8[24]
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _sc_entries      : [u8; 2048] = uninit @align(8)
+  pub let mut _sc_entry_count  : u64        = uninit @align(8)
+  pub let mut _sc_hit_count    : u64        = uninit @align(8)
+  pub let mut _sc_miss_count   : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // _sc_init() -> ()
+  //
+  //   Boot hook. Defensive zero of _sc_entry_count, _sc_hit_count,
+  //   _sc_miss_count (three u64 stores = 24 B). The _sc_entries pool
+  //   is NOT scrubbed -- .bss zero-init already satisfies the
+  //   "magic == 0 means never-used slot" invariant at cold boot. A
+  //   chaos-restart re-entry re-drives this hook defensively.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed scc_ini_.
+  // ==========================================================================
+  pub let _sc_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M7 (#2709): defensive scrub of _sc_entry_count, _sc_hit_count, _sc_miss_count (three u64 stores = 24 B). _sc_entries pool is NOT scrubbed because .bss is already zero at real boot (magic == 0 => never-used slot). Pure leaf; zero pushes; no stack frame; no nested CALL. Store 0 u64 to _sc_entry_count, _sc_hit_count, _sc_miss_count via `lea r11, [rip + sym]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed scc_ini_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _sc_entry_count];
+        mov [r11], rax;
+
+        lea r11, [rip + _sc_hit_count];
+        mov [r11], rax;
+
+        lea r11, [rip + _sc_miss_count];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _sc_lookup(source_hash, deps_hash, out_elaborated_ref, out_len)
+  //                                                 -> status
+  //
+  //   rdi = source_hash
+  //   rsi = deps_hash
+  //   rdx = out_elaborated_ref    (write-ptr; non-null required)
+  //   rcx = out_len               (write-ptr; non-null required)
+  //   rax = SCC_OK (0) on hit; SCC_ERR_NOT_FOUND (0x6510) on miss;
+  //         SCC_ERR_BAD_PTR (0x6500) on null write-ptr.
+  //
+  // Scan all 32 slots. On match (magic == 'SCCA' AND flags.LIVE == 1
+  // AND source_hash matches AND deps_hash matches): write out ptrs,
+  // update slot.timestamp_us = rdtsc, bump _sc_hit_count, return
+  // SCC_OK. On no-match after scanning all 32 slots: bump
+  // _sc_miss_count, return SCC_ERR_NOT_FOUND.
+  //
+  // Pure leaf -- 5 callee-save pushes (rbx, rbp, r12, r13, r14);
+  // no nested CALL.
+  //
+  // Labels prefixed scc_lu_.
+  // ==========================================================================
+  pub let _sc_lookup : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (source_hash: u64) (deps_hash: u64) (out_elaborated_ref: u64)
+       (out_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M7 (#2709): _sc_lookup scans the 32-slot pool for a row matching (magic == 'SCCA' 0x41434353 LE, flags.LIVE == 1, source_hash, deps_hash). On hit: write *out_elaborated_ref = slot.body_ref u64 at [+24], *out_len = slot.body_len u64 at [+32]; update slot.timestamp_us at [+40] via rdtsc + shl rdx,32 + or rax,rdx; bump _sc_hit_count; return SCC_OK. On miss: bump _sc_miss_count; return SCC_ERR_NOT_FOUND (0x6510). 5 callee-save pushes (rbx=source_hash, rbp=deps_hash, r12=out_elaborated_ref, r13=out_len, r14=scan_idx); pure leaf (no nested CALL) so no sub-rsp pad is needed. Guards: out_elaborated_ref != 0 (cmp rdx, 0; je scc_lu_bad_ptr); out_len != 0 (cmp rcx, 0; je scc_lu_bad_ptr). After guards: stash args in callee-saves; r14 = 0. Loop: cmp r14, 32; jae scc_lu_miss; compute slot_addr = &_sc_entries + (r14 << 6) via `mov r10, r14; shl r10, 6; lea r11, [rip + _sc_entries]; add r11, r10; mov r8, r11` (r8 holds slot_addr across the per-slot checks). Load magic u32 at [r8+0] via `xor r9, r9; mov_d r9, [r8+0]`; cmp r9, 0x41434353; jne scc_lu_advance. Load flags u32 at [r8+4] via `xor r9, r9; mov_d r9, [r8+4]`; cmp r9, 1 (SCC_FLAG_LIVE); jne scc_lu_advance. Load source_hash u64 at [r8+8]; cmp rbx; jne advance. Load deps_hash u64 at [r8+16]; cmp rbp; jne advance. On full match: load body_ref u64 at [r8+24]; mov [r12], r9. Load body_len u64 at [r8+32]; mov [r13], r9. rdtsc; shl rdx, 32; or rax, rdx; mov [r8+40], rax. Bump _sc_hit_count via `lea r11,[rip+_sc_hit_count]; mov rax,[r11]; add rax,1; mov [r11], rax`. Return SCC_OK via xor rax, rax. Advance: add r14, 1; jmp loop. Miss path: bump _sc_miss_count; mov rax, 0x6510; jmp epilogue. Bad-ptr path: mov rax, 0x6500. All cmp immediates (0, 1, 32, 0x6500, 0x6510, magic 0x41434353) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. No test; no and-imm64; no imul-r-imm (stride via shl 6); no multiline let; no three-term addressing. Labels prefixed scc_lu_.",
+      block: {
+        // ---- Prologue -------------------------------------------------
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        // ---- Guard: out_elaborated_ref != 0.
+        cmp rdx, 0;
+        je  scc_lu_bad_ptr;
+
+        // ---- Guard: out_len != 0.
+        cmp rcx, 0;
+        je  scc_lu_bad_ptr;
+
+        // ---- Stash args in callee-saves.
+        mov rbx, rdi;                   // source_hash
+        mov rbp, rsi;                   // deps_hash
+        mov r12, rdx;                   // out_elaborated_ref
+        mov r13, rcx;                   // out_len
+
+        // ---- Scan loop: r14 = 0..32.
+        xor r14, r14;
+
+      scc_lu_scan:
+        cmp r14, 32;                    // SCC_POOL_SLOTS
+        jae scc_lu_miss;
+
+        // slot_addr = &_sc_entries + (r14 << 6)
+        mov r10, r14;
+        shl r10, 6;                     // SCC_SLOT_IDX_SHIFT
+        lea r11, [rip + _sc_entries];
+        add r11, r10;
+        mov r8, r11;                    // r8 = slot_addr (stable per iter)
+
+        // Load magic u32 at [slot+0].
+        xor r9, r9;
+        mov_d r9, [r8 + 0];
+        cmp r9, 0x41434353;             // SCC_RECORD_MAGIC
+        jne scc_lu_advance;
+
+        // Load flags u32 at [slot+4]; require LIVE bit set (value 1).
+        xor r9, r9;
+        mov_d r9, [r8 + 4];
+        cmp r9, 1;                      // SCC_FLAG_LIVE
+        jne scc_lu_advance;
+
+        // Load source_hash u64 at [slot+8]; compare to rbx.
+        mov r9, [r8 + 8];
+        cmp r9, rbx;
+        jne scc_lu_advance;
+
+        // Load deps_hash u64 at [slot+16]; compare to rbp.
+        mov r9, [r8 + 16];
+        cmp r9, rbp;
+        jne scc_lu_advance;
+
+        // ---- Hit: write out ptrs, update timestamp, bump hit_count.
+        mov r9, [r8 + 24];              // body_ref
+        mov [r12], r9;
+
+        mov r9, [r8 + 32];              // body_len
+        mov [r13], r9;
+
+        // rdtsc -> [slot+40]
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        mov [r8 + 40], rax;
+
+        // Bump _sc_hit_count.
+        lea r11, [rip + _sc_hit_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // Return SCC_OK.
+        xor rax, rax;
+        jmp scc_lu_epilogue;
+
+      scc_lu_advance:
+        add r14, 1;
+        jmp scc_lu_scan;
+
+      scc_lu_miss:
+        // Bump _sc_miss_count.
+        lea r11, [rip + _sc_miss_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        mov rax, 0x6510;                // SCC_ERR_NOT_FOUND
+        jmp scc_lu_epilogue;
+
+      scc_lu_bad_ptr:
+        mov rax, 0x6500;                // SCC_ERR_BAD_PTR
+        jmp scc_lu_epilogue;
+
+      scc_lu_epilogue:
+        pop r14;
+        pop r13;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _sc_insert(source_hash, deps_hash, elaborated_ref, len) -> errno
+  //
+  //   rdi = source_hash
+  //   rsi = deps_hash
+  //   rdx = elaborated_ref  (opaque pointer; non-zero required)
+  //   rcx = len             (opaque length; > 0 required)
+  //   rax = SCC_OK (0) on success; SCC_ERR_NULL_REF (0x6503) on
+  //         elaborated_ref == 0; SCC_ERR_ZERO_LEN (0x6504) on
+  //         len == 0.
+  //
+  // Phase A (free scan): walk slots 0..32 left-to-right; the first
+  // slot with flags.LIVE == 0 wins. Phase B (LRU scan): if phase A
+  // finds no free slot, re-walk the pool and pick the slot with the
+  // minimum timestamp_us. Overwrite the chosen slot with the new
+  // record. Bump _sc_entry_count iff the chosen slot was free.
+  //
+  // Pure leaf -- 6 callee-save pushes (rbx, rbp, r12, r13, r14, r15);
+  // no nested CALL.
+  //
+  // Labels prefixed scc_in_.
+  // ==========================================================================
+  pub let _sc_insert : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (source_hash: u64) (deps_hash: u64) (elaborated_ref: u64)
+       (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M7 (#2709): _sc_insert places a new 64-byte cache row for (source_hash, deps_hash) -> (elaborated_ref, len). 6 callee-save pushes (rbx=source_hash, rbp=deps_hash, r12=elaborated_ref, r13=len, r14=scan_idx/chosen_idx, r15=min_ts); pure leaf (no nested CALL) so no sub-rsp pad is needed. Guards: elaborated_ref != 0 (SCC_ERR_NULL_REF 0x6503); len != 0 (SCC_ERR_ZERO_LEN 0x6504). Phase A free scan: r14 = 0; loop cmp r14,32; jae scc_in_lru_init; compute slot_addr = &_sc_entries + (r14<<6); load flags u32 at [slot+4]; cmp 1; jne scc_in_free_found (slot is free -- flags != LIVE); add r14, 1; jmp. Free-found: r11 = 1 (is_fresh); jmp write. Phase B LRU scan: initialise r11 = 0 (is_fresh = 0, we are evicting); seed min_ts from slot[0] timestamp at [+40]; r15 = min_ts; set chosen_idx = 0; r14 = 1; loop over r14=1..32: compute slot_addr; load timestamp u64 at [+40]; cmp r15; jae scc_in_lru_advance; mov r15, ts; mov chosen = r14; advance; done -> jmp write. Write path: slot_addr = &_sc_entries + (chosen_idx<<6); write magic 'SCCA' 0x41434353 at [+0] via mov_d; write flags = 1 (LIVE) at [+4] via mov_d; write source_hash (rbx) at [+8]; deps_hash (rbp) at [+16]; elaborated_ref (r12) at [+24]; len (r13) at [+32]; rdtsc + shl rdx,32 + or rax,rdx; store at [+40]; cache_key_inline[16] at [+48]: write source_hash (rbx) at [+48] and deps_hash (rbp) at [+56] as raw bytes. If is_fresh == 1 (r11 == 1), bump _sc_entry_count; else no bump (eviction preserves count). Return SCC_OK via xor rax, rax. All cmp immediates (0, 1, 32, status codes 0x6503/0x6504, magic 0x41434353) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. No test; no and-imm64; no imul-r-imm (stride via shl 6); no multiline let; no three-term addressing (slot_addr precomputed via add). Labels prefixed scc_in_.",
+      block: {
+        // ---- Prologue -------------------------------------------------
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Guard: elaborated_ref != 0.
+        cmp rdx, 0;
+        je  scc_in_null_ref;
+
+        // ---- Guard: len != 0.
+        cmp rcx, 0;
+        je  scc_in_zero_len;
+
+        // ---- Stash args in callee-saves.
+        mov rbx, rdi;                   // source_hash
+        mov rbp, rsi;                   // deps_hash
+        mov r12, rdx;                   // elaborated_ref
+        mov r13, rcx;                   // len
+
+        // -----------------------------------------------------------
+        // Phase A -- scan for a free slot (flags.LIVE != 1).
+        // r14 iterates 0..32.
+        // -----------------------------------------------------------
+        xor r14, r14;
+
+      scc_in_free_scan:
+        cmp r14, 32;                    // SCC_POOL_SLOTS
+        jae scc_in_lru_init;
+
+        // slot_addr = &_sc_entries + (r14 << 6)
+        mov r10, r14;
+        shl r10, 6;                     // SCC_SLOT_IDX_SHIFT
+        lea r11, [rip + _sc_entries];
+        add r11, r10;
+        mov r8, r11;                    // r8 = slot_addr
+
+        // Load flags u32 at [slot+4]; free iff value != 1.
+        xor r9, r9;
+        mov_d r9, [r8 + 4];
+        cmp r9, 1;                      // SCC_FLAG_LIVE
+        jne scc_in_free_found;
+
+        add r14, 1;
+        jmp scc_in_free_scan;
+
+      scc_in_free_found:
+        // r14 holds chosen_idx; is_fresh = 1.
+        mov r11, 1;
+        jmp scc_in_write;
+
+        // -----------------------------------------------------------
+        // Phase B -- LRU scan over all 32 slots. Seed min_ts from
+        // slot[0]'s timestamp; chosen_idx starts at 0; iterate r14
+        // from 1..32 picking the smaller timestamp.
+        // -----------------------------------------------------------
+      scc_in_lru_init:
+        // chosen_idx = 0.
+        xor r14, r14;
+
+        // Seed min_ts = slot[0].timestamp_us at [_sc_entries + 40].
+        lea r11, [rip + _sc_entries];
+        mov r15, [r11 + 40];            // r15 = min_ts
+
+        // is_fresh = 0 (we're evicting; entry_count stays put).
+        xor r11, r11;
+
+        // Start LRU scan at i = 1.
+        mov r9, 1;                      // r9 = i (loop index for phase B)
+
+      scc_in_lru_scan:
+        cmp r9, 32;                     // SCC_POOL_SLOTS
+        jae scc_in_write;
+
+        // slot_addr = &_sc_entries + (r9 << 6)
+        mov r10, r9;
+        shl r10, 6;                     // SCC_SLOT_IDX_SHIFT
+        lea rax, [rip + _sc_entries];
+        add rax, r10;
+        mov r8, rax;                    // r8 = slot_addr
+
+        // Load timestamp u64 at [slot+40].
+        mov rax, [r8 + 40];
+        cmp rax, r15;
+        jae scc_in_lru_advance;
+
+        // New minimum.
+        mov r15, rax;
+        mov r14, r9;
+
+      scc_in_lru_advance:
+        add r9, 1;
+        jmp scc_in_lru_scan;
+
+        // -----------------------------------------------------------
+        // Write path. r14 = chosen slot idx (0..31); r11 = is_fresh
+        // (1 iff slot was previously empty).
+        // -----------------------------------------------------------
+      scc_in_write:
+        // slot_addr = &_sc_entries + (r14 << 6)
+        mov r10, r14;
+        shl r10, 6;                     // SCC_SLOT_IDX_SHIFT
+        lea rax, [rip + _sc_entries];
+        add rax, r10;
+        mov r8, rax;                    // r8 = chosen slot_addr
+
+        // Magic 'SCCA' at [+0].
+        mov rax, 0x41434353;            // SCC_RECORD_MAGIC
+        mov_d [r8 + 0], rax;
+
+        // Flags = SCC_FLAG_LIVE (1) at [+4].
+        mov rax, 1;
+        mov_d [r8 + 4], rax;
+
+        // source_hash at [+8].
+        mov [r8 + 8], rbx;
+
+        // deps_hash at [+16].
+        mov [r8 + 16], rbp;
+
+        // elaborated_ref at [+24].
+        mov [r8 + 24], r12;
+
+        // len at [+32].
+        mov [r8 + 32], r13;
+
+        // rdtsc timestamp at [+40].
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        mov [r8 + 40], rax;
+
+        // cache_key_inline[16] at [+48]: raw bytes of (source_hash,
+        // deps_hash) packed as two u64 LE stores.
+        mov [r8 + 48], rbx;
+        mov [r8 + 56], rbp;
+
+        // If is_fresh (r11 == 1), bump _sc_entry_count.
+        cmp r11, 1;
+        jne scc_in_no_bump;
+        lea r9, [rip + _sc_entry_count];
+        mov rax, [r9];
+        add rax, 1;
+        mov [r9], rax;
+
+      scc_in_no_bump:
+        xor rax, rax;                   // SCC_OK
+        jmp scc_in_epilogue;
+
+      scc_in_null_ref:
+        mov rax, 0x6503;                // SCC_ERR_NULL_REF
+        jmp scc_in_epilogue;
+
+      scc_in_zero_len:
+        mov rax, 0x6504;                // SCC_ERR_ZERO_LEN
+        jmp scc_in_epilogue;
+
+      scc_in_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _sc_invalidate(source_hash) -> errno
+  //
+  //   rdi = source_hash
+  //   rax = SCC_OK (0)
+  //
+  // Scan the 32-slot pool; for every row whose magic == 'SCCA', LIVE
+  // bit set, source_hash matches, zero the magic + flags fields and
+  // decrement _sc_entry_count. Returns SCC_OK (0). The elaborated_
+  // body_ref payload is NOT scrubbed (the module owns no finalizer;
+  // the caller is responsible for releasing the underlying storage).
+  //
+  // Pure leaf -- 3 callee-save pushes (rbx, rbp, r12); no nested CALL.
+  //
+  // Labels prefixed scc_iv_.
+  // ==========================================================================
+  pub let _sc_invalidate : (u64) -> u64 !{mem} @{} =
+    fn (source_hash: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M7 (#2709): _sc_invalidate clears every slot whose magic == 'SCCA' AND flags.LIVE == 1 AND source_hash matches rbx. A given source may have multiple deps_hash rows cached (one per import graph configuration); all matching rows are cleared. 3 callee-save pushes (rbx=source_hash, rbp=scan_idx, r12=cleared_count); pure leaf (no nested CALL) so no sub-rsp pad is needed. r12 counts how many entries were cleared so we can decrement _sc_entry_count by that count at the end. Scan loop: cmp rbp, 32; jae done; slot_addr = &_sc_entries + (rbp << 6); load magic u32 at [+0]; cmp 0x41434353; jne advance; load flags u32 at [+4]; cmp 1 (LIVE); jne advance; load source_hash u64 at [+8]; cmp rbx; jne advance. On full match: zero magic at [+0] via mov_d; zero flags at [+4] via mov_d; add r12, 1. Advance: add rbp, 1; jmp loop. Done: decrement _sc_entry_count by r12 via `lea r11, [rip + _sc_entry_count]; mov rax, [r11]; sub rax, r12; mov [r11], rax`. Return SCC_OK via xor rax, rax. All cmp immediates (0, 1, 32, magic 0x41434353) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. No test; no and-imm64; no imul-r-imm (stride via shl 6); no multiline let; no three-term addressing. Labels prefixed scc_iv_.",
+      block: {
+        // ---- Prologue -------------------------------------------------
+        push rbx;
+        push rbp;
+        push r12;
+
+        // ---- Stash args; reset counters.
+        mov rbx, rdi;                   // source_hash
+        xor rbp, rbp;                   // scan_idx = 0
+        xor r12, r12;                   // cleared_count = 0
+
+      scc_iv_scan:
+        cmp rbp, 32;                    // SCC_POOL_SLOTS
+        jae scc_iv_done;
+
+        // slot_addr = &_sc_entries + (rbp << 6)
+        mov r10, rbp;
+        shl r10, 6;                     // SCC_SLOT_IDX_SHIFT
+        lea r11, [rip + _sc_entries];
+        add r11, r10;
+        mov r8, r11;                    // r8 = slot_addr
+
+        // Load magic u32 at [+0].
+        xor r9, r9;
+        mov_d r9, [r8 + 0];
+        cmp r9, 0x41434353;             // SCC_RECORD_MAGIC
+        jne scc_iv_advance;
+
+        // Load flags u32 at [+4]; require LIVE.
+        xor r9, r9;
+        mov_d r9, [r8 + 4];
+        cmp r9, 1;                      // SCC_FLAG_LIVE
+        jne scc_iv_advance;
+
+        // Load source_hash u64 at [+8]; compare to rbx.
+        mov r9, [r8 + 8];
+        cmp r9, rbx;
+        jne scc_iv_advance;
+
+        // Clear magic + flags (zero both u32s).
+        xor rax, rax;
+        mov_d [r8 + 0], rax;
+        mov_d [r8 + 4], rax;
+        add r12, 1;
+
+      scc_iv_advance:
+        add rbp, 1;
+        jmp scc_iv_scan;
+
+      scc_iv_done:
+        // Decrement _sc_entry_count by r12.
+        cmp r12, 0;
+        je  scc_iv_no_dec;
+        lea r11, [rip + _sc_entry_count];
+        mov rax, [r11];
+        sub rax, r12;
+        mov [r11], rax;
+
+      scc_iv_no_dec:
+        xor rax, rax;                   // SCC_OK
+
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _sc_stats(out_stats_ptr) -> status
+  //
+  //   rdi = out_stats_ptr
+  //   rax = SCC_OK (0) on success; SCC_ERR_BAD_PTR (0x6500) on null.
+  //
+  // Write a 64-byte SCCS stats record to the caller's buffer.
+  // Layout:
+  //   [+0]  u32  magic         = 'SCCS' (0x53434353 LE)
+  //   [+4]  u16  version       = 1
+  //   [+6]  u16  reserved      = 0
+  //   [+8]  u64  entry_count   = _sc_entry_count
+  //   [+16] u64  hit_count     = _sc_hit_count
+  //   [+24] u64  miss_count    = _sc_miss_count
+  //   [+32] u64  capacity      = SCC_POOL_SLOTS (= 32)
+  //   [+40] u8[24] reserved    = 0
+  //
+  // Pure leaf -- 1 callee-save push (rbx); no nested CALL.
+  //
+  // Labels prefixed scc_st_.
+  // ==========================================================================
+  pub let _sc_stats : (u64) -> u64 !{mem} @{} =
+    fn (out_stats_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M7 (#2709): _sc_stats writes a 64-byte SCCS record to the caller's buffer. 1 callee-save push (rbx=out_stats_ptr); pure leaf (no nested CALL) so no sub-rsp pad is needed. Guard: out_stats_ptr != 0 (cmp rdi, 0; je scc_st_bad_ptr). After guard: stash in rbx. Zero-fill 64 B at [rbx, rbx+64) via eight u64 stores at displacements 0, 8, 16, 24, 32, 40, 48, 56 with rax = 0. Write magic 'SCCS' 0x53434353 u32 at [+0] via mov_d. Write version u16 = 1 at [+4] via mov_w (two-byte store). Reserved_6 u16 and reserved_40 u8[24] stay zero from zero-fill. Load _sc_entry_count via `lea r11, [rip + _sc_entry_count]; mov rax, [r11]`; store at [+8]. Load _sc_hit_count; store at [+16]. Load _sc_miss_count; store at [+24]. Write capacity u64 = 32 at [+32] via `mov rax, 32; mov [rbx + 32], rax`. Return SCC_OK via xor rax, rax. All cmp immediates (0, 1, 32, status 0x6500, magic 0x53434353) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. No test; no and-imm64; no imul-r-imm; no multiline let; no three-term addressing. Labels prefixed scc_st_.",
+      block: {
+        // ---- Prologue -------------------------------------------------
+        push rbx;
+
+        // ---- Guard: out_stats_ptr != 0.
+        cmp rdi, 0;
+        je  scc_st_bad_ptr;
+
+        mov rbx, rdi;                   // out_stats_ptr
+
+        // ---- Zero-fill 64 B via eight u64 stores.
+        xor rax, rax;
+        mov [rbx + 0], rax;
+        mov [rbx + 8], rax;
+        mov [rbx + 16], rax;
+        mov [rbx + 24], rax;
+        mov [rbx + 32], rax;
+        mov [rbx + 40], rax;
+        mov [rbx + 48], rax;
+        mov [rbx + 56], rax;
+
+        // ---- Magic 'SCCS' u32 at [+0].
+        mov rax, 0x53434353;            // SCC_STATS_MAGIC
+        mov_d [rbx + 0], rax;
+
+        // ---- Version u16 = 1 at [+4].
+        mov rax, 1;                     // SCC_STATS_VERSION
+        mov_w [rbx + 4], rax;
+
+        // ---- entry_count u64 at [+8].
+        lea r11, [rip + _sc_entry_count];
+        mov rax, [r11];
+        mov [rbx + 8], rax;
+
+        // ---- hit_count u64 at [+16].
+        lea r11, [rip + _sc_hit_count];
+        mov rax, [r11];
+        mov [rbx + 16], rax;
+
+        // ---- miss_count u64 at [+24].
+        lea r11, [rip + _sc_miss_count];
+        mov rax, [r11];
+        mov [rbx + 24], rax;
+
+        // ---- capacity u64 = SCC_POOL_SLOTS (32) at [+32].
+        mov rax, 32;                    // SCC_POOL_SLOTS
+        mov [rbx + 32], rax;
+
+        // ---- Return SCC_OK.
+        xor rax, rax;
+        jmp scc_st_epilogue;
+
+      scc_st_bad_ptr:
+        mov rax, 0x6500;                // SCC_ERR_BAD_PTR
+        jmp scc_st_epilogue;
+
+      scc_st_epilogue:
+        pop rbx;
+        ret;
+      }
+    }
+
+}

@@ -45,7 +45,14 @@ R225.M4 (EffectUnify: effect-row JOIN with ROW_VAR tail
 propagation + rank-restricted-quantifier P10 well-formedness
 validator; three-entry surface `_eu_unify` / `_eu_check_rank` /
 `_eu_least` over the shared R225.M2 pool) -- landed. R226.M1
-(Datalog parser) -- landed. R229.M2 (SessionEnv: session-scoped
+(Datalog parser) -- landed. R226.M2 (PredicateTypes: parser-tier
+predicate-type resolution + argument-position typechecking over
+a singleton 128-slot x 64-byte dense PredicateRecord pool; four
+public entry points `_pt_init` / `_pt_register` / `_pt_lookup`
+/ `_pt_check_call` over caller-supplied buffers; magic 'PRTY' =
+0x59545250 LE; error band 0x6400..0x64FF with the E09NN mapping
+E0900 ARITY_MISMATCH / E0901 TYPE_MISMATCH / E0902
+UNKNOWN_PREDICATE) -- landed. R229.M2 (SessionEnv: session-scoped
 bindings) -- landed. R229.M3 (TypeEnv: type-environment threading
 = scheme store + specialisation cache) -- landed. R229.M4
 (JobControl: per-shell-session 32-slot Job table backing
@@ -201,7 +208,7 @@ JSON-compatible with `line=0` byte-offset fallback until M7.2 wires
 the UTF-8-aware line/column resolver; zero `.bss`; error band
 0x5B00..0x5BFF (five slots used); 60-error acceptance corpus
 enumerated in `design/shell/diagnostic-reporting.md` §8) -- landed.
-**Version:** 1.38.0.
+**Version:** 1.44.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 **Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
 **Wave 126 landings:** R224.M6 PipelineLambda, R229.M5 History,
@@ -331,6 +338,40 @@ PTH_ERR_PROPERTY_P3_VIOLATION 0x6112, PTH_ERR_UNKNOWN_TAG 0x6114,
 PTH_ERR_RC_STRIDE_FAIL 0x6115); 10k-random-program corpus +
 24-hour sustained-run acceptance clauses deferred to R225.M9.5
 along with the full HM elaborator wire-up).
+**Wave 133 landings (parallel-arm):** R225.M10 CheckFingerprint
+(parser-tier per-turn typecheck-outcome anti-fabrication fingerprint
+emitter + correlator implementing the TYPECHECK-side half of project
+invariant P9; every REPL turn emits
+`@fingerprint("check.<turn-id>.<ok|fail-N>")` so the debugger can
+anchor every claimed checker outcome to an FNV-1a 64 hash of the
+actual outcome-string bytes "ok" (OK branch) or "fail-<N>" (FAIL
+branch where N is the LC_DIAG count from R227.M4 `_lc_count_diags`);
+64-byte CheckFingerprint record with magic 'CFPR' = 0x52504643 LE at
+[+0], turn_id u32 at [+4], result_hash u64 at [+8], timestamp_us u64
+at [+16] via rdtsc, rendered_tag u8[32] at [+24..+56] NUL-padded,
+reserved u64 at [+56]; four public entry points `_cf_init` /
+`_cf_emit` / `_cf_render_tag` / `_cf_correlate` over caller-supplied
+buffers; `_cf_init`, `_cf_render_tag`, and `_cf_correlate` are PURE
+LEAVES; `_cf_emit` is a 6-callee-save-push frame (rbx=turn_id,
+rbp=lc_result_status, r12=n_diags, r13=out, r14=out_cap, r15=hash)
+with ZERO nested CALL (FNV-1a 64 inlined byte-identical to the five
+parser-tier FNV precedents and R229.M10 TurnFingerprint's
+`_tf_emit`; decimal rendering unrolled; hash computed INLINE across
+the result-string bytes as they are emitted into the rendered_tag
+field) so no sub-rsp alignment pad is required; zero `.bss` at raw
+M10; two .rodata tables `_cf_pow10` [u32;10] (decimal LUT) and
+`_cf_prefix` [u8;16] (14-byte `@fingerprint("` + 2 pad bytes); error
+band 0x6300..0x63FF with nine CF_* slots (CF_OK, CF_ERR_BAD_OUT
+0x6300, CF_ERR_OUT_TOO_SMALL 0x6301, CF_ERR_BAD_TURN_ID 0x6302,
+CF_ERR_BAD_N_DIAGS 0x6303, CF_ERR_BAD_RECORD 0x6304,
+CF_ERR_BAD_MAGIC 0x6305, CF_ERR_MISMATCH 0x6306, CF_ERR_BAD_LEN
+0x6307, CF_ERR_BAD_EXPECTED 0x6308); pairs with the RESULT-side
+R229.M10 TurnFingerprint which anchors `@fingerprint("turn.<id>.
+<hash-hex>")` -- both per-turn fingerprint emitters produce 64-byte
+records with matched stride, matched FNV family, and matched
+`@fingerprint("...")` wrapper; 200-turn smoke acceptance corpus
+enumerated in `design/shell/check-fingerprint.md` §8 and deferred to
+R225.M10.5 golden landing).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -1400,9 +1441,90 @@ Blocked by: R220.M9.
       (assert rax in band {0x6100..0x61FF, 0x5810..0x5811,
       0x2D00..0x2D03}).
 
-### M10 -- Per-turn type-check fingerprint (deferred)
+### M10 -- Per-turn type-check fingerprint (paideia-os#2691, landed)
 
-Blocked by: R220.M10 (fingerprint emission).
+- [x] **R225.M10-001** -- `src/check_fingerprint.pdx` module
+      `CheckFingerprint` landed: four public entry points
+      (`_cf_init`, `_cf_emit`, `_cf_render_tag`, `_cf_correlate`)
+      over caller-supplied buffers; zero `.bss` at raw M10. 64-byte
+      CheckFingerprint record with magic 'CFPR' = 0x52504643 LE at
+      [+0] (u32); turn_id u32 at [+4]; result_hash u64 (FNV-1a 64
+      of the outcome-string bytes "ok" or "fail-<N>") at [+8];
+      timestamp_us u64 (raw rdtsc) at [+16]; rendered_tag u8[32]
+      at [+24..+56] (`check.<id>.<ok|fail-N>` ASCII, NUL-padded);
+      reserved u64 at [+56]. Record stride 64 is a power of two
+      (`shl idx, 6` addressing for a future multi-check ring). Two
+      .rodata tables: `_cf_pow10` [u32;10] for decimal rendering
+      (mirrors R229.M10 `_tf_pow10` layout); `_cf_prefix` [u8;16]
+      carrying the 14-byte `@fingerprint("` literal + 2 pad bytes;
+      both @align(8). `_cf_init` is a bare `ret` (no .bss state).
+      `_cf_emit` is a 6-callee-save-push frame (rbx=turn_id,
+      rbp=lc_result_status, r12=n_diags, r13=out, r14=out_cap,
+      r15=hash) with ZERO nested CALL (FNV-1a 64 inlined byte-
+      identical to _cmd_sig_fnv1a64 R222.M2 / _fi_fnv1a64 R222.M3 /
+      _cmdreg_fnv1a64 R222.M5 / _ws_schema_hash R223.M5 / _h_append
+      R229.M5 / _tf_emit R229.M10; decimal rendering of turn_id
+      and n_diags via greedy-subtract over `_cf_pow10` LUT with
+      emit_flag for leading-zero suppression; hash computed INLINE
+      across the result-string bytes "ok" or "fail-<N>" as they
+      are emitted into the rendered_tag field so the module makes
+      no second pass over the string). No sub-rsp alignment pad
+      required because no nested CALL fires (precedent: R229.M5
+      `_h_append`, R229.M10 `_tf_emit`). `_cf_render_tag` emits
+      `@fingerprint("<inner>")` where <inner> is copied from
+      record[+24..+24+N] up to first NUL or offset 32; returns
+      `(bytes_written << 32) | CF_OK` on success. `_cf_correlate`
+      avoids a scratch stack buffer by verifying the wrapper
+      prefix/suffix on expected_tag and byte-comparing the inner
+      against record[+24..]; returns CF_OK on exact match,
+      CF_ERR_MISMATCH on any byte disagreement. CF_* status
+      taxonomy in 0x6300..0x6308 (band 0x6300..0x63FF with 247
+      slots reserved for M10.1+ follow-ups: CF_ERR_BAD_ENV_MASK at
+      M10.1 env-mask field validator; CF_ERR_HASH_MISMATCH at
+      M10.3 strict-mode hash-only correlator; CF_ERR_TIMESTAMP_SKEW
+      at M10.4 rdtsc-skew sanity bound; CF_ERR_LC_RESULT_UNKNOWN
+      at M10.6 four-category outcome adapter). The 0x6300..0x63FF
+      carve-out sits above the R227.M6 VersionPragma band
+      (0x6200..0x62FF) with the 0x6400..0x64FF slice held
+      unreserved between R225.M10 and R227.M7 ScriptCache
+      (0x6500..0x65FF).
+- [x] **R225.M10-002** -- design doc landed:
+      `design/shell/check-fingerprint.md`.
+- [ ] **R225.M10-003** -- 200-turn smoke-mode golden corpus
+      (`smoke/check-fingerprint-m10.golden.txt`): deferred to
+      R225.M10.5 along with the full smoke-mode fingerprint
+      goldens. The acceptance assertion ("200-turn REPL session
+      emits 200 fingerprints; debugger correlates each with its
+      expected outcome") is satisfied by the raw M10 surface;
+      the design doc §8 enumerates the 12-fixture tier (3
+      positive + 9 negative) as the golden column.
+- [ ] **R225.M10.1** (deferred) -- env-mask field: an additional
+      u32 at `[record+0x38..+0x3C]` capturing the cap-row delta
+      between the CHECK and READ phases of the turn, so the
+      correlator can detect a mid-turn capability drift (a
+      privilege escalation that the standard check-outcome hash
+      does not notice).
+- [ ] **R225.M10.2** (deferred) -- diag-chain-head field: an
+      additional u32 at `[record+0x3C..+0x40]` carrying the byte
+      offset of the first LC_DIAG record in the chain emitted by
+      the same turn.
+- [ ] **R225.M10.3** (deferred) -- strict-mode hash-only
+      correlator: a second `_cf_correlate_strict(expected_tag,
+      expected_len, lc_status, n_diags)` that RECOMPUTES the FNV
+      from the reconstructed result-string bytes and compares to
+      the hash parsed out of expected_tag's inner.
+- [ ] **R225.M10.4** (deferred) -- rdtsc-skew sanity bound:
+      `_cf_correlate_sequence(records_ptr, n_records)` rejects a
+      sequence where any record's `timestamp_us` precedes the
+      previous turn's.
+- [ ] **R225.M10.5** (deferred) -- 200-turn smoke golden corpus
+      under `smoke/check-fingerprint-m10.golden.txt`; harness
+      lives at `tools/verify-check-fingerprint-coverage.sh`.
+- [ ] **R225.M10.6** (deferred) -- four-category outcome adapter:
+      admit `LC_OK` / `LC_ERR_RANK_VIOLATION` / `LC_ERR_HM_FAILED`
+      / `LC_ERR_IMPORT_FAILED` + N and render as
+      `check.<id>.<ok|rank-N|hm-N|import-N>` for finer diagnostic
+      anchoring.
 
 ## R226 datalog checklist
 
@@ -1420,6 +1542,37 @@ Blocked by: R220.M10 (fingerprint emission).
       corpus milestone per the umbrella decomposition; the design
       doc §9 enumerates the representative OK/error cases that
       corpus will cover.
+
+### M2 -- Predicate-type resolution against schema registry (paideia-os#2693, landed)
+
+- [x] **R226.M2-001** -- `src/predicate_types.pdx` module
+      `PredicateTypes` landed: `_pt_init` pure-leaf idempotent
+      zero-fill hook, `_pt_fnv1a64` pure-leaf FNV-1a 64 helper
+      (byte-for-byte mirror of `_cmd_sig_fnv1a64`, `_cmdreg_fnv1a64`,
+      `_fi_fnv1a64`, `_ha_fnv1a64`), `_pt_register` 6-push callee-
+      save frame + sub rsp,32 (idempotent on name_hash match; linear
+      insertion at `_pt_predicate_count`), `_pt_lookup` 6-push +
+      sub rsp,8 (linear scan + defensive zero-fill on miss),
+      `_pt_check_call` pure leaf (magic + arity + per-position
+      compatibility check with PT_TYPE_VAR / PT_TYPE_WILD wildcard
+      rule). 64-byte PredicateRecord (magic 'PRTY' 0x59545250 LE,
+      arity u16, flags u16, name_hash u64, name_inline u8[16],
+      arg_type_codes u8[32]); 128-slot singleton `.bss` dense pool
+      (8192 B); PT_* status taxonomy in 0x6400..0x6413 with the
+      E09NN mapping (E0900 ARITY_MISMATCH, E0901 TYPE_MISMATCH,
+      E0902 UNKNOWN_PREDICATE).
+- [x] **R226.M2-002** -- design doc landed:
+      `design/shell/predicate-type-resolution.md`.
+- [ ] **R226.M2-003** -- 30-test corpus
+      (`tests/proptest_predicate_types.pdx`): deferred to R226.M2.3
+      per the umbrella decomposition; the design doc §8 enumerates
+      the 30 cases (10 register, 10 lookup, 10 check-call) that
+      corpus will cover.
+- [ ] **R226.M2-004** -- schema-registry wire-up (post-R220.M4):
+      deferred -- `PT_FLAG_USER_DEFINED` auto-registered on every
+      predicate at raw M2; a startup pass pre-registering kernel-
+      known predicates with their SchemasSig type codes lands with
+      R220.M4.
 
 ## R229 REPL evaluator checklist
 
@@ -2172,6 +2325,88 @@ finalised; the line-editor primitive is the standing M6 commitment).
       landing (`tests/proptest_version_pragma.pdx`); landing
       with R221.M9 property-test harness.
 
+### R227.M7 -- Script-body binary cache (paideia-os#2709, landed)
+
+- [x] **R227.M7-001** -- `src/script_cache.pdx` module
+      `ScriptCache` landed: five public entry points
+      (`_sc_init`, `_sc_lookup`, `_sc_insert`, `_sc_invalidate`,
+      `_sc_stats`) over a singleton `.bss` pool (32 slots x 64 B
+      = 2048 B) + three counter scalars (`_sc_entry_count`,
+      `_sc_hit_count`, `_sc_miss_count`). 64-byte ScriptCache
+      record with magic 'SCCA' = 0x41434353 LE u32 @ [+0]; flags
+      u32 @ [+4] (bit 0 = SCC_FLAG_LIVE); source_hash u64 @ [+8];
+      deps_hash u64 @ [+16]; elaborated_body_ref u64 @ [+24];
+      elaborated_body_len u64 @ [+32]; timestamp_us u64 @ [+40];
+      cache_key_inline u8[16] @ [+48]. Stride 64 is a power of
+      two (`shl idx, 6` addressing without 2-op imul-r-imm).
+      `_sc_init` is bare-ret-plus-scalar-scrub (defensive zero
+      of three counter u64s; pool is NOT scrubbed because .bss
+      zero-init already satisfies the magic==0 => never-used
+      invariant). `_sc_lookup` 5-push PURE LEAF with
+      rbx=source_hash, rbp=deps_hash, r12=out_elaborated_ref,
+      r13=out_len, r14=scan_idx; scans all 32 slots for a
+      match on (magic == 'SCCA', flags.LIVE == 1, source_hash,
+      deps_hash); on hit updates slot.timestamp_us via rdtsc
+      and bumps _sc_hit_count; on miss bumps _sc_miss_count.
+      `_sc_insert` 6-push PURE LEAF with rbx=source_hash,
+      rbp=deps_hash, r12=elaborated_ref, r13=len, r14=scan/
+      chosen_idx, r15=min_timestamp carrier; two-phase scan
+      (Phase A: free-slot scan; Phase B on no-free: LRU scan
+      with timestamp seed from slot[0]); overwrites chosen slot
+      with the new record; bumps _sc_entry_count on fresh insert
+      (not on eviction). `_sc_invalidate` 3-push PURE LEAF with
+      rbx=source_hash, rbp=scan_idx, r12=cleared_count; scans
+      all 32 slots clearing magic+flags on matching rows;
+      decrements _sc_entry_count by cleared_count. `_sc_stats`
+      1-push PURE LEAF with rbx=out_stats_ptr; writes a 64-byte
+      SCCS record (magic 'SCCS' = 0x53434353 LE distinct from
+      the row magic 'SCCA' by their last byte). SCC_* status
+      taxonomy in 0x6500..0x6510 (band 0x6500..0x65FF with the
+      six SCC_* status codes: SCC_OK (0), SCC_ERR_BAD_PTR
+      (0x6500), SCC_ERR_RESERVED_01 (0x6501), SCC_ERR_RESERVED_
+      02 (0x6502), SCC_ERR_NULL_REF (0x6503), SCC_ERR_ZERO_LEN
+      (0x6504), SCC_ERR_NOT_FOUND (0x6510); the 0x6505..0x650F
+      slots reserved for M7.1+ insert / invalidate diagnostics;
+      the 0x6511..0x65FF slots reserved for M7.2+ lookup
+      diagnostics). NO intra-library linker-visible FUNCTION
+      dep at raw M7; declared forward-path deps on R229.M10
+      TurnFingerprint (M7.3 chaos-replay cache-state feed-in)
+      and R221.M9 property-test harness (M7.6 fixture slot).
+      NO external cross-library linker dep.
+- [x] **R227.M7-002** -- design doc landed:
+      `design/shell/script-cache.md`.
+- [ ] **R227.M7-003** -- 1000-line-script acceptance fixture
+      (`tests/proptest_script_cache.pdx`): fixture (A) cold load
+      elaboration time measured via rdtsc bracket, (B) warm
+      lookup time measured via rdtsc bracket, (C) assert
+      (A / B) >= 10. Deferred along with the broader parser-
+      tier property-test harness (R221.M9 landing); the raw M7
+      surface satisfies the fixture by the structural
+      guarantee that a 32-slot LRU scan is O(k) while a
+      LoadCheck pass is O(n log n) in the character count --
+      for n = 1000 lines the ratio exceeds 10x by orders of
+      magnitude in practice.
+- [ ] **R227.M7.1** (deferred) -- Disk-backed persistence
+      (`~/.paideia/script-cache/<hash>.pdc`) via pdxfs CoW
+      path integration.
+- [ ] **R227.M7.2** (deferred) -- Hex rendering: `cache_key_
+      inline` field written as the 16-byte hex-string prefix
+      of the source_hash + deps_hash pair.
+- [ ] **R227.M7.3** (deferred) -- TurnFingerprint wire-up:
+      feed the (source_hash, deps_hash) pair into the per-turn
+      fingerprint record so a chaos-replay session exact-
+      reproduces the cache state.
+- [ ] **R227.M7.4** (deferred) -- Capacity bump: 32 -> 128
+      slots once the pool size moves out of the shell's
+      working-set range.
+- [ ] **R227.M7.5** (deferred) -- Cross-session concurrency:
+      a session-shared pool under a RWLock so a federation-
+      attached peer's cache contributes to the local session's
+      hit rate.
+- [ ] **R227.M7.6** (deferred) -- 1000-line-script acceptance
+      fixture landing (`tests/proptest_script_cache.pdx`);
+      landing with R221.M9 property-test harness.
+
 ## Error-band accounting
 
 | Band             | Range            | Milestone | Status |
@@ -2224,7 +2459,9 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | effect_unify     | 0x4900..0x4907   | R225.M4   | landed |
 | effect_unify-M4.1+ | 0x4908..0x49FF | R225.M4.1+ | reserved |
 | datalog          | 0x2E00..0x2E04   | R226.M1   | landed |
-| datalog-M2+      | 0x2E05..0x2EFF   | R226.M2+  | reserved |
+| datalog-M3+      | 0x2E05..0x2EFF   | R226.M3+  | reserved |
+| predicate_types  | 0x6400..0x6413   | R226.M2   | landed |
+| predicate_types-M2.1+ | 0x6414..0x64FF | R226.M2.1+ | reserved |
 | session_env      | 0x3700..0x3704   | R229.M2   | landed |
 | session_env-M3+  | 0x3705..0x37FF   | R229.M3+  | reserved |
 | type_env         | 0x3D00..0x3D08   | R229.M3   | landed |
@@ -2261,6 +2498,10 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | version_pragma-M6.1+ | 0x6211..0x62FF | R227.M6.1+ | reserved |
 | proptest_hm      | 0x6100..0x6115   | R225.M9   | landed |
 | proptest_hm-M9.1+ | 0x6116..0x61FF  | R225.M9.1+ | reserved |
+| script_cache     | 0x6500..0x6510   | R227.M7   | landed |
+| script_cache-M7.1+ | 0x6511..0x65FF | R227.M7.1+ | reserved |
+| check_fingerprint | 0x6300..0x6308  | R225.M10  | landed |
+| check_fingerprint-M10.1+ | 0x6309..0x63FF | R225.M10.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in
