@@ -1,0 +1,722 @@
+// src/kernel/core/pds/container_reader.pdx -- UMB-W26 R133.M1 (paideia-os #2620)
+//
+// `.pds` BINARY CONTAINER reader.
+//
+// R227.M1 (Wave 112, paideia-os#2703) landed the HEADER PRAGMA parser --
+// a TEXTUAL layer that consumes `#pragma pds <directive>` lines at the
+// top of a human-authored `.pds` source file. R133 is the COMPLEMENTARY
+// BINARY layer: once a `.pds` source has been compiled by the paideia-
+// shell toolchain, it is stored on disk as a fixed-shape container
+// holding a 16-byte header plus up to 32 sections (text / rodata /
+// capability-declaration / signature / metadata). THIS file is the
+// pure, side-effect-free container READER. It validates the magic +
+// version, bounds-checks every section, and emits a packed array of
+// 32-byte SectionHeader records suitable for the R131 pds-loader
+// (future milestone) to walk and dispatch.
+//
+// =============================================================================
+// SECTION 0  SCOPE
+// =============================================================================
+//
+// R133.M1 subset -- container header + section-header stream only. Later
+// milestones (M2+) layer on:
+//
+//   M2  Signature verification (walk CT_SEC_SIGNATURE against the
+//       capability-signing root key established in R63).
+//   M3  Capability-declaration decoding (walk CT_SEC_CAPS_DECL into a
+//       KIND_CAP_ENV row via cap_env_from_decl).
+//   M4  Text-section loader entry point (walk CT_SEC_TEXT bytes into
+//       a KIND_CMD_MODULE row via cmd_module_open_from_pds).
+//   M5  Hot-reload integration (follow the R123.M6 UMB-W8 shadow-table
+//       pattern once sections swap live).
+//
+// This parser is PURE: it consumes a byte range, emits an array of
+// 32-byte SectionHeader records into a caller-provided buffer, and
+// returns a packed u64 of (count << 32) | status. It performs NO
+// allocation, NO VFS traffic, NO klog chatter, and NO capability
+// lookup. All enforcement sites (version gating, signature verification,
+// capability-env binding) live downstream in R131/R133 M2+.
+//
+// This file is DISTINCT from `src/kernel/core/pds/header_pragma.pdx`
+// (R227.M1): THAT parser consumes `.pds` SOURCE bytes (ASCII pragma
+// lines) at the start of a source file; THIS parser consumes compiled
+// `.pds` CONTAINER bytes (binary header + sections). The two layers
+// never see each other's bytes; a `.pds` file is EITHER source (with
+// pragmas) OR a compiled container (with magic 'PDSC'). The toolchain
+// chooses based on the first 4 bytes.
+//
+// This file is MODELLED after `src/kernel/core/shell/cmd_registry_
+// parser.pdx` (UMB-W4 R123.M2, Wave 87) and the R227.M1 header_pragma
+// pattern: five callee-save pushes, pure-leaf discipline (no nested
+// calls, so rsp alignment inside the body is relaxed), packed u64
+// return with status in the low word and count/offset in the high word.
+//
+// =============================================================================
+// SECTION 1  CONTAINER LAYOUT
+// =============================================================================
+//
+// A `.pds` container is laid out on disk as:
+//
+//     +--------------------------------------------------------+
+//     | ContainerHeader (16 bytes)                             |
+//     |   [0..4]   magic         u32 = 0x50445343 ('PDSC')     |
+//     |   [4..8]   version       u32 = 1                       |
+//     |   [8..12]  n_sections    u32   (0..CT_MAX_SECTIONS=32) |
+//     |   [12..16] reserved      u32   zero at M1              |
+//     +--------------------------------------------------------+
+//     | SectionHeader[0] (32 bytes)                            |
+//     | SectionHeader[1] (32 bytes)                            |
+//     |   ...                                                  |
+//     | SectionHeader[n-1] (32 bytes)                          |
+//     +--------------------------------------------------------+
+//     | Section payload bytes (indexed by section.offset)      |
+//     |   ...                                                  |
+//     +--------------------------------------------------------+
+//
+// Each SectionHeader is a fixed 32-byte record:
+//
+//     byte [ 0.. 4]  kind     u32   CT_SEC_* ordinal (SECTION 2)
+//     byte [ 4.. 8]  offset   u32   bytes from container start
+//     byte [ 8..12]  size     u32   payload byte count
+//     byte [12..16]  flags    u32   per-kind semantics (M1: zero)
+//     byte [16..32]  name     u8[16] human mnemonic, NUL-padded
+//
+// Invariants enforced at parse time:
+//
+//   (I1) buf_len >= 16                 (header fits)
+//   (I2) magic == 0x50445343           (fits imm32; bit 31 clear)
+//   (I3) version == 1                  (M1 pins v1; later milestones
+//                                        gate on >1 via BAD_VERSION)
+//   (I4) n_sections <= CT_MAX_SECTIONS (32)
+//   (I5) buf_len >= 16 + n_sections*32 (section-header stream fits)
+//   (I6) per section i: offset + size <= buf_len
+//                                       (payload fits; 64-bit add
+//                                        prevents u32 overflow since
+//                                        both operands are zero-ext
+//                                        from u32)
+//   (I7) out_cap >= n_sections*32      (caller buffer has room)
+//
+// A failure at any invariant surfaces as the corresponding CT_ERR_*
+// code in SECTION 3. I1/I2/I3/I4/I5 fire BEFORE any output byte is
+// written. I6 may fire mid-loop; sections 0..i-1 have already been
+// written to the caller buffer at that point and the returned count
+// in the packed u64 is UNDEFINED on error (callers inspect `status`,
+// not `count`, on non-zero return). I7 fires at the capacity check
+// AT THE START (before any section writes); when it fires, no out
+// bytes are touched.
+//
+// =============================================================================
+// SECTION 2  SECTION KINDS
+// =============================================================================
+//
+// Five section kinds at M1. Downstream parsers in R131/R133 M2+ bind
+// enforcement semantics to each; the container reader is agnostic.
+//
+//   CT_SEC_TEXT      = 1    Compiled paideia-shell command bytecode.
+//                           Payload: KIND_CMD_MODULE-shaped bytes.
+//                           Future: cmd_module_open_from_pds decodes.
+//   CT_SEC_RODATA    = 2    Read-only data referenced by TEXT.
+//                           Payload: raw bytes; alignment-naive at M1.
+//                           Future: schema-registry digest check.
+//   CT_SEC_CAPS_DECL = 3    Capability declaration bundle.
+//                           Payload: KIND_CAP_ENV wire record.
+//                           Future: cap_env_from_decl materialises.
+//   CT_SEC_SIGNATURE = 4    Ed25519 signature over the container
+//                           prefix (header + all sections except
+//                           SIGNATURE itself).
+//                           Payload: 64-byte raw signature + 32-byte
+//                           public-key fingerprint; total 96 bytes.
+//                           Future: R133.M2 pds-sign-verify checks.
+//   CT_SEC_META      = 5    Freeform metadata (author, build time,
+//                           source-file digest, pragma snapshot).
+//                           Payload: UTF-8 TLV stream.
+//                           Future: pds_meta_decode surfaces fields
+//                           for `pds info <file>`.
+//
+// Kinds >= 6 are RESERVED at M1 and will be rejected by downstream
+// parsers (not by this reader -- the reader passes unknown kinds
+// through so a forward-compatible loader can skip them). The reader
+// treats kind as an opaque u32 for bounds-check / copy purposes.
+//
+// =============================================================================
+// SECTION 3  RETURN CODES
+// =============================================================================
+//
+// _ctr_parse returns a packed u64:
+//
+//   bits [15: 0]   = status                CT_* code
+//   bits [31:16]   = 0  (reserved)
+//   bits [63:32]   = count   (on CT_OK)
+//                    byte offset (reserved for future per-section
+//                                  error packing; M1 does NOT pack
+//                                  per-section offsets)
+//
+//   CT_OK                   = 0x0000     bits[63:32] = n_sections_parsed
+//   CT_ERR_BAD_MAGIC        = 0x2900     bits[63:32] = 0
+//   CT_ERR_BAD_VERSION      = 0x2901     bits[63:32] = 0
+//   CT_ERR_SECTION_COUNT    = 0x2902     bits[63:32] = 0
+//                                        (n_sections > 32)
+//   CT_ERR_SECTION_OVERRUN  = 0x2903     bits[63:32] = 0
+//                                        (section header stream
+//                                         extends past buf_len,
+//                                         OR a section's
+//                                         offset + size > buf_len)
+//   CT_ERR_OUT_TOO_SMALL    = 0x2904     bits[63:32] = 0
+//                                        (out_cap < n_sections*32)
+//   CT_ERR_NOT_FOUND        = 0x2905     only returned by
+//                                        _ctr_locate_section
+//
+// The 0x2900 prefix carves pds-container errors out of the kernel
+// error space; it is adjacent to R227.M1's 0x2800..0x2803 pds-header
+// space -- the full `.pds` subsystem claims 0x28xx + 0x29xx.
+//
+// _ctr_locate_section returns a bare errno (NOT packed):
+//   CT_OK (0) on found -- *out_offset_ptr and *out_size_ptr populated
+//   CT_ERR_BAD_MAGIC / BAD_VERSION / SECTION_COUNT / SECTION_OVERRUN
+//     on container validation failure (output pointers UNTOUCHED).
+//   CT_ERR_NOT_FOUND on no section matched the kind.
+//
+// =============================================================================
+// SECTION 4  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Pure leaf -- neither _ctr_parse nor _ctr_locate_section makes nested
+// calls, so rsp alignment requirements inside the body are relaxed.
+// Five callee-save pushes (rbx, r12, r13, r14, r15 -- 40 bytes) are
+// kept purely so the five cursor / bound registers survive the body.
+// Scratch: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+//
+// Register plan inside _ctr_parse:
+//   rbx = buf_start      (callee-save; needed for cursor arithmetic)
+//   r12 = buf_end        (callee-save; buf_start + buf_len)
+//   r13 = out_cursor     (callee-save; advances by 32 per section)
+//   r14 = out_end        (callee-save; out_ptr + out_cap)
+//   r15 = n_sections     (callee-save; copied from header +8 after
+//                         the u32 range check)
+//   r9  = src cursor     (walks the section-header stream in buf)
+//   r8  = dst cursor     (walks the output record stream)
+//   rcx = loop counter
+//   r10/r11 = per-step scratch
+//
+// Register plan inside _ctr_locate_section:
+//   rbx = container_ptr  (callee-save)
+//   r12 = container_end  (callee-save)
+//   r13 = target_kind    (callee-save; preserved across header load)
+//   r14 = out_offset_ptr (callee-save)
+//   r15 = out_size_ptr   (callee-save)
+//   r9  = n_sections     (local)
+//   r8  = section cursor (local; walks the section-header stream)
+//   rcx = loop counter   (local)
+//
+// Encoder gaps worked around (same posture as R123.M2 / R227.M1):
+//
+//   G1 "mov [mem], reg widens to REX.W":
+//       u32 stores (none here; the output records receive 64-bit
+//       u64 writes from the zero-extended u32 loads, which is
+//       SEMANTICALLY the write of a u32 in the low 32 bits plus
+//       zero padding -- intentional, since the output SectionHeader
+//       fields are u32 but packed into a 32-byte record that
+//       aligns naturally with u64 moves). Where we need a
+//       definite 32-bit MMIO-shaped store (none at M1), we would
+//       use `mov_d [mem], reg` per apic/eoi.pdx precedent.
+//
+//   G2 "no 2-op imul r,imm":
+//       Multiply-by-32 for section indexing uses `shl rN, 5`.
+//
+//   G3 "no `and reg, imm64`":
+//       Not needed here (no bitfield extraction).
+//
+//   G4 "mov_b does not zero-extend":
+//       All byte reads use `xor rN, rN; mov_b rN, [mem]`. The 32-byte
+//       section-header copy uses 4 u64 reads+writes (`mov rax, [src+N];
+//       mov [dst+N], rax` for N in {0, 8, 16, 24}); u64 moves do not
+//       need pre-zero.
+//
+//   G5 "mov_b [reg+reg*1+off], reg not supported":
+//       Not hit here (no byte-indexed byte stores).
+//
+// Zero checks use `cmp rN, 0; jcc` (NEVER `test rN, rN` -- R123.M2
+// discipline). 32-bit zero-extend loads use `xor rax, rax; mov eax,
+// [mem]` (NEVER `mov eax, [mem]` alone, defensive against future
+// paideia-as encoder churn around implicit zero-extension -- same
+// posture as acpi/rsdp.pdx §scan).
+//
+// All constants in this file fit imm32 (bit 31 clear): CT_MAGIC =
+// 0x50445343 (bit 31 = 0), CT_VERSION = 1, CT_MAX_SECTIONS = 32,
+// CT_HEADER_SIZE = 16, CT_SECTION_SIZE = 32, kinds 1..5, errors
+// 0x2900..0x2905. The `mov rN, imm32` zero-extend form is a 7-byte
+// encode per the kernel-wide discipline.
+//
+// Reserved labels: every label in this file is prefixed `ctr_` so
+// none collides with pdx reserved words (`loop`, `if`, `let`, `else`,
+// `fn`) or with sibling modules. Module basename `ContainerReader`
+// matches the file basename `container_reader.pdx` (encoder expects
+// an exact match).
+//
+// =============================================================================
+// SECTION 5  CROSS-MODULE WIRING NOTES
+// =============================================================================
+//
+// This module is a self-contained parsing primitive. There is no boot
+// hook, no capability substrate row, no VFS traffic at M1. The expected
+// caller sequences (lands incrementally in M2..M5):
+//
+//   M2 pds-sign-verify:
+//     (1) Caller reads a `.pds` file into a buffer.
+//     (2) Caller allocates a SectionHeader[32] array (1024 bytes).
+//     (3) Caller invokes `_ctr_parse(buf, len, &records, 1024)`.
+//     (4) On OK, caller finds CT_SEC_SIGNATURE via
+//         `_ctr_locate_section(buf, len, 4, &sig_off, &sig_size)`.
+//     (5) Caller verifies the Ed25519 signature over
+//         buf[0..sig_off) || buf[sig_off+sig_size..len) and
+//         compares the embedded public-key fingerprint against the
+//         capability-signing root established in R63.
+//
+//   M3 cap-env binding:
+//     (6) Caller walks records for CT_SEC_CAPS_DECL and feeds the
+//         payload bytes to `cap_env_from_decl` (R131.M3).
+//
+//   M4 text-section loader:
+//     (7) Caller walks records for CT_SEC_TEXT and feeds payload
+//         bytes to `cmd_module_open_from_pds` (R131.M4), which
+//         allocates a KIND_CMD_MODULE row and binds the resulting
+//         handle into the cap-env from (6).
+//
+// Design doc: design/shell/pds-container-format.md (M1 binary layout
+// + M2..M5 extension plan + interaction with R227 header pragmas and
+// R131 pds-loader).
+//
+// =============================================================================
+
+module ContainerReader = structure {
+
+  // ==========================================================================
+  // SECTION 6  CONSTANTS
+  // ==========================================================================
+
+  // Return codes (SECTION 3).
+  pub let CT_OK                   : u64 = 0
+  pub let CT_ERR_BAD_MAGIC        : u64 = 0x2900
+  pub let CT_ERR_BAD_VERSION      : u64 = 0x2901
+  pub let CT_ERR_SECTION_COUNT    : u64 = 0x2902
+  pub let CT_ERR_SECTION_OVERRUN  : u64 = 0x2903
+  pub let CT_ERR_OUT_TOO_SMALL    : u64 = 0x2904
+  pub let CT_ERR_NOT_FOUND        : u64 = 0x2905
+
+  // Section kinds (SECTION 2).
+  pub let CT_SEC_TEXT       : u64 = 1
+  pub let CT_SEC_RODATA     : u64 = 2
+  pub let CT_SEC_CAPS_DECL  : u64 = 3
+  pub let CT_SEC_SIGNATURE  : u64 = 4
+  pub let CT_SEC_META       : u64 = 5
+
+  // Container geometry (SECTION 1).
+  pub let CT_MAGIC          : u64 = 0x50445343   // 'PDSC' as little-endian u32
+  pub let CT_VERSION        : u64 = 1
+  pub let CT_HEADER_SIZE    : u64 = 16
+  pub let CT_SECTION_SIZE   : u64 = 32
+  pub let CT_MAX_SECTIONS   : u64 = 32
+  pub let CT_NAME_LEN       : u64 = 16
+
+  // ==========================================================================
+  // SECTION 7  _ctr_parse(buf_ptr, buf_len, out_ptr, out_cap) -> packed u64
+  //
+  // Validates container header + section-header stream, writes a
+  // packed array of 32-byte SectionHeader records into out_ptr. See
+  // SECTION 1 for layout, SECTION 3 for return packing.
+  //
+  // Entry: rdi=buf_ptr, rsi=buf_len, rdx=out_ptr, rcx=out_cap
+  // Return: rax = (n << 32) | status
+  //
+  // Pure leaf. Register plan in SECTION 4.
+  // ==========================================================================
+  pub let _ctr_parse : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (buf_len: u64) (out_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W26 R133.M1 (paideia-os #2620): .pds container reader. Validates the 16-byte header (magic 0x50445343 'PDSC', version 1, n_sections <= 32) and the following 32-byte-per-section header stream (offset+size bounded by buf_len), then packs the 32-byte section records into out_ptr. Returns (n_sections << 32) | CT_OK on success, or bare CT_ERR_BAD_MAGIC/BAD_VERSION/SECTION_COUNT/SECTION_OVERRUN/OUT_TOO_SMALL on failure. Pure leaf -- no nested call. Five callee-save pushes (rbx=buf_start, r12=buf_end, r13=out_cursor, r14=out_end, r15=n_sections). Encoder discipline: G1 avoided (output writes are 64-bit mov per 8-byte chunk of the 32-byte record, intentional zero-extension of the u32 fields); G2 avoided (section index multiplied by 32 via `shl rN, 5`, not `imul r, imm`); G4 enforced (32-bit field reads use `xor rax, rax; mov eax, [mem]` for explicit zero-extension); no `test rN, rN` (every zero-check uses `cmp reg, 0`). Module basename `ContainerReader` matches file basename `container_reader.pdx`. Labels prefixed `ctr_pa_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // buf_start
+        mov r12, rsi;
+        add r12, rdi;                     // buf_end = buf_start + buf_len
+        mov r13, rdx;                     // out_cursor
+        mov r14, rdx;
+        add r14, rcx;                     // out_end = out_ptr + out_cap
+        xor r15, r15;                     // n_sections = 0 (populated below)
+
+        // ------------------------------------------------------------------
+        // (I1) buf_len >= 16  -- header fits.
+        // ------------------------------------------------------------------
+        mov r10, rbx;
+        add r10, 16;                      // CT_HEADER_SIZE
+        cmp r10, r12;
+        ja  ctr_pa_bad_magic;             // too small for even the header
+                                          // -> fold to BAD_MAGIC (the
+                                          //    header's magic field never
+                                          //    existed in the buffer)
+
+        // ------------------------------------------------------------------
+        // (I2) magic == 0x50445343.
+        // ------------------------------------------------------------------
+        xor rax, rax;
+        mov eax, [rbx + 0];               // u32 zero-extend into rax
+        mov r10, 0x50445343;              // CT_MAGIC
+        cmp rax, r10;
+        jne ctr_pa_bad_magic;
+
+        // ------------------------------------------------------------------
+        // (I3) version == 1.
+        // ------------------------------------------------------------------
+        xor rax, rax;
+        mov eax, [rbx + 4];
+        cmp rax, 1;                       // CT_VERSION
+        jne ctr_pa_bad_version;
+
+        // ------------------------------------------------------------------
+        // (I4) n_sections <= 32.
+        // ------------------------------------------------------------------
+        xor rax, rax;
+        mov eax, [rbx + 8];
+        cmp rax, 32;                      // CT_MAX_SECTIONS
+        ja  ctr_pa_section_count;
+        mov r15, rax;                     // n_sections (callee-save)
+
+        // ------------------------------------------------------------------
+        // (I5) buf_len >= 16 + n_sections*32  -- section-header stream fits.
+        //        n_sections*32 = r15 << 5.
+        // ------------------------------------------------------------------
+        mov r10, r15;
+        shl r10, 5;                       // r10 = n_sections * 32
+        add r10, 16;                      // + header
+        mov r11, rbx;
+        add r11, r10;                     // buf_start + 16 + n_sec*32
+        cmp r11, r12;
+        ja  ctr_pa_overrun;
+
+        // ------------------------------------------------------------------
+        // (I7) out_cap >= n_sections*32  -- caller buffer has room.
+        // ------------------------------------------------------------------
+        mov r10, r15;
+        shl r10, 5;                       // n_sections * 32
+        mov r11, r13;
+        add r11, r10;
+        cmp r11, r14;
+        ja  ctr_pa_out_small;
+
+        // ------------------------------------------------------------------
+        // Section-header walk.
+        // src cursor r9 = buf_start + 16.
+        // dst cursor r8 = r13 (out_cursor).
+        // loop counter rcx = i, 0..n_sections.
+        // Per iteration: (I6) offset+size <= buf_len; copy 32 bytes.
+        // ------------------------------------------------------------------
+        mov r9, rbx;
+        add r9, 16;                       // src = &SectionHeader[0]
+        mov r8, r13;                      // dst = out_cursor
+        xor rcx, rcx;                     // i = 0
+
+      ctr_pa_sec_loop:
+        cmp rcx, r15;
+        jae ctr_pa_done;
+
+        // (I6) offset + size <= buf_len.
+        //        offset = u32 @ src+4, size = u32 @ src+8.
+        //        Both zero-extend into 64 bits, so the sum cannot
+        //        overflow (max = 2^33 - 2).
+        xor rax, rax;
+        mov eax, [r9 + 4];                // offset
+        xor rdx, rdx;
+        mov edx, [r9 + 8];                // size
+        add rax, rdx;                     // offset + size
+        mov r11, rbx;
+        add r11, rax;                     // buf_start + offset + size
+        cmp r11, r12;
+        ja  ctr_pa_overrun;
+
+        // Copy 32 bytes src -> dst via 4 u64 moves.
+        mov rax, [r9 + 0];
+        mov [r8 + 0], rax;
+        mov rax, [r9 + 8];
+        mov [r8 + 8], rax;
+        mov rax, [r9 + 16];
+        mov [r8 + 16], rax;
+        mov rax, [r9 + 24];
+        mov [r8 + 24], rax;
+
+        add r9, 32;
+        add r8, 32;
+        add rcx, 1;
+        jmp ctr_pa_sec_loop;
+
+      ctr_pa_done:
+        // (count << 32) | CT_OK (0)
+        mov rax, r15;
+        shl rax, 32;
+        jmp ctr_pa_out;
+
+      ctr_pa_bad_magic:
+        mov rax, 0x2900;                  // CT_ERR_BAD_MAGIC
+        jmp ctr_pa_out;
+
+      ctr_pa_bad_version:
+        mov rax, 0x2901;                  // CT_ERR_BAD_VERSION
+        jmp ctr_pa_out;
+
+      ctr_pa_section_count:
+        mov rax, 0x2902;                  // CT_ERR_SECTION_COUNT
+        jmp ctr_pa_out;
+
+      ctr_pa_overrun:
+        mov rax, 0x2903;                  // CT_ERR_SECTION_OVERRUN
+        jmp ctr_pa_out;
+
+      ctr_pa_out_small:
+        mov rax, 0x2904;                  // CT_ERR_OUT_TOO_SMALL
+
+      ctr_pa_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 8  _ctr_locate_section(container_ptr, container_len,
+  //                                section_kind,
+  //                                out_offset_ptr, out_size_ptr) -> errno
+  //
+  // Convenience: find the first section whose `kind` field matches
+  // `section_kind` and write its `offset` and `size` through the
+  // caller-supplied u64 pointers. Returns CT_OK (0) on hit, or
+  // CT_ERR_NOT_FOUND / BAD_MAGIC / BAD_VERSION / SECTION_COUNT /
+  // SECTION_OVERRUN on failure. On any error path the output
+  // pointers are LEFT UNTOUCHED.
+  //
+  // The function performs its own container-header validation; a
+  // caller may invoke it without a prior _ctr_parse (useful when
+  // only one specific section is needed). The reader does NOT fold
+  // CT_ERR_OUT_TOO_SMALL -- there is no out buffer for a section
+  // record stream here; only two 8-byte scalar stores.
+  //
+  // Entry: rdi=container_ptr, rsi=container_len, rdx=section_kind,
+  //        rcx=out_offset_ptr, r8=out_size_ptr
+  // Return: rax = CT_OK (0) on found, CT_ERR_* on failure
+  //
+  // Pure leaf. Register plan in SECTION 4.
+  // ==========================================================================
+  pub let _ctr_locate_section : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (container_ptr: u64) (container_len: u64) (section_kind: u64) (out_offset_ptr: u64) (out_size_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W26 R133.M1 (paideia-os #2620): find a section by kind in a .pds container and surface its (offset, size) through caller-supplied u64 pointers. Performs its own header validation (magic 0x50445343, version 1, n_sections <= 32, I5 overrun check) before walking the section-header stream; returns CT_ERR_BAD_MAGIC/BAD_VERSION/SECTION_COUNT/SECTION_OVERRUN on header failure (output pointers untouched), CT_ERR_NOT_FOUND if no section matches the target kind, or CT_OK (0) on hit with *out_offset_ptr and *out_size_ptr populated. Pure leaf -- no nested call. Five callee-save pushes (rbx=container_ptr, r12=container_end, r13=target_kind, r14=out_offset_ptr, r15=out_size_ptr). Encoder discipline mirrors _ctr_parse: G2 (shl rN, 5 for i*32 via section-cursor stride), G4 (xor+mov eax, [mem] for u32 zero-extend reads), no `test rN, rN`. The target_kind and out pointers must survive the header-load scratch sequence, hence the callee-save stash. Labels prefixed `ctr_lo_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // container_start
+        mov r12, rsi;
+        add r12, rdi;                     // container_end
+        mov r13, rdx;                     // target_kind
+        mov r14, rcx;                     // out_offset_ptr
+        mov r15, r8;                      // out_size_ptr
+
+        // ------------------------------------------------------------------
+        // (I1) container_len >= 16.
+        // ------------------------------------------------------------------
+        mov r10, rbx;
+        add r10, 16;
+        cmp r10, r12;
+        ja  ctr_lo_bad_magic;
+
+        // ------------------------------------------------------------------
+        // (I2) magic.
+        // ------------------------------------------------------------------
+        xor rax, rax;
+        mov eax, [rbx + 0];
+        mov r10, 0x50445343;
+        cmp rax, r10;
+        jne ctr_lo_bad_magic;
+
+        // ------------------------------------------------------------------
+        // (I3) version.
+        // ------------------------------------------------------------------
+        xor rax, rax;
+        mov eax, [rbx + 4];
+        cmp rax, 1;
+        jne ctr_lo_bad_version;
+
+        // ------------------------------------------------------------------
+        // (I4) n_sections <= 32.
+        // ------------------------------------------------------------------
+        xor rax, rax;
+        mov eax, [rbx + 8];
+        cmp rax, 32;
+        ja  ctr_lo_sec_count;
+        mov r9, rax;                      // n_sections
+
+        // ------------------------------------------------------------------
+        // (I5) container_len >= 16 + n_sections*32.
+        // ------------------------------------------------------------------
+        mov r10, r9;
+        shl r10, 5;
+        add r10, 16;
+        mov r11, rbx;
+        add r11, r10;
+        cmp r11, r12;
+        ja  ctr_lo_overrun;
+
+        // ------------------------------------------------------------------
+        // Linear scan over section headers.
+        // ------------------------------------------------------------------
+        xor rcx, rcx;                     // i = 0
+        mov r8, rbx;
+        add r8, 16;                       // r8 = &SectionHeader[0]
+
+      ctr_lo_sec_loop:
+        cmp rcx, r9;
+        jae ctr_lo_not_found;
+
+        // kind at section_hdr+0 (u32 zero-extend into rax).
+        xor rax, rax;
+        mov eax, [r8 + 0];
+        cmp rax, r13;
+        je  ctr_lo_hit;
+
+        add r8, 32;
+        add rcx, 1;
+        jmp ctr_lo_sec_loop;
+
+      ctr_lo_hit:
+        // *out_offset_ptr = section_hdr.offset (u32 zero-ext to u64).
+        xor rax, rax;
+        mov eax, [r8 + 4];
+        mov [r14 + 0], rax;
+        // *out_size_ptr = section_hdr.size (u32 zero-ext to u64).
+        xor rax, rax;
+        mov eax, [r8 + 8];
+        mov [r15 + 0], rax;
+        // CT_OK (0).
+        xor rax, rax;
+        jmp ctr_lo_out;
+
+      ctr_lo_bad_magic:
+        mov rax, 0x2900;
+        jmp ctr_lo_out;
+      ctr_lo_bad_version:
+        mov rax, 0x2901;
+        jmp ctr_lo_out;
+      ctr_lo_sec_count:
+        mov rax, 0x2902;
+        jmp ctr_lo_out;
+      ctr_lo_overrun:
+        mov rax, 0x2903;
+        jmp ctr_lo_out;
+      ctr_lo_not_found:
+        mov rax, 0x2905;
+
+      ctr_lo_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 9  _ctr_section_kind(record_ptr) -> u64
+  //
+  // Accessor: load the u32 kind at byte offset 0 of a 32-byte
+  // SectionHeader record and zero-extend to u64. Pure leaf.
+  // ==========================================================================
+  pub let _ctr_section_kind : (u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W26 R133.M1 (paideia-os #2620): read u32 kind at offset 0 of a 32-byte SectionHeader and zero-extend to u64. Pure leaf. No stack use. Encoder: xor+mov eax zero-extend per acpi/rsdp.pdx §scan precedent.",
+      block: {
+        xor rax, rax;
+        mov eax, [rdi + 0];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 10  _ctr_section_offset(record_ptr) -> u64
+  //
+  // Accessor: load the u32 offset at byte offset 4 of a 32-byte
+  // SectionHeader record and zero-extend to u64.
+  // ==========================================================================
+  pub let _ctr_section_offset : (u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W26 R133.M1 (paideia-os #2620): read u32 offset at offset 4 of a 32-byte SectionHeader and zero-extend to u64. Pure leaf. No stack use.",
+      block: {
+        xor rax, rax;
+        mov eax, [rdi + 4];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 11  _ctr_section_size(record_ptr) -> u64
+  //
+  // Accessor: load the u32 size at byte offset 8 of a 32-byte
+  // SectionHeader record and zero-extend to u64.
+  // ==========================================================================
+  pub let _ctr_section_size : (u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W26 R133.M1 (paideia-os #2620): read u32 size at offset 8 of a 32-byte SectionHeader and zero-extend to u64. Pure leaf. No stack use.",
+      block: {
+        xor rax, rax;
+        mov eax, [rdi + 8];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 12  _ctr_section_flags(record_ptr) -> u64
+  //
+  // Accessor: load the u32 flags at byte offset 12 of a 32-byte
+  // SectionHeader record and zero-extend to u64.
+  // ==========================================================================
+  pub let _ctr_section_flags : (u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W26 R133.M1 (paideia-os #2620): read u32 flags at offset 12 of a 32-byte SectionHeader and zero-extend to u64. Pure leaf. No stack use.",
+      block: {
+        xor rax, rax;
+        mov eax, [rdi + 12];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 13  _ctr_section_name_ptr(record_ptr) -> u64
+  //
+  // Accessor: return a pointer to the 16-byte name field at offset
+  // 16 of a 32-byte SectionHeader record. The caller treats the
+  // 16 bytes as a NUL-padded ASCII string.
+  // ==========================================================================
+  pub let _ctr_section_name_ptr : (u64) -> u64 !{mem} @{} =
+    fn (record_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W26 R133.M1 (paideia-os #2620): return pointer to the 16-byte name field at offset 16 of a 32-byte SectionHeader. Caller treats bytes as NUL-padded ASCII. Pure leaf. No stack use. No memory read -- pointer arithmetic only.",
+      block: {
+        mov rax, rdi;
+        add rax, 16;
+        ret
+      }
+    }
+}

@@ -1,0 +1,994 @@
+// src/pipeline.pdx -- libpdx-pds-parser (paideia-os#2666, R223.M1)
+//
+// Pipeline: parser-tier shell-pipeline lexer. Consumes an argv-with-
+// pipes byte stream (`cmd1 arg | cmd2 arg | cmd3 arg`) and emits one
+// PipelineStage record per `|`-delimited segment.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// This module is the first R223 wave (R223 = "pipeline-lang": the
+// shell dispatches `cmd1 ... | cmd2 ... | ...` as a sequence of
+// stages, each a `(cmd_name, argv)` tuple). R223.M1 is the lexer-
+// level parser that turns the raw UTF-8 input (post R221.M1 NFC
+// normalisation) into a flat array of PipelineStage records that
+// downstream passes consume:
+//
+//   R222.M*  cmd-functor signature matching -- reads each stage's
+//            cmd_name + n_args to resolve the dispatch target
+//            against the user's registered functors.
+//   R129.M5  renderer-override `as <name>` suffix -- post-parse
+//            pass on the LAST stage's argv tail; this module
+//            leaves `as` as an ordinary argv token (strict
+//            tail-position detection runs AFTER pipeline parse).
+//   R223.M2  stage ABI materialiser -- walks these records into
+//            the kernel-side Pipeline::pipeline_plan input shape
+//            (that module caps at PL_MAX_STAGES=8; this module
+//            allows PL_MAX_STAGES=16 so the parser is a strict
+//            superset of what the planner will accept, and
+//            over-wide pipelines fail cleanly at planner-admission
+//            rather than at parse).
+//
+// =============================================================================
+// GRAMMAR
+// =============================================================================
+//
+//   pipeline := stage ( '|' stage )*
+//   stage    := word ( WS+ word )*                   -- min 1 word
+//   word     := bareword | dq_string | sq_string
+//   bareword := ( non_ws_byte | '\|' | '\"' )+       -- escapes honoured
+//   dq_string := '"' ( non_dq_byte | '\"' | '\\' )* '"'
+//   sq_string := '\'' ( non_sq_byte )* '\''          -- no escapes in sq
+//   WS       := ' ' | '\t'
+//
+// Rejected: consecutive `||`, leading `|`, trailing `|`, unterminated
+// `"` or `'`, more than PL_MAX_STAGES=16 stages, more than
+// PL_MAX_ARGS=8 argv per stage (cmd_name separate), insufficient
+// out_cap.
+//
+// =============================================================================
+// PIPELINESTAGE RECORD (64 bytes, cache-line stride)
+// =============================================================================
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      4   cmd_name_offset   u32 -- byte offset into input bytes
+//     4      2   cmd_name_len      u16 -- byte length of cmd_name span
+//     6      2   n_args            u16 -- argv count (0..PL_MAX_ARGS)
+//     8     32   argv_offsets[8]   u32 -- byte offsets into input bytes
+//    40     16   argv_lens[8]      u16 -- byte lengths of argv spans
+//    56      2   flags             u16 -- bit flags (see below)
+//    58      6   _reserved[6]      u8  -- zeroed; reserved for M2+
+//
+//   total: 64 B (PL_STAGE_SIZE)
+//
+// Spec reconciliation note: the parent brief lists `_reserved: [u8;14]`
+// and `(64B)` in the same sentence; the two are arithmetically
+// inconsistent (4+2+2+32+16+2+14 = 72). This module keeps the 64B
+// stride (the externally-observable property that governs output-
+// capacity sizing: `max_stages = out_cap / 64`) and trims the
+// `_reserved` tail to 6 bytes. The argv budget (8 slots), the
+// offset+len u32/u16 pair widths, and the flags u16 all match the
+// brief verbatim.
+//
+// Flag bits (bit index in `flags` u16):
+//   bit 0  PL_STAGE_HAS_ESCAPES  set iff any argv span contains a
+//                                backslash-escape (`\|` or `\"`).
+//                                Downstream un-escape may skip the
+//                                scan on clear-bit stages.
+//   bit 1  PL_STAGE_HAS_QUOTES   set iff any argv was quoted in the
+//                                source (`"..."` or `'...'`).
+//                                Informational -- the stored span
+//                                excludes the enclosing quote
+//                                characters either way.
+//   bits 2..15  reserved; always 0 at M1.
+//
+// =============================================================================
+// WORD-SPAN SEMANTICS
+// =============================================================================
+//
+// Each stored (offset, len) pair indexes the ORIGINAL caller-supplied
+// bytes buffer at [bytes_ptr + offset, bytes_ptr + offset + len).
+//
+//   * Bareword  (`foo`):           offset = position of 'f', len = 3.
+//   * Double-quoted (`"a b"`):     offset = position of 'a' (one past
+//                                  the opening quote), len = 3; the
+//                                  closing quote is NOT in the span.
+//   * Single-quoted (`'a b'`):     same shape; quotes excluded.
+//   * Escape in bareword (`a\|b`): the span includes the backslash
+//                                  (len = 4). The downstream un-escape
+//                                  pass turns `\|` into `|`.
+//   * Escape in dq (`"a\"b"`):     span is `a\"b` (len = 4), excludes
+//                                  outer quotes. Downstream un-escape
+//                                  turns `\"` into `"`.
+//
+// The parser never mutates the input buffer and never allocates
+// scratch; every out byte goes into the caller's out buffer and the
+// (offset, len) pairs refer to the caller's input buffer verbatim.
+//
+// =============================================================================
+// STATE MACHINE
+// =============================================================================
+//
+//   STATE_WS   (0)  between words; skip SP/TAB; open word on first
+//                   non-ws byte.
+//   STATE_BARE (1)  inside bareword; close word on SP/TAB or '|'
+//                   (unescaped).
+//   STATE_DQ   (2)  inside "..." word; close word on unescaped '"'.
+//   STATE_SQ   (3)  inside '...' word; close word on '\''.
+//
+// Transition diagram:
+//
+//   WS --SP|TAB--> WS                   (skip)
+//   WS --'|'-----> commit stage, WS     (if dirty, else error)
+//   WS --'"'-----> DQ (word_start = i+1)
+//   WS --'\''----> SQ (word_start = i+1)
+//   WS --other---> BARE (word_start = i)
+//
+//   BARE --SP|TAB--> emit_word, WS
+//   BARE --'|'----> emit_word, commit stage, WS
+//   BARE --'\'---> BARE (consume backslash+next; set HAS_ESCAPES)
+//   BARE --other--> BARE
+//
+//   DQ --'"'-----> emit_word, WS
+//   DQ --'\'----> DQ (consume backslash+next; set HAS_ESCAPES)
+//   DQ --other---> DQ
+//
+//   SQ --'\''----> emit_word, WS
+//   SQ --other---> SQ
+//
+// =============================================================================
+// RETURN SHAPE
+// =============================================================================
+//
+//   rax = (n_stages << 32) | status
+//
+//   status in:
+//     PL_OK                     = 0
+//     PL_ERR_TOO_MANY_STAGES    = 0x2B00
+//     PL_ERR_TOO_MANY_ARGS      = 0x2B01
+//     PL_ERR_UNTERMINATED_QUOTE = 0x2B02
+//     PL_ERR_EMPTY_STAGE        = 0x2B03   (`||`, leading `|`, trailing `|`)
+//     PL_ERR_OUT_TOO_SMALL      = 0x2B04
+//
+//   n_stages is the number of fully-written PipelineStage records on
+//   success; on error, n_stages is the count of records committed
+//   BEFORE the fault point (partial write; caller should ignore).
+//
+//   Empty input (bytes_len == 0 or all-whitespace) returns
+//   (0 << 32) | PL_OK: zero stages, no error. A caller interprets this
+//   as "no command to run".
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE
+// =============================================================================
+//
+// PL_* codes live in 0x2B00..0x2BFF, disjoint from every other
+// user-space packed-status range in the paideia-os tree:
+//
+//   * libpdx-pds-parser R221.M1 Utf8Nfc U8N_*  : 0x2700..0x27FF
+//   * libpdx-pds-parser R221.M* reserved       : 0x2800..0x2AFF
+//   * libpdx-pds-parser R223.M* Pipeline PL_*  : 0x2B00..0x2BFF (this)
+//   * libpdx-pds-parser R225.M* reserved       : 0x2C00..0x2EFF
+//
+// Not to be confused with the kernel-side Pipeline module's
+// PL_ERR_BAD_ARGS / PL_ERR_TOO_MANY / PL_ERR_DST_OVERFLOW codes which
+// occupy a wholly separate 0xFFFFEC40..42 band and name a different
+// (planner-side) module. The brief directs PL_* here because this is
+// the PARSER-tier Pipeline module; the two never link together in a
+// program that mixes them -- the kernel-side planner is called from
+// the kernel service, the user-space parser is linked into the
+// semantic shell's user-side pds-lang frontend.
+//
+// Grep confirmation at R223.M1 landing time:
+//
+//   grep -rE '0x2B0[0-4]' paideia-os/{src,tools,design,tests}
+//     -> no packed-status hits outside this file and
+//        design/shell/pipeline-stage-parser.md.
+//
+// =============================================================================
+// INTERACTION WITH R129.M5 RENDERER `as` SYNTAX
+// =============================================================================
+//
+// The `cmd ... as <renderer>` syntax (R129.M5, design/shell/renderer-
+// override-as-syntax.md) is a POST-parse concern. This module leaves
+// the two-token tail `("as", "<renderer>")` as ordinary argv tokens
+// on the LAST pipeline stage. A post-pass (not landed in M1) runs:
+//
+//   1. Pipeline parsed to k stages.
+//   2. Inspect stages[k-1].argv_lens[n_args-2..n_args] for the
+//      exact two-token pattern `("as", <name>)`.
+//   3. If matched, strip both tokens from stages[k-1].argv (decrement
+//      n_args by 2), and emit the renderer id into a sibling slot.
+//
+// Rationale: coupling the `as`-tail recogniser to the pipeline parser
+// adds grammar bloat (`as` would need to be a reserved keyword only
+// at pipeline tail), and makes `as` inside quoted strings subtly
+// different from `as` outside quotes. By keeping the pipeline parse
+// grammar quote-agnostic for `as`, the parser stays uniform:
+//
+//     "echo as thing"          --  1 stage, 1 arg, span is `as thing`
+//     "ls as table"            --  1 stage, 3 args (`ls`, `as`, `table`),
+//                                  then the post-pass picks it up.
+//     "ls | wc as table"       --  2 stages; post-pass on stage[1].
+//     "cp 'as' 'bs'"           --  1 stage, 2 args (`as`, `bs`); post-
+//                                  pass sees the two argv but the names
+//                                  are literal and `cp` doesn't take an
+//                                  override anyway (shell policy, not
+//                                  parse-time).
+//
+// The R129.M5 doc specifies the pattern `argv[argc-2] == "as"` on the
+// LAST pipeline stage; this module's output shape is exactly what
+// that pass walks.
+//
+// =============================================================================
+// INTERACTION WITH R222 CMD-FUNCTOR SIGNATURE MATCHING
+// =============================================================================
+//
+// R222 (not yet landed) resolves each stage's (cmd_name, n_args)
+// against a registered functor table. This module exposes:
+//
+//   * cmd_name_offset + cmd_name_len -- the stage's resolvable name.
+//   * n_args -- the arity the functor dispatcher sees after stripping
+//     flags / renderer-overrides in later passes.
+//
+// Downstream un-escape and option-vs-positional partitioning run
+// AFTER this parser; this module reports raw argv.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0` or
+//     `cmp reg, imm32`.
+//   - No `and rN, imm64` -- the few mask operations use imm32-safe
+//     values (0xFF, 0xFFFF, 0x7FFFFFFF).
+//   - No 2-op `imul r, imm` -- slot-index multiplies by 4 and 2 are
+//     done via `shl r, 2` and `shl r, 1`.
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `Pipeline` matches `pipeline.pdx`.
+//   - Labels prefixed `pl_` for `_pl_parse`, `pl_ew_` for
+//     `_pl_emit_word` -- disjoint from paideia-as reserved keywords
+//     (`loop`, `if`, `let`, `fn`, `ret`, `done`, etc.).
+//   - All `cmp reg, imm` immediates <= 0x2B04 < 0x80000000 so direct
+//     `cmp reg, imm32` is sign-extension-safe. No MOVABS staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + idx * 1]`
+//     (paideia-as #1248 mitigation; explicit `*1` scale per
+//     libpdx-audit audit_file_sink precedent).
+//   - u32 stores via `mov_d [base + disp], rax` (per libpdx-argv
+//     emit_parse_error / libpdx-volume pdxb_kek_derive precedent).
+//   - u16 stores via two `mov_b` byte stores (low byte, high byte);
+//     mov_w short-form is not used in this repo.
+//   - u64 zero-fill of a fresh stage via eight `mov [r15 + disp], rax`
+//     with rax = 0.
+//   - `_pl_parse` is NOT a pure leaf -- it CALLs `_pl_emit_word` from
+//     four token-emit sites. Prologue is five callee-save pushes
+//     (rbx, r12, r13, r14, r15 = 40 bytes) + `sub rsp, 48` for a
+//     six-slot local frame = 88 total, giving rsp%16==0 at every
+//     nested CALL under entry rsp%16==8.
+//   - `_pl_emit_word` is a pure leaf (no nested CALL) with a two-push
+//     prologue (rbx, r12) to carry stage_ptr and slot across the
+//     dispatch; a stack frame is unnecessary.
+//
+// =============================================================================
+// Upstream: paideia-os#2487 (R223 umbrella), paideia-os#2666 (THIS
+// ticket, R223.M1). Substrate: paideia-os#2651 (R221.M1 Utf8Nfc
+// -- NFC-normalised input bytes). Design doc:
+// design/shell/pipeline-stage-parser.md.
+
+module Pipeline = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in low 32 bits of packed result)
+  // ==========================================================================
+
+  pub let PL_OK                     : u64 = 0
+  pub let PL_ERR_TOO_MANY_STAGES    : u64 = 0x2B00
+  pub let PL_ERR_TOO_MANY_ARGS      : u64 = 0x2B01
+  pub let PL_ERR_UNTERMINATED_QUOTE : u64 = 0x2B02
+  pub let PL_ERR_EMPTY_STAGE        : u64 = 0x2B03
+  pub let PL_ERR_OUT_TOO_SMALL      : u64 = 0x2B04
+
+  // ==========================================================================
+  // SECTION 2 -- STAGE SHAPE CONSTANTS
+  // ==========================================================================
+  //
+  // PL_STAGE_SIZE is the 64-byte stride of one PipelineStage record.
+  // A consumer sizing the out buffer uses
+  // `out_cap = max_stages * PL_STAGE_SIZE`.
+  //
+  // PL_MAX_STAGES is the parser-tier upper bound; the kernel-side
+  // Pipeline planner caps at 8, so a parser output with more than 8
+  // stages is well-formed syntactically but will fail at
+  // planner-admission (PL_ERR_TOO_MANY in the kernel band).
+  //
+  // PL_MAX_ARGS is the per-stage argv capacity (cmd_name is a
+  // separate slot and NOT counted toward this budget).
+
+  pub let PL_STAGE_SIZE : u64 = 64
+  pub let PL_MAX_STAGES : u64 = 16
+  pub let PL_MAX_ARGS   : u64 = 8
+
+  // Stage field offsets (byte offsets within one PipelineStage record).
+  pub let PL_OFF_CMD_NAME_OFF  : u64 = 0
+  pub let PL_OFF_CMD_NAME_LEN  : u64 = 4
+  pub let PL_OFF_N_ARGS        : u64 = 6
+  pub let PL_OFF_ARGV_OFFSETS  : u64 = 8
+  pub let PL_OFF_ARGV_LENS     : u64 = 40
+  pub let PL_OFF_FLAGS         : u64 = 56
+  pub let PL_OFF_RESERVED      : u64 = 58
+
+  // Flag bits in the `flags` u16.
+  pub let PL_FLAG_HAS_ESCAPES  : u64 = 0x0001
+  pub let PL_FLAG_HAS_QUOTES   : u64 = 0x0002
+
+  // ==========================================================================
+  // SECTION 3 -- WORD-SLOT SENTINEL
+  // ==========================================================================
+  //
+  // _pl_emit_word takes a `word_slot` argument that is either
+  // `PL_SLOT_CMD` (= 0xFFFF) meaning "the stage's cmd_name slot" or
+  // an argv index 0..PL_MAX_ARGS-1 meaning "argv[word_slot]". Any
+  // other value returns PL_ERR_TOO_MANY_ARGS.
+
+  pub let PL_SLOT_CMD : u64 = 0xFFFF
+
+  // ==========================================================================
+  // SECTION 4 -- STATE ENUM (held in [rsp + 16] in _pl_parse)
+  // ==========================================================================
+
+  pub let PL_STATE_WS   : u64 = 0
+  pub let PL_STATE_BARE : u64 = 1
+  pub let PL_STATE_DQ   : u64 = 2
+  pub let PL_STATE_SQ   : u64 = 3
+
+  // ==========================================================================
+  // _pl_emit_word(stage_ptr, offset, len, word_slot) -> u64
+  //
+  //   rdi = stage_ptr      (pointer to the PipelineStage being filled)
+  //   rsi = offset         (byte offset into the input buffer; u32)
+  //   rdx = len            (byte length of the span; u16)
+  //   rcx = word_slot      (PL_SLOT_CMD or 0..7)
+  //   rax = PL_OK on success,
+  //         PL_ERR_TOO_MANY_ARGS if word_slot is out of range for argv.
+  //
+  // Side effects: writes cmd_name_offset+len (for PL_SLOT_CMD) or
+  // argv_offsets[slot] + argv_lens[slot] (for 0..7), and bumps the
+  // n_args u16 at [stage_ptr + 6] to (slot + 1) when writing an argv
+  // slot. Does NOT touch cur_stage_dirty or flags -- the caller
+  // manages those.
+  //
+  // Pure leaf; two-push prologue (rbx, r12) to carry stage_ptr and
+  // slot across the dispatch arithmetic. No nested CALL; no stack
+  // frame.
+  //
+  // Labels prefixed pl_ew_.
+  // ==========================================================================
+  pub let _pl_emit_word : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (stage_ptr: u64) (offset: u64) (len: u64) (word_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R223.M1 (#2666): _pl_emit_word writes one (offset, len) pair into a PipelineStage record at either the cmd_name slot ([stage_ptr+0] u32 offset, [stage_ptr+4] u16 len) when word_slot == PL_SLOT_CMD (0xFFFF), or the argv[slot] slot ([stage_ptr + 8 + slot*4] u32 offset, [stage_ptr + 40 + slot*2] u16 len) when word_slot is 0..7. Any other word_slot value returns PL_ERR_TOO_MANY_ARGS (0x2B01). u32 writes via mov_d (paideia-as W32 sized store; precedent in libpdx-argv emit_parse_error and libpdx-volume pdxb_kek_derive). u16 writes via two mov_b (low byte, high byte); mov_w short-form is not in use in this repo. Address computation for argv slots: shl rax,2 for *4 offset stride; shl rax,1 for *2 len stride; both avoid the paideia-as 2-op imul-r-imm pitfall. All cmp immediates (0xFFFF, 8) fit in imm32 and are sign-safe. Prologue: push rbx, push r12 (two callee-save qwords) to carry stage_ptr and slot across arithmetic; no sub rsp, no nested CALL. Register plan: rbx=stage_ptr (saved from rdi), r12=word_slot (saved from rcx), rax/rcx/r8/r9=scratch arithmetic. Label prefix pl_ew_ per the reserved-label discipline. No test; no and-imm64; no 2-op imul; no multiline let; no add-reg-mem.",
+      block: {
+        // ---- Prologue --------------------------------------------------
+        push rbx;
+        push r12;
+
+        // Save stage_ptr and slot into callee-save for easy reuse.
+        mov rbx, rdi;            // rbx = stage_ptr
+        mov r12, rcx;            // r12 = word_slot
+
+        // ---- Dispatch: cmd slot vs argv slot ---------------------------
+        cmp r12, 0xFFFF;         // PL_SLOT_CMD?
+        je  pl_ew_cmd;
+
+        // argv slot: must be < PL_MAX_ARGS (8).
+        cmp r12, 8;
+        jae pl_ew_too_many;
+
+        // ---- argv slot write -------------------------------------------
+        // u32 offset at [stage_ptr + 8 + slot*4].
+        //   r8 = stage_ptr + slot*4  (compute via shl r8, 2; add r8, rbx)
+        //   mov_d [r8 + 8], rax     with rax = offset
+        mov r8, r12;
+        shl r8, 2;
+        add r8, rbx;
+        mov rax, rsi;            // rax = offset
+        mov_d [r8 + 8], rax;
+
+        // u16 len at [stage_ptr + 40 + slot*2].
+        //   r9 = stage_ptr + slot*2  (compute via shl r9, 1; add r9, rbx)
+        //   mov_b [r9 + 40], rdx_lo
+        //   mov_b [r9 + 41], rdx_hi
+        mov r9, r12;
+        shl r9, 1;
+        add r9, rbx;
+        mov rax, rdx;            // rax = len
+        mov_b [r9 + 40], rax;    // low byte
+        shr rax, 8;
+        mov_b [r9 + 41], rax;    // high byte
+
+        // n_args = slot + 1  (u16 at [stage_ptr + 6]).
+        mov rax, r12;
+        add rax, 1;
+        mov_b [rbx + 6], rax;    // low byte
+        shr rax, 8;
+        mov_b [rbx + 7], rax;    // high byte
+
+        // Success.
+        xor rax, rax;            // PL_OK
+        pop r12;
+        pop rbx;
+        ret;
+
+        // ---- cmd slot write --------------------------------------------
+      pl_ew_cmd:
+        // u32 offset at [stage_ptr + 0].
+        mov rax, rsi;
+        mov_d [rbx + 0], rax;
+
+        // u16 len at [stage_ptr + 4].
+        mov rax, rdx;
+        mov_b [rbx + 4], rax;    // low byte
+        shr rax, 8;
+        mov_b [rbx + 5], rax;    // high byte
+
+        // Success. (n_args is left alone; cmd_name is a separate slot.)
+        xor rax, rax;            // PL_OK
+        pop r12;
+        pop rbx;
+        ret;
+
+        // ---- Out-of-range argv slot ------------------------------------
+      pl_ew_too_many:
+        mov rax, 0x2B01;         // PL_ERR_TOO_MANY_ARGS
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _pl_parse(bytes_ptr, bytes_len, out_ptr, out_cap) -> packed_u64
+  //
+  //   rdi = bytes_ptr      (pointer to the NFC-normalised input bytes)
+  //   rsi = bytes_len      (input length in bytes; 0 is well-defined)
+  //   rdx = out_ptr        (pointer to the output stage buffer)
+  //   rcx = out_cap        (output buffer capacity in bytes)
+  //   rax = (n_stages << 32) | status
+  //
+  // Walks the input bytes through the four-state tokeniser (WS, BARE,
+  // DQ, SQ), emitting one PipelineStage per `|`-delimited segment via
+  // CALLs to _pl_emit_word at the four word-boundary sites. Honours
+  // the escape pair `\|` and `\"` outside and inside double-quotes
+  // respectively (not inside single-quotes, which pass bytes
+  // verbatim).
+  //
+  // Local frame (48 bytes at [rsp], after the 5-push prologue):
+  //
+  //   [rsp + 0]   i                 cursor into input bytes
+  //   [rsp + 8]   word_start        byte offset where current word started
+  //   [rsp + 16]  state             PL_STATE_* (WS/BARE/DQ/SQ)
+  //   [rsp + 24]  word_slot         PL_SLOT_CMD (0xFFFF) or 0..7
+  //   [rsp + 32]  stages_written    count of fully-committed stages
+  //   [rsp + 40]  cur_stage_dirty   1 iff current stage has >= 1 word
+  //
+  // Register plan:
+  //
+  //   rbx = bytes_ptr (saved)
+  //   r12 = bytes_len (saved)
+  //   r13 = out_ptr   (saved; immutable base)
+  //   r14 = out_end   (= out_ptr + out_cap; precomputed capacity cap)
+  //   r15 = current_stage_ptr (advances by PL_STAGE_SIZE at each `|`)
+  //
+  //   Scratch: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11 (SysV caller-save).
+  //
+  // Labels prefixed pl_.
+  // ==========================================================================
+  pub let _pl_parse : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bytes_ptr: u64) (bytes_len: u64) (out_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "libpdx-pds-parser R223.M1 (#2666): _pl_parse real body. Walks input bytes through the WS/BARE/DQ/SQ state machine; emits PipelineStage records at every `|` boundary and at EOI. Each word boundary CALLs _pl_emit_word with (stage_ptr, offset, len, slot). Escape handling: `\|` outside quotes and `\"` inside dq consume both bytes and set PL_FLAG_HAS_ESCAPES in the stage flags u16 (bit 0 at [r15+56]). PL_FLAG_HAS_QUOTES (bit 1) is set when any argv enters DQ or SQ. The flag OR uses `mov_b rax,[r15+56]; or rax, r8; mov_b [r15+56], rax` -- a 3-op bit-set shape with no imm64 (precedent: libpdx-elevate elevate_policy_client.pdx). Byte loads via `xor rax, rax; mov_b rax, [rbx + rcx * 1]` with explicit *1 scale (paideia-as #1248 + U1606 mitigation per libpdx-audit audit_file_sink). Prologue: 5 callee-save pushes (rbx, r12, r13, r14, r15 = 40 bytes) + sub rsp, 48 (local frame) = 88 bytes added; rsp%16 goes from 8 (entry) to (8+88)%16 = 0 before every nested CALL into _pl_emit_word. Frame layout: [rsp+0]=i, [rsp+8]=word_start, [rsp+16]=state, [rsp+24]=word_slot, [rsp+32]=stages_written, [rsp+40]=cur_stage_dirty. Stage advance: `add r15, 64` per `|`. OOS check: `r15 + 64 > r14` triggers PL_ERR_OUT_TOO_SMALL. Stage count check: stages_written >= PL_MAX_STAGES (16) at next-stage-start triggers PL_ERR_TOO_MANY_STAGES. Zero-fill of fresh stage: 8 `mov [r15 + disp], rax` with rax=0, covering the full 64-byte stride. Empty input (bytes_len==0 or all-ws) returns (0<<32)|PL_OK. Trailing `|` or `||` triggers PL_ERR_EMPTY_STAGE. Unterminated `\"` or `'` at EOI triggers PL_ERR_UNTERMINATED_QUOTE. The packed return at every success/error site uses `shl rax, 32; or rax, r10` to compose (n_stages<<32)|status (precedent: libpdx-audit audit_begin's audit_id composition at src/audit_broker.pdx L163). All cmp immediates (0, 1, 2, 3, 8, 16, 64, 0x09, 0x20, 0x22, 0x27, 0x5C, 0x7C, 0xFFFF, 0x2B00..0x2B04) fit in imm32 and are sign-safe. No test; no and-imm64; no 2-op imul; no multiline let; no add-reg-mem. Label prefix pl_ per the reserved-label discipline.",
+      block: {
+        // ====================================================================
+        // ---- Prologue ------------------------------------------------------
+        // ====================================================================
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 48;
+
+        // Save args into callee-save regs + precompute out_end.
+        mov rbx, rdi;            // bytes_ptr
+        mov r12, rsi;            // bytes_len
+        mov r13, rdx;            // out_ptr
+        mov r14, rdx;            // out_end = out_ptr + out_cap
+        add r14, rcx;
+
+        // Current stage pointer starts at out_ptr.
+        mov r15, r13;
+
+        // Initialise local frame.
+        xor rax, rax;
+        mov [rsp + 0], rax;      // i = 0
+        mov [rsp + 8], rax;      // word_start = 0
+        mov [rsp + 16], rax;     // state = PL_STATE_WS (0)
+        mov [rsp + 32], rax;     // stages_written = 0
+        mov [rsp + 40], rax;     // cur_stage_dirty = 0
+
+        mov rax, 0xFFFF;         // PL_SLOT_CMD
+        mov [rsp + 24], rax;     // word_slot = cmd sentinel
+
+        // ====================================================================
+        // ---- Edge cases: empty input / tiny buffer ------------------------
+        // ====================================================================
+
+        // bytes_len == 0 -> zero stages, PL_OK.
+        cmp r12, 0;
+        je  pl_return_zero_ok;
+
+        // out_cap < PL_STAGE_SIZE -> OUT_TOO_SMALL (we can't even write
+        // one stage; the input is non-empty so we WILL need one).
+        //
+        // Compute out_cap = r14 - r13 implicitly via `cmp r15 + 64, r14`
+        // after we set r15. The simpler shape: if r14 - r13 < 64, OOS.
+        mov rax, r14;
+        sub rax, r13;            // rax = out_cap
+        cmp rax, 64;
+        jb  pl_return_oos;
+
+        // Zero stage 0 (64 bytes = 8 qwords).
+        xor rax, rax;
+        mov [r15 + 0], rax;
+        mov [r15 + 8], rax;
+        mov [r15 + 16], rax;
+        mov [r15 + 24], rax;
+        mov [r15 + 32], rax;
+        mov [r15 + 40], rax;
+        mov [r15 + 48], rax;
+        mov [r15 + 56], rax;
+
+        // ====================================================================
+        // ---- Main loop ----------------------------------------------------
+        // ====================================================================
+      pl_loop:
+        mov rcx, [rsp + 0];      // rcx = i
+        cmp rcx, r12;
+        jae pl_eoi;
+
+        // Load byte: rax = input[i].
+        xor rax, rax;
+        mov_b rax, [rbx + rcx * 1];
+
+        // Dispatch on state.
+        mov rdx, [rsp + 16];
+        cmp rdx, 0;              // PL_STATE_WS
+        je  pl_s_ws;
+        cmp rdx, 1;              // PL_STATE_BARE
+        je  pl_s_bare;
+        cmp rdx, 2;              // PL_STATE_DQ
+        je  pl_s_dq;
+        // Fall through: state must be PL_STATE_SQ.
+        jmp pl_s_sq;
+
+        // --------------------------------------------------------------------
+        // State: WS -- between words
+        // --------------------------------------------------------------------
+      pl_s_ws:
+        cmp rax, 0x7C;           // '|'
+        je  pl_ws_pipe;
+        cmp rax, 0x20;           // SP
+        je  pl_advance_byte;
+        cmp rax, 0x09;           // TAB
+        je  pl_advance_byte;
+        cmp rax, 0x22;           // '"'
+        je  pl_ws_open_dq;
+        cmp rax, 0x27;           // '\''
+        je  pl_ws_open_sq;
+        // Otherwise -> open bareword at i. (Includes '\' as the first
+        // byte of a bareword; escape handling will set the flag as the
+        // state-machine walks over the backslash below.)
+        mov [rsp + 8], rcx;      // word_start = i
+        mov rax, 1;              // PL_STATE_BARE
+        mov [rsp + 16], rax;
+        jmp pl_advance_byte;
+
+      pl_ws_open_dq:
+        // Opening '"': word starts one byte past the quote.
+        mov rax, rcx;
+        add rax, 1;
+        mov [rsp + 8], rax;      // word_start = i + 1
+        mov rax, 2;              // PL_STATE_DQ
+        mov [rsp + 16], rax;
+        // Set HAS_QUOTES flag.
+        mov_b r10, [r15 + 56];
+        mov r11, 2;              // PL_FLAG_HAS_QUOTES
+        or  r10, r11;
+        mov_b [r15 + 56], r10;
+        jmp pl_advance_byte;
+
+      pl_ws_open_sq:
+        // Opening '\'': word starts one byte past the quote.
+        mov rax, rcx;
+        add rax, 1;
+        mov [rsp + 8], rax;      // word_start = i + 1
+        mov rax, 3;              // PL_STATE_SQ
+        mov [rsp + 16], rax;
+        // Set HAS_QUOTES flag.
+        mov_b r10, [r15 + 56];
+        mov r11, 2;              // PL_FLAG_HAS_QUOTES
+        or  r10, r11;
+        mov_b [r15 + 56], r10;
+        jmp pl_advance_byte;
+
+      pl_ws_pipe:
+        // '|' seen in WS state. Current stage must be dirty.
+        mov rax, [rsp + 40];
+        cmp rax, 1;
+        jne pl_err_empty_stage;
+        // Commit the current (dirty) stage and advance.
+        jmp pl_commit_stage;
+
+        // --------------------------------------------------------------------
+        // State: BARE -- inside a bareword
+        // --------------------------------------------------------------------
+      pl_s_bare:
+        cmp rax, 0x20;           // SP
+        je  pl_bare_end_ws;
+        cmp rax, 0x09;           // TAB
+        je  pl_bare_end_ws;
+        cmp rax, 0x7C;           // '|'
+        je  pl_bare_end_pipe;
+        cmp rax, 0x5C;           // '\\'
+        je  pl_bare_escape;
+        // Ordinary byte -- stay in BARE, advance.
+        jmp pl_advance_byte;
+
+      pl_bare_escape:
+        // Backslash in bareword. Consume the next byte verbatim (if
+        // it's '|' or '"' it's a documented escape; any other
+        // following byte we also consume, treating the backslash as
+        // a literal). Set HAS_ESCAPES on recognised escapes.
+        //
+        // Advance cursor past the backslash first.
+        add rcx, 1;
+        mov [rsp + 0], rcx;
+        // Peek next byte (if any).
+        cmp rcx, r12;
+        jae pl_loop;             // backslash at EOI -- treated as literal, done
+        xor rax, rax;
+        mov_b rax, [rbx + rcx * 1];
+        cmp rax, 0x7C;           // '|'
+        je  pl_bare_escape_set_flag;
+        cmp rax, 0x22;           // '"'
+        je  pl_bare_escape_set_flag;
+        // Any other byte: consume as-is (literal backslash + byte).
+        jmp pl_advance_byte;
+
+      pl_bare_escape_set_flag:
+        mov_b r10, [r15 + 56];
+        mov r11, 1;              // PL_FLAG_HAS_ESCAPES
+        or  r10, r11;
+        mov_b [r15 + 56], r10;
+        jmp pl_advance_byte;
+
+      pl_bare_end_ws:
+        // Bareword terminated by SP/TAB. Emit then transition to WS.
+        // offset = word_start; len = i - word_start.
+        mov rdi, r15;            // stage_ptr
+        mov rsi, [rsp + 8];      // offset = word_start
+        mov rdx, rcx;            // len = i - word_start
+        sub rdx, rsi;
+        mov rcx, [rsp + 24];     // word_slot
+        call _pl_emit_word;
+        cmp rax, 0;
+        jne pl_err_from_emit;
+        // Successful emit -> stage is now dirty; advance word_slot.
+        mov rax, 1;
+        mov [rsp + 40], rax;     // cur_stage_dirty = 1
+        // word_slot: cmd sentinel -> 0; else -> slot + 1.
+        mov rax, [rsp + 24];
+        cmp rax, 0xFFFF;
+        je  pl_bare_end_ws_set0;
+        add rax, 1;
+        mov [rsp + 24], rax;
+        jmp pl_bare_end_ws_done;
+      pl_bare_end_ws_set0:
+        xor rax, rax;
+        mov [rsp + 24], rax;     // word_slot = 0 (first argv)
+      pl_bare_end_ws_done:
+        // state = WS, advance cursor past the whitespace byte.
+        xor rax, rax;
+        mov [rsp + 16], rax;     // state = PL_STATE_WS
+        jmp pl_advance_byte;
+
+      pl_bare_end_pipe:
+        // Bareword terminated by '|'. Emit, then commit stage.
+        mov rdi, r15;
+        mov rsi, [rsp + 8];
+        mov rdx, rcx;
+        sub rdx, rsi;
+        mov rcx, [rsp + 24];
+        call _pl_emit_word;
+        cmp rax, 0;
+        jne pl_err_from_emit;
+        mov rax, 1;
+        mov [rsp + 40], rax;     // cur_stage_dirty = 1
+        // state will be reset by commit_stage; don't bump word_slot
+        // (new stage resets it).
+        jmp pl_commit_stage;
+
+        // --------------------------------------------------------------------
+        // State: DQ -- inside "..." word
+        // --------------------------------------------------------------------
+      pl_s_dq:
+        cmp rax, 0x22;           // '"'
+        je  pl_dq_close;
+        cmp rax, 0x5C;           // '\\'
+        je  pl_dq_escape;
+        jmp pl_advance_byte;
+
+      pl_dq_escape:
+        // Backslash inside dq. Consume next byte verbatim; set
+        // HAS_ESCAPES on `\"` (the one documented dq-interior escape).
+        add rcx, 1;
+        mov [rsp + 0], rcx;
+        cmp rcx, r12;
+        jae pl_loop;             // backslash at EOI -- next iter catches unterminated-quote
+        xor rax, rax;
+        mov_b rax, [rbx + rcx * 1];
+        cmp rax, 0x22;           // '"'
+        je  pl_dq_escape_set_flag;
+        // Any other byte in dq after '\\' -- consume as literal.
+        jmp pl_advance_byte;
+
+      pl_dq_escape_set_flag:
+        mov_b r10, [r15 + 56];
+        mov r11, 1;              // PL_FLAG_HAS_ESCAPES
+        or  r10, r11;
+        mov_b [r15 + 56], r10;
+        jmp pl_advance_byte;
+
+      pl_dq_close:
+        // Closing '"'. Emit word (offset = word_start, len = i -
+        // word_start -- closing quote NOT included in span).
+        mov rdi, r15;
+        mov rsi, [rsp + 8];
+        mov rdx, rcx;
+        sub rdx, rsi;
+        mov rcx, [rsp + 24];
+        call _pl_emit_word;
+        cmp rax, 0;
+        jne pl_err_from_emit;
+        mov rax, 1;
+        mov [rsp + 40], rax;     // dirty = 1
+        // Advance word_slot.
+        mov rax, [rsp + 24];
+        cmp rax, 0xFFFF;
+        je  pl_dq_close_set0;
+        add rax, 1;
+        mov [rsp + 24], rax;
+        jmp pl_dq_close_done;
+      pl_dq_close_set0:
+        xor rax, rax;
+        mov [rsp + 24], rax;
+      pl_dq_close_done:
+        xor rax, rax;
+        mov [rsp + 16], rax;     // state = WS
+        jmp pl_advance_byte;
+
+        // --------------------------------------------------------------------
+        // State: SQ -- inside '...' word (no escapes)
+        // --------------------------------------------------------------------
+      pl_s_sq:
+        cmp rax, 0x27;           // '\''
+        je  pl_sq_close;
+        jmp pl_advance_byte;
+
+      pl_sq_close:
+        mov rdi, r15;
+        mov rsi, [rsp + 8];
+        mov rdx, rcx;
+        sub rdx, rsi;
+        mov rcx, [rsp + 24];
+        call _pl_emit_word;
+        cmp rax, 0;
+        jne pl_err_from_emit;
+        mov rax, 1;
+        mov [rsp + 40], rax;
+        mov rax, [rsp + 24];
+        cmp rax, 0xFFFF;
+        je  pl_sq_close_set0;
+        add rax, 1;
+        mov [rsp + 24], rax;
+        jmp pl_sq_close_done;
+      pl_sq_close_set0:
+        xor rax, rax;
+        mov [rsp + 24], rax;
+      pl_sq_close_done:
+        xor rax, rax;
+        mov [rsp + 16], rax;
+        jmp pl_advance_byte;
+
+        // --------------------------------------------------------------------
+        // Shared: advance cursor by one, loop
+        // --------------------------------------------------------------------
+      pl_advance_byte:
+        mov rcx, [rsp + 0];
+        add rcx, 1;
+        mov [rsp + 0], rcx;
+        jmp pl_loop;
+
+        // --------------------------------------------------------------------
+        // Shared: commit current stage on `|`, prepare for next stage
+        // --------------------------------------------------------------------
+      pl_commit_stage:
+        // dirty was validated by the caller branch.
+        // Increment stages_written.
+        mov rax, [rsp + 32];
+        add rax, 1;
+        mov [rsp + 32], rax;
+
+        // Starting a NEW stage; its index is stages_written. Must be
+        // < PL_MAX_STAGES. If stages_written == PL_MAX_STAGES, we
+        // can't make another stage.
+        cmp rax, 16;
+        jae pl_err_many_stages;
+
+        // Advance r15 to the next stage slot.
+        add r15, 64;
+
+        // Check buffer room: r15 + 64 <= r14 (out_end).
+        mov r10, r15;
+        add r10, 64;
+        cmp r10, r14;
+        ja  pl_err_oos;
+
+        // Zero the next stage.
+        xor rax, rax;
+        mov [r15 + 0], rax;
+        mov [r15 + 8], rax;
+        mov [r15 + 16], rax;
+        mov [r15 + 24], rax;
+        mov [r15 + 32], rax;
+        mov [r15 + 40], rax;
+        mov [r15 + 48], rax;
+        mov [r15 + 56], rax;
+
+        // Reset per-stage state.
+        xor rax, rax;
+        mov [rsp + 40], rax;     // cur_stage_dirty = 0
+        mov [rsp + 16], rax;     // state = PL_STATE_WS
+        mov rax, 0xFFFF;
+        mov [rsp + 24], rax;     // word_slot = PL_SLOT_CMD
+
+        // Advance cursor past the '|' byte.
+        mov rcx, [rsp + 0];
+        add rcx, 1;
+        mov [rsp + 0], rcx;
+        jmp pl_loop;
+
+        // ====================================================================
+        // ---- End-of-input handling ----------------------------------------
+        // ====================================================================
+      pl_eoi:
+        // Dispatch on state.
+        mov rdx, [rsp + 16];
+        cmp rdx, 2;              // PL_STATE_DQ
+        je  pl_err_unterm_quote;
+        cmp rdx, 3;              // PL_STATE_SQ
+        je  pl_err_unterm_quote;
+
+        cmp rdx, 1;              // PL_STATE_BARE
+        je  pl_eoi_in_bare;
+
+        // State == WS at EOI.
+        // If dirty, that means we already closed a word via SP/TAB
+        // and no pipe followed -> the current stage is valid, commit
+        // its count. If not dirty but stages_written > 0, that means
+        // the input ended with a trailing `|` -> error.
+        mov rax, [rsp + 40];     // cur_stage_dirty
+        cmp rax, 1;
+        je  pl_eoi_commit_last;
+
+        // Not dirty.
+        mov rax, [rsp + 32];     // stages_written
+        cmp rax, 0;
+        je  pl_return_zero_ok;   // completely empty input (or all-ws)
+        jmp pl_err_empty_stage;  // trailing `|`
+
+      pl_eoi_in_bare:
+        // Emit the trailing bareword.
+        mov rcx, [rsp + 0];      // i = bytes_len
+        mov rdi, r15;
+        mov rsi, [rsp + 8];      // offset
+        mov rdx, rcx;
+        sub rdx, rsi;            // len
+        mov rcx, [rsp + 24];     // word_slot
+        call _pl_emit_word;
+        cmp rax, 0;
+        jne pl_err_from_emit;
+        mov rax, 1;
+        mov [rsp + 40], rax;     // dirty
+        jmp pl_eoi_commit_last;
+
+      pl_eoi_commit_last:
+        // Commit the final (dirty) stage.
+        mov rax, [rsp + 32];
+        add rax, 1;
+        mov [rsp + 32], rax;
+        // Guard: we already have the slot committed in-buffer; the
+        // only check is PL_MAX_STAGES. (OOS was validated at advance
+        // time; here we just bump the count.)
+        cmp rax, 16;
+        ja  pl_err_many_stages;
+
+        // Pack return: (n_stages << 32) | PL_OK.
+        mov r10, 0;              // status = PL_OK
+        shl rax, 32;
+        or  rax, r10;
+        jmp pl_epilogue;
+
+        // ====================================================================
+        // ---- Error return paths -------------------------------------------
+        // ====================================================================
+      pl_err_from_emit:
+        // rax already carries a PL_ERR_* status (currently only
+        // PL_ERR_TOO_MANY_ARGS from _pl_emit_word).
+        mov r10, rax;            // status in low 32
+        mov rax, [rsp + 32];     // n_stages (committed before fault)
+        shl rax, 32;
+        or  rax, r10;
+        jmp pl_epilogue;
+
+      pl_err_many_stages:
+        mov r10, 0x2B00;
+        mov rax, [rsp + 32];
+        shl rax, 32;
+        or  rax, r10;
+        jmp pl_epilogue;
+
+      pl_err_unterm_quote:
+        mov r10, 0x2B02;
+        mov rax, [rsp + 32];
+        shl rax, 32;
+        or  rax, r10;
+        jmp pl_epilogue;
+
+      pl_err_empty_stage:
+        mov r10, 0x2B03;
+        mov rax, [rsp + 32];
+        shl rax, 32;
+        or  rax, r10;
+        jmp pl_epilogue;
+
+      pl_err_oos:
+      pl_return_oos:
+        mov r10, 0x2B04;
+        mov rax, [rsp + 32];
+        shl rax, 32;
+        or  rax, r10;
+        jmp pl_epilogue;
+
+      pl_return_zero_ok:
+        // (0 << 32) | PL_OK == 0.
+        xor rax, rax;
+        jmp pl_epilogue;
+
+        // ====================================================================
+        // ---- Epilogue -----------------------------------------------------
+        // ====================================================================
+      pl_epilogue:
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

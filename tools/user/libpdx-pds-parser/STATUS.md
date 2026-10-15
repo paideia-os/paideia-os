@@ -1,9 +1,12 @@
 # libpdx-pds-parser -- status
 
-**Wave:** R221 (semantic shell -- parser-tier Unicode and lexer
-umbrella, paideia-os#2485)
-**Current milestone:** M1 (UTF-8 decoder + NFC normalizer) -- landed.
-**Version:** 1.0.0.
+**Waves:**
+- R221 (semantic shell -- parser-tier Unicode and lexer umbrella,
+  paideia-os#2485)
+- R223 (pipeline-lang umbrella, paideia-os#2487)
+**Current milestones:** R221.M1 (UTF-8 decoder + NFC normalizer) --
+landed. R223.M1 (Pipeline stage parser) -- landed.
+**Version:** 1.1.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -60,18 +63,34 @@ table alongside the output bytes.
 
 Blocked by: M5. 24-hour AFL run gates landing.
 
+## R223 pipeline-lang checklist
+
+### M1 -- Pipeline stage parser + `|` operator (paideia-os#2666, landed)
+
+- [x] **R223.M1-001** -- `src/pipeline.pdx` module `Pipeline` landed:
+      `_pl_parse` + `_pl_emit_word`, 64-byte stage record, PL_* status
+      taxonomy in 0x2B00..0x2BFF.
+- [x] **R223.M1-002** -- design doc landed:
+      `design/shell/pipeline-stage-parser.md`.
+- [ ] **R223.M1-003** -- 30-test parser corpus
+      (`tests/proptest_pipeline.pdx`): deferred to R223.M7 per the
+      umbrella decomposition; the design doc §12 enumerates the
+      representative OK/error cases that corpus will cover.
+
 ## Error-band accounting
 
 | Band             | Range            | Milestone | Status |
 |------------------|------------------|-----------|--------|
-| utf8_nfc         | 0x2700..0x2702   | M1        | landed |
-| grapheme_iter    | 0x2710..0x271F   | M2        | reserved |
-| width_pass       | 0x2720..0x272F   | M3        | reserved |
-| lexer            | 0x2730..0x274F   | M4        | reserved |
-| ast              | 0x2750..0x275F   | M5        | reserved |
-| span_map         | 0x2760..0x276F   | M6        | reserved |
+| utf8_nfc         | 0x2700..0x2702   | R221.M1   | landed |
+| grapheme_iter    | 0x2710..0x271F   | R221.M2   | reserved |
+| width_pass       | 0x2720..0x272F   | R221.M3   | reserved |
+| lexer            | 0x2730..0x274F   | R221.M4   | reserved |
+| ast              | 0x2750..0x275F   | R221.M5   | reserved |
+| span_map         | 0x2760..0x276F   | R221.M6   | reserved |
+| pipeline         | 0x2B00..0x2B04   | R223.M1   | landed |
+| pipeline-M2+     | 0x2B05..0x2BFF   | R223.M2+  | reserved |
 
-All codes live in the 0x2700..0x27FF parser-tier packed-status
-range. Disjoint from every user-space `0xFFFFExxx` error band in
+Codes live in the parser-tier packed-status range (0x2700..0x2BFF
+slice). Disjoint from every user-space `0xFFFFExxx` error band in
 the paideia-os tree (see `caps.decl` for the full disjointness
 proof).

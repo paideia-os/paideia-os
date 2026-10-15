@@ -25,23 +25,27 @@ syscall, binds no ambient service, holds no capability of its own
 
 ## Status
 
-**M1 landed — v1.0.0.** UTF-8 decoder + NFC normalizer with the
-ASCII fast-path heuristic for the parser hot path. See
-[`STATUS.md`](STATUS.md) for the per-milestone roadmap; M2..M7
-remain in follow-up issues.
+**R221.M1 landed — v1.1.0.** UTF-8 decoder + NFC normalizer with the
+ASCII fast-path heuristic.
+**R223.M1 landed — v1.1.0.** Pipeline-stage parser (`cmd | cmd | ...`
+tokeniser with quoting + escape handling).
+See [`STATUS.md`](STATUS.md) for the per-milestone roadmap; R221.M2+
+and R223.M2+ remain in follow-up issues.
 
-## API surface (M1)
+## API surface
 
 Every function returns a single `u64` register per paideia-as
 calling convention; multi-value returns pack into a single register
 per the shape documented at each site.
+
+### R221.M1 — UTF-8 decoder + NFC normaliser
 
 | Function | Signature | Return |
 |---|---|---|
 | `Utf8Nfc::_u8n_quick_check_ascii` | `(bytes_ptr: u64, bytes_len: u64) -> u64` | `1` iff every byte `< 0x80`, else `0`. Zero-length input returns `1`. |
 | `Utf8Nfc::_u8n_decode_and_normalize` | `(bytes_ptr: u64, bytes_len: u64, out_ptr: u64, out_cap: u64) -> u64` | `(bytes_written << 32) \| status`; status in `{U8N_OK, U8N_ERR_INVALID_UTF8, U8N_ERR_OUT_TOO_SMALL, U8N_ERR_NORMALIZE_FAIL}` |
 
-### Status codes (`src/utf8_nfc.pdx` Section 1)
+#### U8N_* status codes (`src/utf8_nfc.pdx` Section 1)
 
 | Name | Value | Meaning |
 |---|---|---|
@@ -49,6 +53,36 @@ per the shape documented at each site.
 | `U8N_ERR_INVALID_UTF8` | `0x2700` | Input is not RFC 3629 well-formed UTF-8 |
 | `U8N_ERR_OUT_TOO_SMALL` | `0x2701` | `out_cap` smaller than NFC output |
 | `U8N_ERR_NORMALIZE_FAIL` | `0x2702` | Reserved for post-M1 normaliser-internal failure (never returned at M1) |
+
+### R223.M1 — Pipeline stage parser
+
+| Function | Signature | Return |
+|---|---|---|
+| `Pipeline::_pl_parse` | `(bytes_ptr: u64, bytes_len: u64, out_ptr: u64, out_cap: u64) -> u64` | `(n_stages << 32) \| status`; status in `{PL_OK, PL_ERR_TOO_MANY_STAGES, PL_ERR_TOO_MANY_ARGS, PL_ERR_UNTERMINATED_QUOTE, PL_ERR_EMPTY_STAGE, PL_ERR_OUT_TOO_SMALL}` |
+| `Pipeline::_pl_emit_word` | `(stage_ptr: u64, offset: u64, len: u64, word_slot: u64) -> u64` | `PL_OK` or `PL_ERR_TOO_MANY_ARGS`; internal helper |
+
+#### PL_* status codes (`src/pipeline.pdx` Section 1)
+
+| Name | Value | Meaning |
+|---|---|---|
+| `PL_OK` | `0` | Parse succeeded; `n_stages` is the number of 64-byte `PipelineStage` records written. |
+| `PL_ERR_TOO_MANY_STAGES` | `0x2B00` | > `PL_MAX_STAGES` (16) `\|`-delimited stages. |
+| `PL_ERR_TOO_MANY_ARGS` | `0x2B01` | > `PL_MAX_ARGS` (8) argv per stage (cmd_name separate). |
+| `PL_ERR_UNTERMINATED_QUOTE` | `0x2B02` | Open `"` or `'` at end-of-input. |
+| `PL_ERR_EMPTY_STAGE` | `0x2B03` | Consecutive `\|\|`, leading `\|`, or trailing `\|`. |
+| `PL_ERR_OUT_TOO_SMALL` | `0x2B04` | `out_cap` smaller than the stage buffer the input needs. |
+
+#### `PipelineStage` record (64 bytes)
+
+| Offset | Size | Field | Type |
+|---:|---:|---|---|
+| 0 | 4 | `cmd_name_offset` | u32 (byte offset into input) |
+| 4 | 2 | `cmd_name_len` | u16 |
+| 6 | 2 | `n_args` | u16 (0..`PL_MAX_ARGS`) |
+| 8 | 32 | `argv_offsets[8]` | u32[8] |
+| 40 | 16 | `argv_lens[8]` | u16[8] |
+| 56 | 2 | `flags` | u16 (bit 0 `HAS_ESCAPES`, bit 1 `HAS_QUOTES`) |
+| 58 | 6 | `_reserved[6]` | u8[6] (zero at M1) |
 
 ## Fast-path strategy
 
@@ -70,13 +104,16 @@ dominates the input distribution, so the fast path pays off.
 
 ## Linker dependencies
 
-`_u8n_decode_and_normalize` references the external symbol
+`Utf8Nfc::_u8n_decode_and_normalize` references the external symbol
 `_norm_nfc` from `libpdx-unicode-tables::Normalize` (R131.M3). A
 consumer linking this library passes
 `--extra-obj-dir tools/user/libpdx-unicode-tables/build-out` to
 `paideia-as link` so the symbol resolves. If the consumer wants
 only `_u8n_quick_check_ascii` (no nested call), it can link this
 library standalone.
+
+`Pipeline::_pl_parse` has no external linker dependencies; it only
+CALLs the module-private `_pl_emit_word`.
 
 ## Build
 
@@ -89,11 +126,14 @@ Requires `paideia-as >= 0.21.0`. The script auto-resolves the
 assembler via `$PAIDEIA_AS` env var, the sibling paideia-os checkout,
 or `$PATH`.
 
-## Design doc
+## Design docs
 
 - `design/shell/parser-utf8-nfc.md` — R221.M1 interaction model with
   the R131 Unicode substrate, fast-path heuristic rationale,
   forward path to R221.M2+.
+- `design/shell/pipeline-stage-parser.md` — R223.M1 grammar, state
+  machine, `PipelineStage` layout, interactions with R129.M5
+  renderer `as` syntax and R222 cmd-functor dispatch.
 
 ## References
 
