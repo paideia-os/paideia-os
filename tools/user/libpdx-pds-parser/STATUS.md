@@ -16,12 +16,19 @@ cluster-aware column accumulator with locale-amb overlay) --
 landed. R221.M4 (CtxLexer: context-tracking lexer over pipeline /
 datalog / lambda tiers) -- landed. R221.M5 (Ast: unified SyntaxNode
 sum type over a 256-slot bump-pointer pool with Q-A5 source-span
-invariants) -- landed. R222.M1 (SchemasSig parser) --
+invariants) -- landed. R221.M6 (SpanMap: sparse delta list that
+preserves Q-A5 source-byte offsets across UTF-8 -> NFC
+normalization; 1024-slot 8-byte pair pool, binary-search lookup,
+one-pass lockstep-walk constructor) -- landed. R222.M1 (SchemasSig parser) --
 landed. R222.M2 (CommandSig parser) -- landed. R222.M3
 (FunctorInstance: instantiation materialization record) -- landed.
 R222.M4 (ArgFlagSpec: HM-typed arg + flag descriptors and
 invocation checker) -- landed. R222.M5 (CmdRegistry: per-session
 command-registry client with user-shadow override) -- landed.
+R222.M6 (DispatchMode: light-vs-heavy classifier +
+indirector over `resource_mask` at CommandSigHeader+84, two
+weak-import function-pointer seams `_dm_light_fn` /
+`_dm_spawn_fn`) -- landed.
 R223.M1 (Pipeline stage parser) --
 landed. R223.M2 (RecordProjection: select/project FIELDS) --
 landed. R224.M1 (LambdaLit grammar) -- landed. R224.M2
@@ -33,11 +40,15 @@ E0820-family diagnostic) -- landed. R224.M5 (LetScope: nested
 lambda + let / let-rec scope-frame pool with inner-first parent-
 chain resolve per standard HM shadowing, E0830-family diagnostic)
 -- landed. R225.M1 (HM algorithm W core) -- landed.
-R225.M2 (RowTypes: Remy-style row polymorphism) -- landed. R226.M1
+R225.M2 (RowTypes: Remy-style row polymorphism) -- landed.
+R225.M4 (EffectUnify: effect-row JOIN with ROW_VAR tail
+propagation + rank-restricted-quantifier P10 well-formedness
+validator; three-entry surface `_eu_unify` / `_eu_check_rank` /
+`_eu_least` over the shared R225.M2 pool) -- landed. R226.M1
 (Datalog parser) -- landed. R229.M2 (SessionEnv: session-scoped
 bindings) -- landed. R229.M3 (TypeEnv: type-environment threading
 = scheme store + specialisation cache) -- landed.
-**Version:** 1.19.0.
+**Version:** 1.21.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -145,17 +156,50 @@ is landed).
       pipeline / datalog / lambda / record / literal fixture
       shapes for the acceptance anchor.
 
-### M6 -- Source-span tracking through NFC normalization (deferred)
+### M6 -- Source-span tracking through NFC normalization (paideia-os#2656, landed)
 
-Blocked by: M1 + M5 (unblocked). Will add a sibling entry point
-`_u8n_decode_and_normalize_with_map` that emits a span-mapping
-table alongside the output bytes, feeding into the AST module's
-`src_offset` / `src_length` slot so diagnostics quote the user's
-original (pre-NFC) input.
+- [x] **R221.M6-001** -- `src/span_map.pdx` module `SpanMap` landed:
+      four public entry points over a 1024-slot `.bss` pair pool
+      (`_sm_pairs` 8 KiB, `_sm_pair_count` u64). `_sm_init`
+      (hard-reset of `_sm_pair_count`), `_sm_record_pair(nfc_offset,
+      src_offset)` (append monotonic pair; strict-monotonicity
+      guard on both coordinates), `_sm_lookup(nfc_offset)`
+      (binary-search for largest preceding pair; returns
+      `pair.src + (query - pair.nfc)` or identity on empty-table),
+      `_sm_from_u8nfc(bytes_src, src_len, bytes_nfc, nfc_len)`
+      (one-pass lockstep walk that records one pair per divergence;
+      resync heuristic: decode UTF-8 scalar length from NFC lead
+      byte, advance NFC cursor, scan src for next matching byte).
+      Three entry points are PURE LEAVES; `_sm_from_u8nfc` has a
+      5-push + 16 B frame giving rsp%16==0 at the two nested CALLs.
+      SM_* status taxonomy in `0x4700..0x47FF` with four slots used
+      + 252 reserved for M6.1+.
+- [x] **R221.M6-002** -- design doc landed:
+      `design/shell/span-map-nfc.md` (sparse delta list, worked
+      example, pool layout, resync heuristic, correctness envelope,
+      status codes, register plan, linker + wire-up, acceptance
+      corpus, forward path, ABI freeze).
+- [ ] **R221.M6-003** -- 100-sample round-trip test corpus +
+      proptest harness (`tests/proptest_span_map.pdx`): deferred to
+      R221.M7 parser fuzz corpus per the umbrella decomposition;
+      the design doc §9 enumerates the five canonical cases
+      (ASCII, Latin+combining, multi-codepoint composition, CJK
+      fullwidth, mixed ASCII+combining+ASCII) + the pathological
+      pool-full case.
+- [ ] **R221.M6-004** (deferred) -- AST wire-up at `_ast_render`:
+      filed as R221.M6.1 follow-up. Currently `_ast_render`
+      span-copies from the NFC buffer verbatim; the M6.1 landing
+      threads `_sm_lookup` through to refine the pre-NFC offset
+      before span-copying.
+- [ ] **R221.M6-005** (deferred) -- bounded-window resync (W = 4):
+      filed as R221.M6.1 follow-up. The M6 heuristic resyncs on
+      the first byte matching `nfc[nc]`; the M6.1 variant will
+      cross-check the next W bytes for a stricter correctness
+      envelope.
 
 ### M7 -- Fuzz corpus for parser + Unicode (deferred)
 
-Blocked by: M5 (unblocked). 24-hour AFL run gates landing.
+Blocked by: M5 + M6 (unblocked). 24-hour AFL run gates landing.
 
 ## R222 cmd-functor checklist
 
@@ -216,10 +260,61 @@ Blocked by: M5 (unblocked). 24-hour AFL run gates landing.
       §Acceptance enumerates the 5-command seed + user-shadow override
       case and the ≤50 μs per-lookup target.
 
-### M6 -- commands.toml bind (deferred)
+### M6 -- Light vs heavy dispatch (paideia-os#2663, landed)
 
-Blocked by: M5. Adds the `= <literal>` default-value grammar to
-ArgSpec / FlagSpec.
+- [x] **R222.M6-001** -- `src/dispatch_mode.pdx` module
+      `DispatchMode` landed: `_dm_init` idempotent boot (zero-fills
+      the five u64 scalar .bss slots: two function-pointer slots +
+      three dispatch counters), `_dm_register_light` /
+      `_dm_register_spawn` publish fn pointers into
+      `_dm_light_fn` / `_dm_spawn_fn` (nil at session boot),
+      `_dm_classify(cs_body, cs_len)` validates the CommandSig
+      record (`cs_body != 0`, `cs_len >= 128`, magic `'CSIG' =
+      0x47495343` at offset 0) and reads `resource_mask` u32 at
+      offset 84 (R222.M2 reserved-tail carve-out), AND-tests
+      against `DM_HEAVY_MASK` (0x3C = NET|EXEC|LONG_RUNNING|
+      HIGH_MEM) via the imm8 variant of `and r64, imm8`, returns
+      `DM_LIGHT` (0) or `DM_HEAVY` (1). `_dm_dispatch(cs_body,
+      cs_len, mat_body, mat_len)` validates the FunctorInstance
+      materialization record, CALLs `_dm_classify`, bumps the
+      matching counter (`_dm_light_count` / `_dm_heavy_count`),
+      writes `_dm_last_decision` (1 = LIGHT, 2 = HEAVY), loads
+      the matching weak-import slot, and indirect-calls it via
+      `mov rax, [slot]; call rax` (precedent:
+      `script_cmd.pdx:660`). Pack: bits `[15:0]` status, bit
+      `[16]` decision, bits `[63:32]` downstream errno. DM_*
+      status taxonomy in `0x4800..0x48FF` (seven slots used +
+      249 reserved for M6.1+ follow-ups).
+- [x] **R222.M6-002** -- design doc landed:
+      `design/shell/light-heavy-dispatch.md`. Resource-mask bit
+      layout (FS_READ 0x01 / FS_WRITE 0x02 / NET 0x04 / EXEC 0x08
+      / LONG_RUNNING 0x10 / HIGH_MEM 0x20); LIGHT iff
+      `resource_mask & 0x3C == 0`; two disjoint weak-import seams
+      mirroring the R133.M5 `_tcg_check_fn` + R133.M6
+      `_sc_dispatch_fn` precedent; counter-based fingerprint
+      (user-space has no klog surface); 4-command acceptance
+      anchor (`where` + `sort` -> LIGHT; `find` + `grep` ->
+      HEAVY; post-sequence `_dm_light_count == 2`,
+      `_dm_heavy_count == 2`, `_dm_last_decision == 2`).
+- [x] **R222.M6-003** -- lib.pdx: version 1.19.0 -> 1.20.0;
+      `LPX_PDS_PARSER_R222_M6_READY` flipped to 1.
+- [x] **R222.M6-004** -- caps.decl: 0x4800..0x48FF band section
+      + per-milestone catalogue entry + grep-disjointness line
+      (`0x480[0-6]\b`) + linker-dependency entry.
+- [ ] **R222.M6-005** (deferred) --
+      `tests/proptest_dispatch_mode.pdx` 4-command corpus +
+      fingerprint goldens: filed as R222.M6.5 follow-up. The
+      design doc §9 enumerates the 4-command sequence so a
+      late-landing test harness can golden it from the spec.
+- [ ] **R222.M6-006** (deferred) -- commands.toml bind layer that
+      fills `resource_mask` from a `#resource` directive at
+      session boot: filed as R222.M6.5. Mirrors R133.M2's
+      cap-mask bind pass. The former M6 "commands.toml bind"
+      scope is now the TOML-side companion to this landing;
+      the parser-side dispatch-mode substrate lands first so
+      downstream smoke-mode asserters can exercise the
+      classifier against caller-supplied CommandSig records
+      with pre-populated `resource_mask` fields.
 
 ### M7 -- cmd-functor fuzz corpus (deferred)
 
@@ -528,11 +623,44 @@ Blocked by: M4. 20-test parser corpus + fuzz run gate landing.
 Blocked by: M1 + R222.M1 (SchemasSig descriptor array) + R220.M4
 (schema registry; paideia-as).
 
-### M4 -- Effect-row unification (deferred)
+### M4 -- Effect-row unification (paideia-os#2685, landed)
 
-Blocked by: M2 (reuses the Remy pivot verbatim; differentiator is a
-disjoint ROW_SUBKIND_EFFECT_* subkind) + R220.M8 (open-row effect
-inference; paideia-as).
+- [x] **R225.M4-001** -- `src/effect_unify.pdx` module `EffectUnify`
+      landed: three public entry points over the shared R225.M2
+      `_hm_pool`.
+      - `_eu_unify(row_a, row_b) -> packed_u64` — computes the JOIN
+        (set union with ROW_VAR tail propagation) of two effect
+        rows via a Phase-1a walk of row_a + Phase-1b walk of row_b
+        collecting packed label ids into `_eu_label_scratch` (128 B
+        .bss), then a Phase-2 prepend-with-dedup build onto a
+        fresh `_rt_row_empty` or `_rt_row_var` tail using
+        `_rt_row_select` as the dedup oracle.
+      - `_eu_check_rank(scheme_ptr, scheme_len) -> status` —
+        validates a HmCore scheme byte stream against the P10
+        rank-restriction well-formedness envelope (header
+        consistency, `n_bound_vars <= 64`, `n_body_nodes in
+        [1..128]`, legal body kinds). Pure byte walker; zero
+        callee-save pushes, no stack frame, no nested CALL.
+        `EU_ERR_RANK_RESTRICTED_VIOLATION` reserved for the
+        R225.M4.1 nested-quantifier wire format.
+      - `_eu_least(rows_ptr, n) -> packed_u64` — folds `_eu_unify`
+        across N rows; caps `n` at `EU_MAX_JOIN_ARITY=16`.
+      - EU_* status taxonomy in 0x4900..0x4907 (eight slots used;
+        0x4908..0x49FF reserved for R225.M4.1+).
+- [x] **R225.M4-002** -- design doc landed:
+      `design/shell/effect-row-unification.md`. 12 sections; 30-test
+      acceptance corpus enumerated at §7 (18 `_eu_unify` + 8
+      `_eu_check_rank` + 4 `_eu_least`).
+- [ ] **R225.M4-003** -- 30-test proptest harness
+      (`tests/proptest_effect_unify.pdx`): deferred to R225.M4.9
+      (shared R225.M9 harness landing) per the umbrella
+      decomposition.
+- [ ] **R225.M4-004** (deferred) -- M4.1 wire-format extension
+      landing nested-quantifier body nodes; `EU_ERR_RANK_RESTRICTED_VIOLATION`
+      becomes reachable.
+- [ ] **R225.M4-005** (deferred) -- M4.2 inner-subterm Rémy unify
+      arm in `_eu_unify` (pivot bindings for two open-tail inputs);
+      reserves `EU_ERR_ROWVAR_OCCURS` and `EU_ERR_UNIFY_INCONSISTENT`.
 
 ### M5 -- Cross-context type flow (deferred)
 
@@ -650,8 +778,12 @@ Blocked by: M4 + pdxfs user profile schema.
 | ctx_lexer        | 0x4200..0x4207   | R221.M4   | landed |
 | ctx_lexer-M4.1+  | 0x4208..0x42FF   | R221.M4.1+ | reserved |
 | lexer-m1-rsv     | 0x2730..0x274F   | R221.M4-rsv | superseded by ctx_lexer |
-| ast              | 0x2750..0x275F   | R221.M5   | reserved |
-| span_map         | 0x2760..0x276F   | R221.M6   | reserved |
+| ast-m1-rsv       | 0x2750..0x275F   | R221.M5-rsv | superseded by ast (0x4400..0x44FF) |
+| span_map-m1-rsv  | 0x2760..0x276F   | R221.M6-rsv | superseded by span_map (0x4700..0x47FF) |
+| ast              | 0x4400..0x4405   | R221.M5   | landed |
+| ast-M5.1+        | 0x4406..0x44FF   | R221.M5.1+ | reserved |
+| span_map         | 0x4700..0x4703   | R221.M6   | landed |
+| span_map-M6.1+   | 0x4704..0x47FF   | R221.M6.1+ | reserved |
 | schemas_sig      | 0x2A00..0x2A03   | R222.M1   | landed |
 | command_sig      | 0x3300..0x3303   | R222.M2   | landed |
 | functor_instance | 0x3900..0x3906   | R222.M3   | landed |
@@ -659,6 +791,8 @@ Blocked by: M4 + pdxfs user profile schema.
 | arg_flag_spec-M6+| 0x3C0B..0x3CFF   | R222.M6+  | reserved |
 | cmd_registry     | 0x4500..0x4505   | R222.M5   | landed |
 | cmd_registry-M6+ | 0x4506..0x45FF   | R222.M6+  | reserved |
+| dispatch_mode    | 0x4800..0x4806   | R222.M6   | landed |
+| dispatch_mode-M6.1+ | 0x4807..0x48FF | R222.M6.1+ | reserved |
 | pipeline         | 0x2B00..0x2B04   | R223.M1   | landed |
 | pipeline-M3+     | 0x2B05..0x2BFF   | R223.M3+  | reserved |
 | record_projection | 0x3400..0x3402  | R223.M2   | landed |
@@ -677,6 +811,8 @@ Blocked by: M4 + pdxfs user profile schema.
 | hm_core-M3+      | 0x2D04..0x2DFF   | R225.M3+  | reserved |
 | row_types        | 0x3600..0x3606   | R225.M2   | landed |
 | row_types-M3+    | 0x3607..0x36FF   | R225.M3+  | reserved |
+| effect_unify     | 0x4900..0x4907   | R225.M4   | landed |
+| effect_unify-M4.1+ | 0x4908..0x49FF | R225.M4.1+ | reserved |
 | datalog          | 0x2E00..0x2E04   | R226.M1   | landed |
 | datalog-M2+      | 0x2E05..0x2EFF   | R226.M2+  | reserved |
 | session_env      | 0x3700..0x3704   | R229.M2   | landed |

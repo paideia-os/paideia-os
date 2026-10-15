@@ -4,6 +4,419 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.0] -- 2026-10-15
+
+Wave 123 R225.M4 arm: effect-row unification + rank-restricted
+quantifier (P10) well-formedness validator. Dispatched as a solo
+arm after the Wave 123 R221.M6 + R222.M6 pair at 1.20.0; the
+parallel-CHANGELOG discipline consolidates this stanza at wave
+close (per-primitive scratch at `.plans/scratch/CHANGELOG-R225M4.md`).
+The arm touches disjoint `.bss` state (`_eu_label_scratch` 128 B),
+a disjoint error band (`0x4900..0x49FF`), a disjoint label prefix
+(`eu_`), and its own design doc (`design/shell/effect-row-
+unification.md`) — shared surfaces are limited to the top-of-file
+`lib.pdx` manifest, this CHANGELOG, and `STATUS.md`.
+
+### R225.M4 -- EffectUnify
+
+Effect rows obey a MONOTONE lattice: a lambda typed `!{io}` can
+safely be re-typed `!{io, mem}` because adding effects is harmless
+at the use-site. The typechecker needs the LEAST-UPPER-BOUND (set
+union with ROW_VAR tail propagation) operation, NOT Rémy's
+structural-equality pivot (which refuses to unify `!{io}` with
+`!{mem}`). This landing lands the dedicated row-arithmetic entry
+point `_eu_unify` plus a fold wrapper `_eu_least` and a scheme-
+shape validator `_eu_check_rank` (P10 rank restriction).
+
+### Added
+
+- `src/effect_unify.pdx` module `EffectUnify` (R225.M4,
+  paideia-os#2685): three public entry points over the shared
+  R225.M2 singleton `_hm_pool`.
+  - `_eu_unify(row_a, row_b) -> packed_u64` — JOIN two effect
+    rows. Phase 1a walks row_a collecting packed label ids into
+    `_eu_label_scratch` and notes any ROW_VAR tail; Phase 1b
+    walks row_b appending past Phase 1a's count; Phase 2 builds
+    the join by prepending each unique label onto a fresh
+    `_rt_row_empty` or `_rt_row_var` tail, using `_rt_row_select`
+    for dedup. Returns `(joined_row_ref << 32) | status`.
+  - `_eu_check_rank(scheme_ptr, scheme_len) -> status` — validate
+    a HmCore scheme byte stream against the P10 rank restriction.
+    At M4 (single outer ∀ in the wire format): header consistency
+    (`scheme_len == 8 + 4*n_bound_vars + 16*n_body_nodes`),
+    `n_bound_vars <= 64`, `n_body_nodes in [1..128]`, and every
+    body node's kind in `{TYVAR=1, TYCON=2, TYAPP=3, TYROW=4}`.
+    Pure byte walker; no nested CALL.
+    `EU_ERR_RANK_RESTRICTED_VIOLATION` reserved for the M4.1
+    nested-quantifier wire-format extension.
+  - `_eu_least(rows_ptr, n) -> packed_u64` — fold `_eu_unify`
+    across N rows (associative + commutative, so fold order
+    irrelevant). Caps `n` at `EU_MAX_JOIN_ARITY=16`.
+- 128-byte .bss scratch (`_eu_label_scratch`, 32 u32 packed-
+  label-id slots) for the Phase 1 raw-collect buffer. Disjoint
+  from `_hm_subst_table`, `_er_parse_scratch`, `_cr_parse_scratch`.
+- Error band 0x4900..0x4907 (eight slots used; 0x4908..0x49FF
+  reserved for M4.1+): EU_OK (0), EU_ERR_KIND_MISMATCH (0x4900),
+  EU_ERR_POOL_FULL (0x4901), EU_ERR_RANK_RESTRICTED_VIOLATION
+  (0x4902 — reserved for M4.1), EU_ERR_BAD_SCHEME (0x4903),
+  EU_ERR_EMPTY_ARRAY (0x4904), EU_ERR_TOO_MANY (0x4905),
+  EU_ERR_ROWVAR_OCCURS (0x4906 — reserved for M4.2),
+  EU_ERR_UNIFY_INCONSISTENT (0x4907 — reserved for M4.2).
+- Pure in-process; no KIND surface; no external linker dependency;
+  no cross-library dependency.
+- Label prefix `eu_` (grep-confirmed free of linker-visible symbol
+  collisions; disjoint from every sibling satellite's prefix:
+  `u8n_`, `gi_`, `wp_`, `cl_`, `ast_`, `sm_`, `sch_sig_`,
+  `cmd_sig_`, `fi_`, `afs_`, `cmdreg_`, `dm_`, `pl_`, `rp_`,
+  `ll_`, `cc_`, `er_`, `cr_`, `ls_`, `hm_`, `rt_`, `dl_`, `se_`,
+  `te_`).
+- Intra-library dependency on R225.M2 RowTypes at five symbols
+  (`_rt_find`, `_rt_row_empty`, `_rt_row_var`, `_rt_row_extend`,
+  `_rt_row_select`) and on R225.M1 HmCore's `_hm_pool` .bss
+  symbol (via `lea r11, [rip + _hm_pool]` for node-address
+  computation on walked cursors).
+- Reused opaque-u32 label identity contract: `_eu_unify`'s dedup
+  check compares arg0 u32 directly, so it works equally for
+  R224.M3 effect-labels AND R224.M4 capability-labels — the
+  module is already structurally ready for the R225.M4.3
+  capability-row-join parallel landing.
+
+### Changed
+
+- `src/lib.pdx`: flipped `LPX_PDS_PARSER_R225_M4_READY` from 0 to
+  1; bumped MINOR 20 -> 21; module-filename comment extended with
+  `src/effect_unify.pdx at R225.M4`; upstream-issues doc comment
+  picks up `paideia-os#2685 (R225.M4 EffectUnify)`; design-doc
+  comment picks up `design/shell/effect-row-unification.md`.
+- `caps.decl`: added the full 0x4900..0x49FF band section (eight
+  slots + reservation note + pack-shape); the R225.M4 landing
+  paragraph in the per-milestone catalogue; the grep-disjointness
+  confirmation line for `0x490[0-7]\b`; the full linker-dependency
+  entry (intra-library deps on `_rt_find`, `_rt_row_empty`,
+  `_rt_row_var`, `_rt_row_extend`, `_rt_row_select`, and the
+  `_hm_pool` .bss symbol); Wave-123 band-adjacency note extended
+  to mention `(status & 0xFF00) == 0x4900` effect-row-join / rank-
+  check faults; R225.M2 reservation note clarified that R225.M4
+  landed in a disjoint band rather than subdividing the 0x3600
+  band.
+- `STATUS.md`: filled in R225.M4 EffectUnify in the current-
+  milestones summary; added the R225.M4 subsection with the two
+  landed checklist items (`src/effect_unify.pdx`, design doc) and
+  the deferred 30-test proptest harness as R225.M4-003; appended
+  `effect_unify` + `effect_unify-M4.1+` rows to the error-band
+  accounting table; bumped the file's `**Version:**` line to
+  1.21.0.
+
+### Design doc
+
+- `design/shell/effect-row-unification.md`: 12 sections (scope,
+  operational semantics, public API, pool-reuse, rank-restricted
+  quantifiers, encoder discipline, 30-test acceptance corpus,
+  error-band layout, forward path, co-landing discipline, linker
+  dependencies, references). The 30-test corpus is decomposed
+  into 18 `_eu_unify` tests, 8 `_eu_check_rank` tests, and 4
+  `_eu_least` tests; the proptest harness is deferred to
+  R225.M4.9 per the umbrella's shared R225.M9 landing.
+
+### Compatibility
+
+- Additive; no entry-point signature changes to R225.M1/M2.
+- The three public entries follow the parser-tier packed-u64
+  convention: high 32 = row_ref (0 on error), low 32 = status
+  band 0x4900..0x4907.
+- Pool budget: `_eu_unify` can consume up to ~17 pool slots per
+  call (1 tail + up to 16 unique ROW_EXTs after dedup); the
+  128-slot shared pool must have headroom at every call site.
+  The typechecker driver that invokes `_eu_least` across N rows
+  must plan for ~16N worst-case node consumption.
+
+### Deferred to R225.M4.1+
+
+- M4.1 wire-format extension landing nested-quantifier body nodes
+  (new `HM_KIND_FORALL = 5` kind); `EU_ERR_RANK_RESTRICTED_VIOLATION`
+  becomes reachable.
+- M4.2 inner-subterm Rémy unify arm in `_eu_unify` (pivot
+  bindings for `rho_a := rho_fresh` / `rho_b := rho_fresh`);
+  reserves `EU_ERR_ROWVAR_OCCURS` and `EU_ERR_UNIFY_INCONSISTENT`.
+- M4.3 capability-row join parallel (R224.M4 CapRow consumer).
+- M4.4 per-session effect-label alphabet override hook.
+- M4.5 row-fingerprint caching (per-REPL turn LRU).
+- M4.6 hybrid record/effect arrow typing.
+- M4.9 30-test proptest corpus + fingerprint goldens (deferred
+  per the umbrella's shared R225.M9 harness landing).
+
+## [1.20.0] -- 2026-10-15
+
+Wave 123 joint landing: R222.M6 DispatchMode (paideia-os#2663) +
+R221.M6 SpanMap (paideia-os#2656) land in parallel. Each softarch
+arm declared 1.20.0 as its per-primitive version per the parallel-
+CHANGELOG discipline; main consolidates both into this single
+stanza at wave close. The two arms touch disjoint `.bss` state
+(`_dm_*` vs `_sm_*`), disjoint error bands (`0x4800..0x48FF` vs
+`0x4700..0x47FF`), disjoint label prefixes (`dm_` vs `sm_`), and
+disjoint design docs — their only shared surfaces are the top-of-
+file lib.pdx manifest and this CHANGELOG.
+
+### R222.M6 -- DispatchMode
+
+Load-time light-vs-heavy dispatch classifier for the semantic shell.
+Reads a command's declared resource needs (`resource_mask` u32 at
+offset 84 of the R222.M2 CommandSig record), decides LIGHT (elaborate
+in-process) vs HEAVY (spawn a separate process), bumps per-decision
+counters, and indirect-calls one of two disjoint weak-import function-
+pointer slots.
+
+### Added
+
+- `src/dispatch_mode.pdx` module `DispatchMode` (R222.M6,
+  paideia-os#2663): five public entry points over three u64 scalar
+  state slots + two weak-import function-pointer slots.
+  - `_dm_init() -> ()` -- idempotent boot hook; zero-fills the five
+    u64 slots (`_dm_light_fn`, `_dm_spawn_fn`, `_dm_light_count`,
+    `_dm_heavy_count`, `_dm_last_decision`). .bss zero-init at
+    program load already satisfies this; the explicit init supports
+    test-time counter resets. Pure leaf.
+  - `_dm_register_light(fn_ptr) -> errno` -- publishes `fn_ptr` into
+    `_dm_light_fn`. Returns `DM_OK` on success, `DM_ERR_NULL_FN`
+    (0x4803) on nil. Pure leaf.
+  - `_dm_register_spawn(fn_ptr) -> errno` -- publishes `fn_ptr` into
+    `_dm_spawn_fn`. Returns `DM_OK` on success, `DM_ERR_NULL_FN`
+    (0x4803) on nil. Pure leaf.
+  - `_dm_classify(cs_body, cs_len) -> decision_or_err` -- validates
+    the CommandSig record (`cs_body != 0`, `cs_len >= 128`, magic
+    `'CSIG' == 0x47495343` at offset 0), reads `resource_mask` u32
+    at offset 84, ANDs with `DM_HEAVY_MASK` (`0x3C` =
+    `NET|EXEC|LONG_RUNNING|HIGH_MEM`), and returns `DM_LIGHT` (0)
+    iff the result is 0; `DM_HEAVY` (1) otherwise. Pure leaf.
+  - `_dm_dispatch(cs_body, cs_len, mat_body, mat_len) -> packed_u64`
+    -- validates the FunctorInstance materialization record
+    (`mat_body != 0`, `mat_len >= 64`), CALLs `_dm_classify`, bumps
+    the matching decision counter, writes `_dm_last_decision`, loads
+    the matching weak-import slot, and indirect-calls it with
+    `(cs_body, cs_len, mat_body, mat_len)`. Pack: bits `[15:0]`
+    status, bit `[16]` decision (`0`=LIGHT, `1`=HEAVY), bits
+    `[63:32]` downstream errno on `*_FAILED` paths.
+- Resource-mask bit layout (R222.M6 ABI): `DM_BIT_FS_READ` (0x01),
+  `DM_BIT_FS_WRITE` (0x02), `DM_BIT_NET` (0x04), `DM_BIT_EXEC`
+  (0x08), `DM_BIT_LONG_RUNNING` (0x10), `DM_BIT_HIGH_MEM` (0x20).
+  Heavy mask (`DM_HEAVY_MASK` = 0x3C) = `NET | EXEC | LONG_RUNNING
+  | HIGH_MEM`. The classifier encodes the mask AND as a single
+  `and r64, imm8` instruction (0x3C fits in imm8 with bit 7 clear,
+  per `feedback_pdx_encoder_pitfalls` -- precedent
+  `grapheme_iter.pdx:335` `and r11, 0xFF`).
+- Two weak-import function-pointer slots in .bss (`_dm_light_fn`,
+  `_dm_spawn_fn`), both nil at session boot. The pdx dialect lacks
+  linker-level weak imports; the function-pointer slot is the
+  convention. Mirrors R133.M5 `_tcg_check_fn` / R133.M6
+  `_sc_dispatch_fn` byte-for-byte minus the klog_s1 emits.
+- Three u64 counters in .bss (`_dm_light_count`, `_dm_heavy_count`,
+  `_dm_last_decision`) as the dispatch fingerprint. User-space
+  satellite modules in `libpdx-pds-parser` have no klog surface;
+  a counter-based fingerprint is the parser-tier precedent.
+- Error band 0x4800..0x48FF (seven slots used; 0x4807..0x48FF
+  reserved for R222.M6.1+): `DM_OK` (0), `DM_LIGHT` (0),
+  `DM_HEAVY` (1), `DM_ERR_BAD_RECORD` (0x4800),
+  `DM_ERR_NO_LIGHT_FN` (0x4801), `DM_ERR_NO_SPAWN_FN` (0x4802),
+  `DM_ERR_NULL_FN` (0x4803), `DM_ERR_LIGHT_FAILED` (0x4804),
+  `DM_ERR_SPAWN_FAILED` (0x4805), `DM_ERR_BAD_MAT` (0x4806).
+- CommandSigHeader offset carve-out at [+84..+88) for `resource_mask`
+  u32. R222.M2 reserved the 44-byte tail at [+84..+128) "for
+  R222.M3+ (effect-row id, cap-row id, source span, etc.)" so this
+  claim does not disturb any landed R222.M2..M5 reader of the
+  header. No ABI break; existing readers that stop at offset 84
+  (`flags u32`) see no change in the bytes they consume. The
+  fingerprint pipeline (R222.M8) already covers the full 128-byte
+  header verbatim, so the new field is included in the record's
+  fingerprint by construction.
+- Pure in-process; no KIND surface; no external linker dependency;
+  no cross-library dependency; no intra-library linker dependency.
+- Label prefix `dm_` (grep-confirmed unique against the parser-
+  tier modules' 22 prior prefixes; the lone `dm_*` labels in the
+  tree (`dm_pud_divide_setup` / `dm_fail` in `src/user/dmesg.pdx`)
+  are function-scoped and do not share a linker-visible namespace).
+
+### Changed
+
+- `tools/user/libpdx-pds-parser/src/lib.pdx`: flipped
+  `LPX_PDS_PARSER_R222_M6_READY` from 0 to 1; bumped MINOR 19 -> 20;
+  module-filename comment extended with `src/dispatch_mode.pdx at
+  R222.M6`; upstream-issues doc comment picks up `paideia-os#2663
+  (R222.M6 DispatchMode)`; design-doc comment picks up
+  `design/shell/light-heavy-dispatch.md`.
+- `tools/user/libpdx-pds-parser/caps.decl`: added the full
+  0x4800..0x48FF band section (seven slots + reservation note),
+  the R222.M6 landing paragraph to the per-milestone catalogue
+  (dispatch-mode classifier + indirector + weak-import seams +
+  CommandSigHeader resource_mask offset), the grep-disjointness
+  confirmation line for `0x480[0-6]\b`, and the R222.M6 linker-
+  dependency entry (NO external linker deps; no cross-library dep;
+  no intra-library dep; two weak-import function-pointer slots nil
+  at session boot; cs_body / cs_len / mat_body / mat_len handed in
+  as opaque caller-managed pointer args).
+
+### Design doc
+
+- `design/shell/light-heavy-dispatch.md` -- resource-mask bit
+  layout, LIGHT vs HEAVY decision rule, weak-import seam rationale
+  (two slots not one, mirroring the R133.M5 / R133.M6 precedent),
+  public API, status-code taxonomy (band 0x4800..0x48FF),
+  fingerprint surface (three u64 counters observable by a smoke-
+  mode asserter), encoder-pitfall discipline (no `test`, no
+  `and r, imm64`, no 2-op `imul r, imm`, no multiline `pub let`,
+  `dm_` label prefix), register-liveness note (r11 clobbered
+  across nested CALLs; survivors in r12..r15 or .bss), 4-command
+  acceptance test (`where` + `sort` -> LIGHT; `find` + `grep` ->
+  HEAVY), forward path through R222.M6.1 (prologue pad audit),
+  R222.M6.5 (commands.toml `#resource` bind), R222.M6.6 (per-cost
+  budget violation code), R222.M7 (fuzz corpus), R222.M8
+  (`describe <cmd>` renders resource_mask as a human-readable
+  string).
+
+### Notes
+
+- The 0x4700..0x47FF band is reserved for the parallel Wave-123
+  R221.M6 span-mapping NFC variant arm. DispatchMode's 0x4800..
+  0x48FF carve-out sits on a kilo-step boundary disjoint from
+  every prior landed wave's bands.
+- `_dm_classify` is a pure predicate suitable for consumption by
+  planners, cost estimators, and smoke-mode asserters that want
+  the policy decision without triggering the invocation half.
+- `_dm_dispatch` separates classification from invocation so
+  either half can be audited independently; the two u64 counters
+  record the classification half and the indirect-call return
+  pack records the invocation half.
+- Two weak-import slots (`_dm_light_fn` + `_dm_spawn_fn`) permit
+  shell variants that register only one seam (a refusal shell
+  that rejects HEAVY commands by leaving `_dm_spawn_fn` nil, or
+  a sandbox shell that only spawns and never runs in-process).
+  Both failure modes have dedicated error codes
+  (`DM_ERR_NO_LIGHT_FN` / `DM_ERR_NO_SPAWN_FN`).
+- 4-command acceptance anchor (per the design doc §9): after the
+  sequence `where`, `sort`, `find`, `grep`, the counters observe
+  `_dm_light_count == 2`, `_dm_heavy_count == 2`,
+  `_dm_last_decision == 2` (HEAVY). The proptest harness
+  (`tests/proptest_dispatch_mode.pdx`) is deferred to R222.M7.
+
+### R221.M6 -- SpanMap
+
+R221.M6 of the parser-tier Unicode + lexer umbrella (paideia-os#2485,
+decomposed into paideia-os#2656 for this M6) — SOURCE-SPAN TRACKING
+ACROSS NFC NORMALIZATION: a sparse delta list of
+`(nfc_offset_u32, src_offset_u32)` pairs that preserves the Q-A5
+invariant that every AST node points back into the ORIGINAL
+caller-supplied source bytes, not the NFC-normalised output. Lets a
+downstream diagnostic quote `src[src_offset..]` so the error message
+reflects what the user actually typed.
+
+### Added
+
+- `src/span_map.pdx` module `SpanMap` (R221.M6, paideia-os#2656):
+  four public entry points over a 1024-slot `.bss` pair pool.
+  - `_sm_init() -> ()` — hard-reset of `_sm_pair_count` (one u64
+    scalar). `.bss` zero-init at boot already satisfies the cold-
+    start identity-map state. Idempotent. Pure leaf.
+  - `_sm_record_pair(nfc_offset, src_offset) -> errno` — append
+    one monotonic pair at slot `_sm_pair_count` and bump the count.
+    Enforces strict monotonicity (new `nfc_offset` AND `src_offset`
+    both strictly > prev); defensive catch for `_sm_from_u8nfc`
+    walker bugs. Pure leaf.
+  - `_sm_lookup(nfc_offset) -> src_offset` — binary-search the
+    pair array for the largest `pair.nfc_offset <= nfc_offset`;
+    return `pair.src + (nfc_offset - pair.nfc)` or `nfc_offset`
+    verbatim on empty-table / below-first-pair queries (identity
+    map). Pure leaf.
+  - `_sm_from_u8nfc(bytes_src, src_len, bytes_nfc, nfc_len) ->
+    errno` — rebuild the span map in one pass. CALLs `_sm_init`
+    first; walks both buffers byte-by-byte; on divergence decodes
+    the UTF-8 scalar length from the NFC lead byte, advances the
+    NFC cursor, scans src for the next matching byte, and records
+    the pair. 5 callee-save pushes + `sub rsp, 16` → `rsp%16 == 0`
+    at every nested CALL (`_sm_init`, `_sm_record_pair`).
+- 8-byte pair record: nfc_offset u32 at [+0], src_offset u32 at
+  [+4]. 8-byte stride uses `shl r, 3` (smallest stride in the
+  parser-tier; precedent for `shl r, 3` on an 8-byte-stride struct
+  pool is new to this landing).
+- 1024-slot `.bss` table (`_sm_pairs`, 8192 B, @align(8));
+  pair-count scalar (`_sm_pair_count` u64, @align(8)).
+- Error band `0x4700..0x47FF` (4 slots used; `0x4704..0x47FF`
+  reserved for M6.1+ follow-ups): `SM_OK` (0), `SM_ERR_POOL_FULL`
+  (`0x4700`), `SM_ERR_NON_MONOTONIC` (`0x4701`), `SM_ERR_OOB_OFFSET`
+  (`0x4702`, reserved), `SM_ERR_BAD_INPUT` (`0x4703`).
+- Pure in-process; no KIND surface; no external linker dependency;
+  no cross-library dependency; no intra-library linker-visible
+  dependency at raw M6 (the AST wire-up to `_sm_lookup` is deferred
+  to R221.M6.1).
+- Label prefix `sm_` with per-function suffix (`sm_i_`, `sm_rp_`,
+  `sm_lu_`, `sm_fnfc_`); grep-confirmed free of linker-visible
+  symbol collisions.
+- UTF-8 scalar-length decoding uses only `cmp rN, imm32-safe` byte-
+  range tests; the 0x80..0xBF continuation-byte-in-lead-slot and
+  0xF8+ fallback paths both map to L=1 defensively.
+- Register-liveness note: r11 is clobbered by nested CALL per SysV
+  ABI; in `_sm_from_u8nfc` the state that must survive CALL is
+  placed in the callee-save set (rbx=src_ptr, r12=src_len,
+  r13=nfc_ptr, r14=nfc_len, r15=nc) plus the stack local
+  `[rsp + 0]` holding `sc`.
+
+### Changed
+
+- `src/lib.pdx`: flipped `LPX_PDS_PARSER_M6_READY` from 0 to 1;
+  module-filename comment extended with `src/span_map.pdx at
+  R221.M6`; upstream-issues doc comment picks up `paideia-os#2656
+  (R221.M6 SpanMap)`; design-doc comment picks up
+  `design/shell/span-map-nfc.md`.
+- `caps.decl`: added the full `0x4700..0x47FF` band section (4
+  slots + reservation note), the R221.M6 landing paragraph to the
+  per-milestone catalogue, the `grep -rE '0x470[0-3]\b'`
+  disjointness-proof line, and the R221.M6 linker-dependency entry
+  (NO external linker dep; NO intra-library linker-visible dep at
+  raw M6; the AST wire-up at `_sm_lookup` lands at R221.M6.1).
+  Updated the parallel R222.M6 DispatchMode section's "0x4700..0x47FF
+  reserved for the parallel SpanMap arm" placeholder to the current
+  state ("landed above").
+
+### Design doc
+
+- `design/shell/span-map-nfc.md` — sparse delta list structure,
+  worked example (a-acute composition), pool + `.bss` layout,
+  public API, status codes, resync heuristic (M6 initial + bounded-
+  window M6.1 follow-up), correctness envelope, register plan,
+  encoder-pitfall discipline, linker + wire-up, 100-sample
+  acceptance corpus (deferred to R221.M7 fuzz-corpus milestone),
+  forward path (R221.M6.1 AST wire-up + bounded-window; R225.M7
+  HM-mismatch diagnostics; R229.M3-dispatch error-path threading),
+  ABI freeze.
+
+### Design notes
+
+- Span map = sparse delta list: pairs record positions AT WHICH the
+  two cursors diverge by a fresh amount; BETWEEN consecutive pairs
+  both cursors advance byte-for-byte. Lookup = binary search for
+  largest preceding pair + delta add.
+- Pure ASCII input NEVER triggers a pair (R221.M1's fast branch is
+  byte-for-byte identity); the identity map holds throughout and
+  `_sm_lookup` short-circuits on empty-table.
+- Pool cap 1024 pairs is sized ~10× the typical pds-lang line input
+  pair count. Over-cap signals an adversarial input and returns
+  `SM_ERR_POOL_FULL`; the 1024 recorded pairs remain queryable.
+- Resync heuristic (M6 initial): on divergence, decode UTF-8 scalar
+  length from the NFC lead byte, advance NFC cursor by that length,
+  scan src for the next matching byte, record pair. Correct for
+  canonical-composition cases (Latin + combining marks). Bounded-
+  window cross-check deferred to R221.M6.1.
+
+### Linker dependencies
+
+- No external cross-library dependency; no intra-library linker-
+  visible dependency at raw M6. The AST module (R221.M5) stores
+  spans as `src_offset` / `src_length` u32 fields that currently
+  index into the NFC output; a downstream consumer that wants pre-
+  NFC spans calls `_sm_lookup(src_offset)` to refine the offset
+  before quoting source bytes. R221.M6.1 (AST wire-up at
+  `_ast_render`) will introduce a one-way intra-library dependency
+  where `ast.pdx` CALLs `_sm_lookup`; no cross-library dependency
+  is planned at that milestone either.
+
 ## [1.19.0] -- 2026-10-15
 
 Wave 122 joint landing: R222.M5 CmdRegistry (paideia-os#2662) +
